@@ -5,7 +5,7 @@ const DEFAULT_CPU_CURVE = [
   { temp_c: 70, pwm_percent: 85 },
   { temp_c: 80, pwm_percent: 100 },
 ];
-const DEFAULT_DISK_CURVE = [
+const DEFAULT_STORAGE_CURVE = [
   { temp_c: 25, pwm_percent: 60 },
   { temp_c: 35, pwm_percent: 85 },
   { temp_c: 50, pwm_percent: 100 },
@@ -17,18 +17,28 @@ const GPIO_ACTIONS = [
   ['smart_check', '刷新仓位并检查 SMART'],
   ['reapply_plugin', '重新应用插件配置'],
 ];
+const STORAGE_STATE_LABELS = {
+  empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
+};
+const STORAGE_ACTIVITY_LABELS = {
+  busy: '繁忙', idle: '空闲', sleeping: '休眠', unknown: '未知',
+};
 const CURVE_MIN_POINTS = 2;
 const CURVE_MAX_POINTS = 8;
 const CHART = { left: 52, right: 616, top: 20, bottom: 222 };
-const CURVE_KINDS = ['cpu', 'disk'];
+const CURVE_KINDS = ['cpu', 'hdd', 'nvme'];
 const curveEditors = {
   cpu: {
     chartID: 'fan-curve-chart', addID: 'curve-add', removeID: 'curve-remove', selectedID: 'curve-selected',
-    curve: DEFAULT_CPU_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#58e6ad',
+    curve: DEFAULT_CPU_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#536dfe',
   },
-  disk: {
+  hdd: {
     chartID: 'disk-curve-chart', addID: 'disk-curve-add', removeID: 'disk-curve-remove', selectedID: 'disk-curve-selected',
-    curve: DEFAULT_DISK_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#69bfff',
+    curve: DEFAULT_STORAGE_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#18a779',
+  },
+  nvme: {
+    chartID: 'nvme-curve-chart', addID: 'nvme-curve-add', removeID: 'nvme-curve-remove', selectedID: 'nvme-curve-selected',
+    curve: DEFAULT_STORAGE_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#a25bd7',
   },
 };
 let currentStatus = null;
@@ -67,14 +77,55 @@ function formatSize(bytes) {
   return `${value.toFixed(unit < 3 ? 0 : 1)} ${units[unit]}`;
 }
 
-function renderStorageTable(storage = {}) {
-  const stateLabels = {
-    empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
-  };
-  const slots = [...(storage.slots || [])].sort((left, right) => {
+function sortedStorageSlots(storage = {}) {
+  return [...(storage.slots || [])].sort((left, right) => {
     if (left.kind !== right.kind) return left.kind === 'front' ? -1 : 1;
     return left.kind === 'front' ? right.slot - left.slot : left.slot - right.slot;
   });
+}
+
+function maximumSlotTemperature(slots, kind) {
+  const temperatures = slots
+    .filter((slot) => slot.kind === kind)
+    .map((slot) => Number(slot.temperature_c))
+    .filter((temperature) => Number.isFinite(temperature) && temperature > 0);
+  return temperatures.length ? Math.max(...temperatures) : null;
+}
+
+function renderStorageTemperatureCards(storage = {}) {
+  const slots = sortedStorageSlots(storage);
+  const hddMaximum = maximumSlotTemperature(slots, 'front');
+  const nvmeMaximum = maximumSlotTemperature(slots, 'm2');
+  $('hdd-max-temperature').textContent = formatTemperature(hddMaximum, hddMaximum !== null);
+  $('nvme-max-temperature').textContent = formatTemperature(nvmeMaximum, nvmeMaximum !== null);
+
+  const cards = $('storage-temperature-cards');
+  cards.replaceChildren();
+  slots.forEach((slot) => {
+    const state = slot.state || 'unknown';
+    const card = document.createElement('article');
+    card.className = `storage-temperature-card storage-${state}`;
+    const label = document.createElement('span');
+    label.textContent = slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`;
+    const temperature = document.createElement('strong');
+    temperature.textContent = Number(slot.temperature_c) > 0
+      ? formatTemperature(slot.temperature_c) : '—';
+    const status = document.createElement('small');
+    const activity = STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity;
+    status.textContent = [STORAGE_STATE_LABELS[state] || state, state === 'empty' ? '' : activity].filter(Boolean).join(' · ');
+    card.append(label, temperature, status);
+    cards.append(card);
+  });
+  if (!slots.length) {
+    const empty = document.createElement('p');
+    empty.className = 'storage-temperature-empty';
+    empty.textContent = '尚未获得硬盘槽位信息';
+    cards.append(empty);
+  }
+}
+
+function renderStorageTable(storage = {}) {
+  const slots = sortedStorageSlots(storage);
   const body = $('storage-body');
   body.replaceChildren();
   slots.forEach((slot) => {
@@ -84,13 +135,14 @@ function renderStorageTable(storage = {}) {
     const deviceDetail = [slot.device, slot.model, slot.serial, formatSize(slot.size_bytes)].filter(Boolean).join(' · ');
     const values = [
       label,
-      stateLabels[slot.state] || slot.state || '未知',
+      STORAGE_STATE_LABELS[slot.state] || slot.state || '未知',
+      slot.state === 'empty' ? '—' : (STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity || '未知'),
       deviceDetail || '—',
       slot.purpose || (slot.state === 'empty' ? '空仓位' : '—'),
       slot.warning || slot.health || '—',
       formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0),
     ];
-    const labels = ['仓位', '状态', '设备', '用途', '健康', '温度'];
+    const labels = ['仓位', '状态', '活动', '设备', '用途', '健康', '温度'];
     values.forEach((value, index) => {
       const cell = document.createElement(index === 0 ? 'th' : 'td');
       cell.dataset.label = labels[index];
@@ -102,7 +154,7 @@ function renderStorageTable(storage = {}) {
   if (!slots.length) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     cell.dataset.label = '状态';
     cell.textContent = '尚未获得仓位信息';
     row.append(cell);
@@ -112,6 +164,78 @@ function renderStorageTable(storage = {}) {
     ? `更新于 ${new Date(storage.updated_at).toLocaleTimeString()}` : '等待刷新';
   $('storage-error').textContent = storage.last_error || '';
   $('storage-error').className = `inline-status${storage.last_error ? ' error' : ''}`;
+}
+
+function renderDiagnosticChips(targetID, items, emptyText = '—') {
+  const target = $(targetID);
+  target.replaceChildren();
+  if (!items.length) {
+    target.textContent = emptyText;
+    return;
+  }
+  items.forEach((item) => {
+    const chip = document.createElement('span');
+    chip.className = `diagnostic-chip${item.tone ? ` ${item.tone}` : ''}`;
+    if (item.label) {
+      const label = document.createElement('b');
+      label.textContent = item.label;
+      chip.append(label);
+    }
+    const value = document.createElement('span');
+    value.textContent = item.value;
+    chip.append(value);
+    target.append(chip);
+  });
+}
+
+function fanSourceLabel(source = '') {
+  const labels = { cpu: 'CPU', hdd: 'HDD/SATA', nvme: 'NVMe' };
+  const parts = String(source).split('+').filter(Boolean).map((part) => labels[part] || part);
+  return parts.length ? parts.join(' + ') : '当前温度';
+}
+
+function renderDiagnostics(status, fanStatus) {
+  const temperatures = Array.isArray(status.temperatures) ? status.temperatures : [];
+  renderDiagnosticChips('temperature-sensors', temperatures.map((item) => ({
+    label: item.label || 'coretemp',
+    value: formatTemperature(item.celsius),
+  })), '未读取到 coretemp');
+
+  const gpuRuntime = Array.isArray(status.gpu_runtime) ? status.gpu_runtime : [];
+  renderDiagnosticChips('gpu-runtime', gpuRuntime.map((item) => {
+    const value = String(item);
+    return {
+      value,
+      tone: /active|运行|启用/i.test(value) ? 'ok' : (/unsupported|未暴露|不可用/i.test(value) ? 'muted' : ''),
+    };
+  }), '未暴露');
+
+  if (!fanStatus.active) {
+    renderDiagnosticChips('fan-control', [{
+      value: fanStatus.available ? '可用，尚未启用' : '驱动或风扇不可用',
+      tone: fanStatus.available ? 'muted' : 'warning',
+    }]);
+    return;
+  }
+  const cpuTemperature = Number(fanStatus.cpu_temperature_c ?? fanStatus.temperature_c);
+  const hddTemperature = Number(fanStatus.hdd_temperature_c);
+  const nvmeTemperature = Number(fanStatus.nvme_temperature_c);
+  const chips = [{
+    label: 'CPU',
+    value: `${formatTemperature(cpuTemperature, cpuTemperature > 0)} → ${fanStatus.cpu_target_pwm_percent || 0}%`,
+  }];
+  chips.push(hddTemperature > 0
+    ? { label: 'HDD/SATA', value: `${formatTemperature(hddTemperature)} → ${fanStatus.hdd_target_pwm_percent || 0}%` }
+    : { label: 'HDD/SATA', value: '温度暂不可用', tone: 'muted' });
+  chips.push(nvmeTemperature > 0
+    ? { label: 'NVMe', value: `${formatTemperature(nvmeTemperature)} → ${fanStatus.nvme_target_pwm_percent || 0}%` }
+    : { label: 'NVMe', value: '温度暂不可用', tone: 'muted' });
+  chips.push({
+    label: '最终',
+    value: `${fanSourceLabel(fanStatus.control_source)} · ${fanStatus.target_pwm_percent || 0}%`,
+    tone: 'ok',
+  });
+  renderDiagnosticChips('fan-control', chips);
 }
 
 function setupGPIOActions() {
@@ -321,36 +445,39 @@ function renderFanChart(kind = 'cpu') {
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
-    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, stroke: 'rgba(150,230,196,.12)' }));
-    svg.append(svgElement('text', { x: x(temp), y: 246, fill: '#9bb5aa', 'font-size': 12, 'text-anchor': 'middle' }, `${temp}°`));
+    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, stroke: 'rgba(72,82,102,.12)' }));
+    svg.append(svgElement('text', { x: x(temp), y: 246, fill: '#7b8290', 'font-size': 12, 'text-anchor': 'middle' }, `${temp}°`));
   });
   [30, 50, 70, 100].forEach((speed) => {
-    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), stroke: 'rgba(150,230,196,.12)' }));
-    svg.append(svgElement('text', { x: 42, y: y(speed) + 4, fill: '#9bb5aa', 'font-size': 12, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), stroke: 'rgba(72,82,102,.12)' }));
+    svg.append(svgElement('text', { x: 42, y: y(speed) + 4, fill: '#7b8290', 'font-size': 12, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
     fill: 'none', stroke: editor.color, 'stroke-width': 4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
   }));
-  const actualTemp = Number(kind === 'disk'
-    ? currentStatus?.fan_control?.disk_temperature_c
-    : (currentStatus?.fan_control?.cpu_temperature_c ?? currentStatus?.fan_control?.temperature_c));
+  const actualTemperatures = {
+    cpu: currentStatus?.fan_control?.cpu_temperature_c ?? currentStatus?.fan_control?.temperature_c,
+    hdd: currentStatus?.fan_control?.hdd_temperature_c ?? currentStatus?.fan_control?.disk_temperature_c,
+    nvme: currentStatus?.fan_control?.nvme_temperature_c,
+  };
+  const actualTemp = Number(actualTemperatures[kind]);
   if (Number.isFinite(actualTemp) && actualTemp > 0) {
-    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#ffb76b', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: x(actualTemp), y: 14, fill: '#ffca8f', 'font-size': 12, 'text-anchor': 'middle' }, `当前 ${actualTemp.toFixed(1)}°C`));
+    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#e89b24', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
+    svg.append(svgElement('text', { x: x(actualTemp), y: 14, fill: '#b96f00', 'font-size': 12, 'text-anchor': 'middle' }, `当前 ${actualTemp.toFixed(1)}°C`));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
     const node = svgElement('circle', {
       cx: x(point.temp_c), cy: y(point.pwm_percent), r: selected ? 9 : 7,
-      fill: selected ? editor.color : '#07110f', stroke: editor.color, 'stroke-width': 3,
+      fill: selected ? editor.color : '#ffffff', stroke: editor.color, 'stroke-width': 3,
       class: `curve-node${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
     svg.append(node);
     const labelY = y(point.pwm_percent) < 44 ? y(point.pwm_percent) + 25 : y(point.pwm_percent) - 14;
     svg.append(svgElement('text', {
-      x: x(point.temp_c), y: labelY, fill: selected ? editor.color : '#b8d1c6',
+      x: x(point.temp_c), y: labelY, fill: selected ? editor.color : '#596273',
       'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
     }, `${point.temp_c}° · ${point.pwm_percent}%`));
   });
@@ -420,7 +547,8 @@ function fillFanInputs(fan = {}) {
     editor.selectedIndex = clamp(editor.selectedIndex, 0, editor.curve.length - 1);
   };
   fillCurve('cpu', fan.curve, DEFAULT_CPU_CURVE);
-  fillCurve('disk', fan.disk_curve, DEFAULT_DISK_CURVE);
+  fillCurve('hdd', fan.hdd_curve || fan.disk_curve, DEFAULT_STORAGE_CURVE);
+  fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
 }
 
 function render(status, keepInputs = false) {
@@ -444,28 +572,17 @@ function render(status, keepInputs = false) {
   $('temperature-source').textContent = cpuTemperature.display_source === 'core_max_rr'
     ? `RR 核心最大值（${cpuTemperature.core_sensors} 个 Core）`
     : (cpuTemperature.display_source === 'package_fallback' ? '未找到 Core 标签，回退到 Package' : '未识别');
-  $('temperature-sensors').textContent = Array.isArray(status.temperatures) && status.temperatures.length
-    ? status.temperatures.map((item) => `${item.label} ${formatTemperature(item.celsius)}`).join(' · ')
-    : '未读取到 coretemp';
-  $('gpu-runtime').textContent = status.gpu_runtime?.join('，') || '未暴露';
   $('last-apply').textContent = status.last_apply ? new Date(status.last_apply).toLocaleString() : '尚未应用';
-  $('last-error').textContent = status.last_error || fanStatus.last_error || '正常';
-  const fanSource = { cpu: 'CPU', disk: '硬盘', 'cpu+disk': 'CPU 与硬盘' }[fanStatus.control_source] || '当前温度';
-  const diskControl = Number(fanStatus.disk_temperature_c) > 0
-    ? `；硬盘 ${Number(fanStatus.disk_temperature_c).toFixed(1)} °C → ${fanStatus.disk_target_pwm_percent || 0}%`
-    : '；硬盘温度暂不可用';
-  $('fan-control').textContent = fanStatus.active
-    ? `已启用 · CPU ${Number(fanStatus.cpu_temperature_c || fanStatus.temperature_c || 0).toFixed(1)} °C → ${fanStatus.cpu_target_pwm_percent || 0}%${diskControl}；采用 ${fanSource} 的 ${fanStatus.target_pwm_percent || 0}%`
-    : (fanStatus.available ? '可用，尚未启用' : '驱动或风扇不可用');
+  const diagnosticError = status.last_error || fanStatus.last_error || '';
+  $('last-error').textContent = diagnosticError || '正常';
+  $('last-error').className = diagnosticError ? 'diagnostic-error' : 'diagnostic-ok';
+  renderDiagnostics(status, fanStatus);
+  renderStorageTemperatureCards(storageStatus);
   renderStorageTable(storageStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
     : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
-  $('gpio-diagnostic').textContent = gpioStatus.enabled
-    ? (gpioStatus.available ? (gpioStatus.last_event || '监听中') : (gpioStatus.last_error || '不可用'))
-    : '未启用';
-
   const storageWarning = storageStatus.slots?.some((slot) => slot.state === 'warning');
   const gpioError = gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error);
   const healthy = status.supported && !status.last_error && !fanStatus.last_error && !storageWarning && !gpioError;
@@ -517,7 +634,8 @@ async function refresh(keepInputs = false) {
 $('config-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   const cpuCurve = curveFromInputs('cpu');
-  const diskCurve = curveFromInputs('disk');
+  const hddCurve = curveFromInputs('hdd');
+  const nvmeCurve = curveFromInputs('nvme');
   const config = {
     enabled: $('enabled').checked,
     pl1_w: Number($('pl1').value),
@@ -530,7 +648,8 @@ $('config-form').addEventListener('submit', async (event) => {
       emergency_temp_c: Number($('fan-emergency').value),
       poll_seconds: Number($('fan-poll').value),
       curve: cpuCurve,
-      disk_curve: diskCurve,
+      hdd_curve: hddCurve,
+      nvme_curve: nvmeCurve,
     },
     gpio: gpioConfigFromInputs(),
   };
@@ -542,7 +661,7 @@ $('config-form').addEventListener('submit', async (event) => {
     showMessage('启用风扇曲线前必须检测到有转速反馈的风扇。', true);
     return;
   }
-  for (const [label, curve] of [['CPU', cpuCurve], ['硬盘', diskCurve]]) {
+  for (const [label, curve] of [['CPU', cpuCurve], ['HDD/SATA', hddCurve], ['NVMe', nvmeCurve]]) {
     if (curve.length < CURVE_MIN_POINTS || curve.length > CURVE_MAX_POINTS) {
       showMessage(`${label}曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true);
       return;
@@ -560,7 +679,7 @@ $('config-form').addEventListener('submit', async (event) => {
   setBusy(true);
   try {
     render(await request('api/config', { method: 'POST', body: JSON.stringify(config) }));
-    showMessage('功耗、CPU/硬盘双温控曲线与按键映射配置已保存并应用。');
+    showMessage('功耗、CPU/HDD/NVMe 三温控曲线与按键映射配置已保存并应用。');
   } catch (error) {
     showMessage(`应用失败：${error.message}`, true);
   } finally {

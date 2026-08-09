@@ -8,33 +8,42 @@
 </head>
 <body>
   <main class="shell">
-    <header>
-      <div class="brand-mark" aria-hidden="true">⚡</div>
-      <div>
-        <p class="eyebrow">TAD MODULE</p>
+    <header class="app-header">
+      <div class="brand-mark" aria-hidden="true">T</div>
+      <div class="title-row">
         <h1>TAD模块</h1>
-        <p class="subtitle">按 RR 口径显示 CPU 核心最高温度，并与 fnOS 使用的 Package 原始温度分开。</p>
-        <p class="project-link"><a href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 项目主页 · 检查新版本</a></p>
+        <a class="project-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub · 检查更新</a>
       </div>
       <span id="health" class="badge pending">读取中</span>
     </header>
 
-    <nav class="app-tabs" role="tablist" aria-label="插件功能">
-      <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0">温度</button>
-      <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1">风扇控制</button>
-      <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1">按键控制</button>
-      <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1">硬盘槽位</button>
-    </nav>
+    <div class="app-layout">
+      <nav class="app-tabs" role="tablist" aria-label="插件功能">
+        <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">🌡</span>温度</button>
+        <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><span aria-hidden="true">◉</span>风扇控制</button>
+        <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><span aria-hidden="true">⌁</span>按键控制</button>
+        <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1"><span aria-hidden="true">▱</span>硬盘面板</button>
+      </nav>
 
-    <form id="config-form" class="tab-form">
+      <form id="config-form" class="tab-form">
       <section id="panel-temperature" class="tab-panel" role="tabpanel" aria-labelledby="tab-temperature">
         <section class="metrics" aria-label="运行状态">
           <article><span>处理器</span><strong id="cpu-model">—</strong></article>
           <article><span id="cpu-display-label">CPU 核心最高（RR 口径）</span><strong id="cpu-display-temperature">—</strong></article>
           <article><span>Package 原始温度</span><strong id="package-temperature">—</strong></article>
+          <article><span>HDD/SATA 最高温度</span><strong id="hdd-max-temperature">—</strong></article>
+          <article><span>NVMe 最高温度</span><strong id="nvme-max-temperature">—</strong></article>
           <article><span>当前 PL1</span><strong id="current-pl1">—</strong></article>
           <article><span>当前 PL2</span><strong id="current-pl2">—</strong></article>
           <article><span>机箱风扇</span><strong id="fan-rpm">—</strong></article>
+        </section>
+
+        <section class="storage-temperature-strip" aria-labelledby="storage-temperature-heading">
+          <div class="strip-heading">
+            <h2 id="storage-temperature-heading">硬盘温度与槽位状态</h2>
+            <span>前置 SATA 6 → 1，NVMe 1 → 4</span>
+          </div>
+          <div id="storage-temperature-cards" class="storage-temperature-cards"></div>
         </section>
 
         <section class="panel power-panel">
@@ -66,15 +75,14 @@
 
         <section class="details">
           <h2>诊断信息</h2>
-          <dl>
-            <div><dt>识别配置</dt><dd id="profile">—</dd></div>
-            <div><dt>温度显示来源</dt><dd id="temperature-source">—</dd></div>
-            <div><dt>GPU 运行状态</dt><dd id="gpu-runtime">—</dd></div>
-            <div><dt>风扇控制</dt><dd id="fan-control">—</dd></div>
-            <div><dt>最近应用</dt><dd id="last-apply">—</dd></div>
-            <div><dt>GPIO 按键</dt><dd id="gpio-diagnostic">—</dd></div>
-            <div><dt>状态</dt><dd id="last-error">—</dd></div>
-            <div class="temperature-row"><dt>原始 coretemp</dt><dd id="temperature-sensors">—</dd></div>
+          <dl class="diagnostic-grid">
+            <div class="diagnostic-card"><dt>识别配置</dt><dd id="profile">—</dd></div>
+            <div class="diagnostic-card"><dt>温度显示来源</dt><dd id="temperature-source">—</dd></div>
+            <div class="diagnostic-card"><dt>最近应用</dt><dd id="last-apply">—</dd></div>
+            <div class="diagnostic-card"><dt>状态</dt><dd id="last-error">—</dd></div>
+            <div class="diagnostic-card diagnostic-wide"><dt>风扇控制</dt><dd id="fan-control" class="diagnostic-chips">—</dd></div>
+            <div class="diagnostic-card diagnostic-wide"><dt>GPU 运行状态</dt><dd id="gpu-runtime" class="diagnostic-chips">—</dd></div>
+            <div class="diagnostic-card diagnostic-wide"><dt>原始 coretemp</dt><dd id="temperature-sensors" class="diagnostic-chips sensor-chips">—</dd></div>
           </dl>
           <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
           <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
@@ -85,8 +93,8 @@
         <section class="panel fan-editor" aria-labelledby="fan-heading">
           <div class="panel-heading fan-heading">
             <div>
-              <h2 id="fan-heading">CPU 与硬盘双温控曲线</h2>
-              <p>两条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
+              <h2 id="fan-heading">CPU、HDD 与 NVMe 三温控曲线</h2>
+              <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
               <p class="driver-link">未检测到风扇？<a href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">前往 GitHub 下载并安装 IT87 驱动</a></p>
             </div>
             <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
@@ -133,10 +141,10 @@
             </section>
             <section class="curve-editor" aria-labelledby="disk-curve-heading">
               <div class="curve-editor-heading">
-                <h3 id="disk-curve-heading">硬盘温度曲线</h3>
-                <span>取所有仓位最高盘温</span>
+                <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
+                <span>取六个前置仓最高温度</span>
               </div>
-              <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的硬盘温控曲线" aria-describedby="disk-curve-help"></svg>
+              <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 HDD 温控曲线" aria-describedby="disk-curve-help"></svg>
               <div class="curve-toolbar">
                 <div class="curve-actions">
                   <button id="disk-curve-add" type="button">＋ 增加节点</button>
@@ -144,10 +152,25 @@
                 </div>
                 <strong id="disk-curve-selected">—</strong>
               </div>
-              <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；盘温来自 60 秒 SMART 缓存。</p>
+              <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
+            </section>
+            <section class="curve-editor" aria-labelledby="nvme-curve-heading">
+              <div class="curve-editor-heading">
+                <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
+                <span>取四个 M.2 槽最高温度</span>
+              </div>
+              <svg id="nvme-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 NVMe 温控曲线" aria-describedby="nvme-curve-help"></svg>
+              <div class="curve-toolbar">
+                <div class="curve-actions">
+                  <button id="nvme-curve-add" type="button">＋ 增加节点</button>
+                  <button id="nvme-curve-remove" type="button">删除选中节点</button>
+                </div>
+                <strong id="nvme-curve-selected">—</strong>
+              </div>
+              <p id="nvme-curve-help">默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
             </section>
           </div>
-          <p class="notice curve-notice">最终转速 = CPU 曲线目标与硬盘曲线目标的较高值；硬盘温度暂不可用时只按 CPU 曲线控制。</p>
+          <p class="notice curve-notice">最终转速 = CPU、HDD/SATA 与 NVMe 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
         </section>
       </section>
 
@@ -179,14 +202,14 @@
         <section class="panel storage-panel" aria-labelledby="storage-heading">
           <div class="panel-heading">
             <div>
-              <h2 id="storage-heading">硬盘仓位</h2>
+              <h2 id="storage-heading">硬盘面板</h2>
               <p>前置仓位按机箱正面从左到右 6 → 1 显示；M.2 按主板槽位 1 → 4 显示。</p>
             </div>
             <span id="storage-updated" class="table-meta">等待刷新</span>
           </div>
           <div class="table-scroll">
             <table class="status-table storage-table">
-              <thead><tr><th>仓位</th><th>状态</th><th>设备</th><th>用途</th><th>健康</th><th>温度</th></tr></thead>
+              <thead><tr><th>仓位</th><th>状态</th><th>活动</th><th>设备</th><th>用途</th><th>健康</th><th>温度</th></tr></thead>
               <tbody id="storage-body"></tbody>
             </table>
           </div>
@@ -200,7 +223,8 @@
         <button id="restore" type="button" class="danger">恢复安装前配置</button>
       </div>
       <p id="message" class="message" role="status" aria-live="polite"></p>
-    </form>
+      </form>
+    </div>
   </main>
   <script src="app.js" defer></script>
 </body>

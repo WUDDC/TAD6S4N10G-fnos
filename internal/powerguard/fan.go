@@ -28,7 +28,9 @@ type FanConfig struct {
 	EmergencyTempC float64    `json:"emergency_temp_c"`
 	PollSeconds    int        `json:"poll_seconds"`
 	Curve          []FanPoint `json:"curve"`
-	DiskCurve      []FanPoint `json:"disk_curve"`
+	DiskCurve      []FanPoint `json:"disk_curve,omitempty"`
+	HDDCurve       []FanPoint `json:"hdd_curve"`
+	NVMeCurve      []FanPoint `json:"nvme_curve"`
 }
 
 type FanDevice struct {
@@ -60,9 +62,13 @@ type FanControlStatus struct {
 	TemperatureC         float64     `json:"temperature_c,omitempty"`
 	CPUTemperatureC      float64     `json:"cpu_temperature_c,omitempty"`
 	DiskTemperatureC     float64     `json:"disk_temperature_c,omitempty"`
+	HDDTemperatureC      float64     `json:"hdd_temperature_c,omitempty"`
+	NVMeTemperatureC     float64     `json:"nvme_temperature_c,omitempty"`
 	TargetPWMPercent     int         `json:"target_pwm_percent,omitempty"`
 	CPUTargetPWMPercent  int         `json:"cpu_target_pwm_percent,omitempty"`
 	DiskTargetPWMPercent int         `json:"disk_target_pwm_percent,omitempty"`
+	HDDTargetPWMPercent  int         `json:"hdd_target_pwm_percent,omitempty"`
+	NVMeTargetPWMPercent int         `json:"nvme_target_pwm_percent,omitempty"`
 	ControlSource        string      `json:"control_source,omitempty"`
 	Fans                 []FanStatus `json:"fans"`
 	LastApply            time.Time   `json:"last_apply,omitempty"`
@@ -94,11 +100,12 @@ func DefaultFanConfig() FanConfig {
 			{TempC: 80, PWMPercent: 100},
 		},
 	}
-	config.DiskCurve = defaultDiskFanCurve(config.MinPWMPercent)
+	config.HDDCurve = defaultStorageFanCurve(config.MinPWMPercent)
+	config.NVMeCurve = defaultStorageFanCurve(config.MinPWMPercent)
 	return config
 }
 
-func defaultDiskFanCurve(minimum int) []FanPoint {
+func defaultStorageFanCurve(minimum int) []FanPoint {
 	minimum = max(30, min(minimum, 100))
 	return []FanPoint{
 		{TempC: 25, PWMPercent: minimum},
@@ -117,8 +124,20 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.Fan.DeviceID = deviceID
 		changed = true
 	}
-	if cfg.Fan.DiskCurve == nil {
-		cfg.Fan.DiskCurve = defaultDiskFanCurve(cfg.Fan.MinPWMPercent)
+	if cfg.Fan.HDDCurve == nil {
+		if cfg.Fan.DiskCurve != nil {
+			cfg.Fan.HDDCurve = append([]FanPoint(nil), cfg.Fan.DiskCurve...)
+		} else {
+			cfg.Fan.HDDCurve = defaultStorageFanCurve(cfg.Fan.MinPWMPercent)
+		}
+		changed = true
+	}
+	if cfg.Fan.NVMeCurve == nil {
+		cfg.Fan.NVMeCurve = defaultStorageFanCurve(cfg.Fan.MinPWMPercent)
+		changed = true
+	}
+	if cfg.Fan.DiskCurve != nil {
+		cfg.Fan.DiskCurve = nil
 		changed = true
 	}
 	if cfg.GPIO.Version == 0 {
@@ -141,7 +160,10 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if err := validateFanCurve("CPU", cfg.Curve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
 		return err
 	}
-	if err := validateFanCurve("disk", cfg.DiskCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+	if err := validateFanCurve("HDD", cfg.HDDCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+		return err
+	}
+	if err := validateFanCurve("NVMe", cfg.NVMeCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
 		return err
 	}
 	if !cfg.Enabled {
@@ -306,8 +328,10 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		failSafeErr := setFanPWM(*selected, 100)
 		return errors.Join(fmt.Errorf("temperature sensor failed; fan forced to full speed: %w", tempErr), failSafeErr)
 	}
-	diskTemperature, diskAvailable := maximumStorageTemperature(m.StorageStatus())
-	_, _, target := fanTargets(cfg, temperature, diskTemperature, diskAvailable)
+	storage := m.StorageStatus()
+	hddTemperature, hddAvailable := maximumStorageTemperature(storage, "front")
+	nvmeTemperature, nvmeAvailable := maximumStorageTemperature(storage, "m2")
+	_, _, _, target := fanTargets(cfg, temperature, hddTemperature, hddAvailable, nvmeTemperature, nvmeAvailable)
 	if err := setFanPWM(*selected, target); err != nil {
 		failSafeErr := setFanPWM(*selected, 100)
 		return errors.Join(fmt.Errorf("set fan %s to %d%%: %w", selected.ID, target, err), failSafeErr)
@@ -397,20 +421,24 @@ func interpolatePWMPercent(points []FanPoint, tempC float64, minimum int, emerge
 	return value
 }
 
-func fanTargets(cfg FanConfig, cpuTemperature, diskTemperature float64, diskAvailable bool) (int, int, int) {
+func fanTargets(cfg FanConfig, cpuTemperature, hddTemperature float64, hddAvailable bool, nvmeTemperature float64, nvmeAvailable bool) (int, int, int, int) {
 	cpuTarget := interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
-	diskTarget := 0
-	if diskAvailable {
-		diskTarget = interpolatePWMPercent(cfg.DiskCurve, diskTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	hddTarget := 0
+	if hddAvailable {
+		hddTarget = interpolatePWMPercent(cfg.HDDCurve, hddTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 	}
-	return cpuTarget, diskTarget, max(cpuTarget, diskTarget)
+	nvmeTarget := 0
+	if nvmeAvailable {
+		nvmeTarget = interpolatePWMPercent(cfg.NVMeCurve, nvmeTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	}
+	return cpuTarget, hddTarget, nvmeTarget, max(cpuTarget, hddTarget, nvmeTarget)
 }
 
-func maximumStorageTemperature(status StorageStatus) (float64, bool) {
+func maximumStorageTemperature(status StorageStatus, kind string) (float64, bool) {
 	maximum := 0.0
 	available := false
 	for _, slot := range status.Slots {
-		if slot.TemperatureC <= 0 {
+		if slot.Kind != kind || slot.TemperatureC <= 0 {
 			continue
 		}
 		if !available || slot.TemperatureC > maximum {
@@ -419,6 +447,24 @@ func maximumStorageTemperature(status StorageStatus) (float64, bool) {
 		}
 	}
 	return maximum, available
+}
+
+func fanControlSource(cpuTarget, hddTarget, nvmeTarget int) string {
+	target := max(cpuTarget, hddTarget, nvmeTarget)
+	if target <= 0 {
+		return ""
+	}
+	var sources []string
+	if cpuTarget == target {
+		sources = append(sources, "cpu")
+	}
+	if hddTarget == target {
+		sources = append(sources, "hdd")
+	}
+	if nvmeTarget == target {
+		sources = append(sources, "nvme")
+	}
+	return strings.Join(sources, "+")
 }
 
 func (m *Manager) controlTemperature() (float64, error) {
@@ -584,23 +630,23 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 	} else if cfg.Enabled {
 		result.LastError = combineError(result.LastError, err)
 	}
-	if temperature, available := maximumStorageTemperature(m.StorageStatus()); available {
-		result.DiskTemperatureC = temperature
-		if len(cfg.DiskCurve) >= 2 {
-			result.DiskTargetPWMPercent = interpolatePWMPercent(cfg.DiskCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	storage := m.StorageStatus()
+	if temperature, available := maximumStorageTemperature(storage, "front"); available {
+		result.HDDTemperatureC = temperature
+		if len(cfg.HDDCurve) >= 2 {
+			result.HDDTargetPWMPercent = interpolatePWMPercent(cfg.HDDCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	}
-	if result.CPUTargetPWMPercent > 0 {
-		result.TargetPWMPercent = max(result.CPUTargetPWMPercent, result.DiskTargetPWMPercent)
-		switch {
-		case result.DiskTargetPWMPercent > result.CPUTargetPWMPercent:
-			result.ControlSource = "disk"
-		case result.DiskTargetPWMPercent == result.CPUTargetPWMPercent && result.DiskTargetPWMPercent > 0:
-			result.ControlSource = "cpu+disk"
-		default:
-			result.ControlSource = "cpu"
+	if temperature, available := maximumStorageTemperature(storage, "m2"); available {
+		result.NVMeTemperatureC = temperature
+		if len(cfg.NVMeCurve) >= 2 {
+			result.NVMeTargetPWMPercent = interpolatePWMPercent(cfg.NVMeCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	}
+	result.DiskTemperatureC = max(result.HDDTemperatureC, result.NVMeTemperatureC)
+	result.DiskTargetPWMPercent = max(result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)
+	result.TargetPWMPercent = max(result.CPUTargetPWMPercent, result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)
+	result.ControlSource = fanControlSource(result.CPUTargetPWMPercent, result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)
 	return result
 }
 

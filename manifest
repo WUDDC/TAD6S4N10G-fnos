@@ -1,7 +1,7 @@
 appname=powerguard
-version=0.5.0
+version=0.6.0
 display_name=TAD模块
-desc=面向 TAD6S4N10G 的温度、功耗、CPU/硬盘双曲线风扇、硬盘仓位与 GPIO 按键管理模块。
+desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
 source=thirdparty
 platform=x86
 arch=x86_64
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=powerguard.Application
 checkport=false
 disable_authorization_path=false
-changelog=风扇控制新增 CPU 与硬盘两条可拖拽曲线并取较高目标转速；插件显示名称统一改为 TAD模块。
+changelog=界面重写为 fnOS 浅色应用风格；新增 SATA/NVMe 槽位温度与活动状态；风扇控制拆分为 CPU、HDD 和 NVMe 三条曲线并取最高目标转速。

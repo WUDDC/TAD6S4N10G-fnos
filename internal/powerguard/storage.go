@@ -21,6 +21,11 @@ const (
 	StorageUsed    = "used"
 	StorageWarning = "warning"
 	StorageUnknown = "unknown"
+
+	StorageActivityBusy     = "busy"
+	StorageActivityIdle     = "idle"
+	StorageActivitySleeping = "sleeping"
+	StorageActivityUnknown  = "unknown"
 )
 
 type StorageSlot struct {
@@ -28,6 +33,7 @@ type StorageSlot struct {
 	Kind         string  `json:"kind"`
 	Slot         int     `json:"slot"`
 	State        string  `json:"state"`
+	Activity     string  `json:"activity,omitempty"`
 	BusPath      string  `json:"bus_path"`
 	Device       string  `json:"device,omitempty"`
 	Model        string  `json:"model,omitempty"`
@@ -96,6 +102,13 @@ type smartResult struct {
 	TemperatureC   float64
 	Critical       int64
 	PercentageUsed int64
+	PowerMode      string
+}
+
+type blockIOSample struct {
+	Reads    uint64
+	Writes   uint64
+	InFlight uint64
 }
 
 func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
@@ -178,6 +191,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 			slot.State = StorageUsed
 		}
 		slot.Purpose = strings.Join(info.Purposes, "、")
+		slot.Activity = m.readBlockActivity(kname)
 		if warning := m.mdWarning(info.Purposes); warning != "" {
 			slot.State = StorageWarning
 			slot.Warning = warning
@@ -201,6 +215,9 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 			continue
 		}
 		slot.TemperatureC = result.TemperatureC
+		if powerModeIsSleeping(result.PowerMode) {
+			slot.Activity = StorageActivitySleeping
+		}
 		slot.Health = "正常"
 		var warnings []string
 		if result.Passed != nil && !*result.Passed {
@@ -342,6 +359,38 @@ func (m *Manager) readBlockInfoFromSysfs(kname string) blockInfo {
 	return info
 }
 
+func (m *Manager) readBlockActivity(kname string) string {
+	data, err := os.ReadFile(filepath.Join(m.rooted("/sys/class/block"), kname, "stat"))
+	if err != nil {
+		return StorageActivityUnknown
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) < 9 {
+		return StorageActivityUnknown
+	}
+	reads, readErr := strconv.ParseUint(fields[0], 10, 64)
+	writes, writeErr := strconv.ParseUint(fields[4], 10, 64)
+	inFlight, flightErr := strconv.ParseUint(fields[8], 10, 64)
+	if readErr != nil || writeErr != nil || flightErr != nil {
+		return StorageActivityUnknown
+	}
+	sample := blockIOSample{Reads: reads, Writes: writes, InFlight: inFlight}
+	if m.storageIO == nil {
+		m.storageIO = make(map[string]blockIOSample)
+	}
+	previous, hadPrevious := m.storageIO[kname]
+	m.storageIO[kname] = sample
+	if sample.InFlight > 0 || (hadPrevious && (sample.Reads != previous.Reads || sample.Writes != previous.Writes)) {
+		return StorageActivityBusy
+	}
+	return StorageActivityIdle
+}
+
+func powerModeIsSleeping(mode string) bool {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	return strings.Contains(mode, "standby") || strings.Contains(mode, "sleep")
+}
+
 func (m *Manager) mdWarning(purposes []string) string {
 	for _, purpose := range purposes {
 		if !strings.HasPrefix(purpose, "md") {
@@ -400,6 +449,7 @@ func parseSMART(data []byte) (smartResult, error) {
 			Temperature     float64 `json:"temperature"`
 			PercentageUsed  int64   `json:"percentage_used"`
 		} `json:"nvme_smart_health_information_log"`
+		PowerMode string `json:"power_mode"`
 	}
 	if err := json.Unmarshal(data, &document); err != nil {
 		return smartResult{}, fmt.Errorf("解析 SMART JSON: %w", err)
@@ -411,5 +461,6 @@ func parseSMART(data []byte) (smartResult, error) {
 	return smartResult{
 		Passed: document.SmartStatus.Passed, TemperatureC: temperature,
 		Critical: document.NVMe.CriticalWarning, PercentageUsed: document.NVMe.PercentageUsed,
+		PowerMode: document.PowerMode,
 	}, nil
 }

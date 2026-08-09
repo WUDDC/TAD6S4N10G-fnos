@@ -1,6 +1,8 @@
 package powerguard
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -60,6 +62,43 @@ func TestParseSMARTReportsNVMeWarningData(t *testing.T) {
 	}
 	if result.Passed == nil || *result.Passed || result.Critical != 4 || result.PercentageUsed != 104 || result.TemperatureC != 45 {
 		t.Fatalf("unexpected SMART result: %+v", result)
+	}
+}
+
+func TestParseSMARTReportsStandbyPowerMode(t *testing.T) {
+	result, err := parseSMART([]byte(`{"power_mode":"STANDBY"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !powerModeIsSleeping(result.PowerMode) {
+		t.Fatalf("expected standby power mode, got %+v", result)
+	}
+}
+
+func TestReadBlockActivityUsesInflightIO(t *testing.T) {
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "sda", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	if err := os.WriteFile(statPath, []byte("1 0 8 2 3 0 9 4 1 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.readBlockActivity("sda"); got != StorageActivityBusy {
+		t.Fatalf("got %q, want busy", got)
+	}
+	if err := os.WriteFile(statPath, []byte("1 0 8 2 3 0 9 4 0 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.readBlockActivity("sda"); got != StorageActivityIdle {
+		t.Fatalf("got %q, want idle", got)
+	}
+	if err := os.WriteFile(statPath, []byte("2 0 8 2 3 0 9 4 0 0 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.readBlockActivity("sda"); got != StorageActivityBusy {
+		t.Fatalf("got %q after I/O counter changed, want busy", got)
 	}
 }
 

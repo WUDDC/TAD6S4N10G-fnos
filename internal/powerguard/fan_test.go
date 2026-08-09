@@ -17,8 +17,10 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 	if len(cfg.Curve) != 4 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
 		t.Fatalf("unexpected default curve: %+v", cfg.Curve)
 	}
-	if len(cfg.DiskCurve) != 3 || cfg.DiskCurve[0].TempC != 25 || cfg.DiskCurve[0].PWMPercent != 60 || cfg.DiskCurve[1].TempC != 35 || cfg.DiskCurve[1].PWMPercent != 85 || cfg.DiskCurve[2].TempC != 50 || cfg.DiskCurve[2].PWMPercent != 100 {
-		t.Fatalf("unexpected default disk curve: %+v", cfg.DiskCurve)
+	for name, curve := range map[string][]FanPoint{"HDD": cfg.HDDCurve, "NVMe": cfg.NVMeCurve} {
+		if len(curve) != 3 || curve[0].TempC != 25 || curve[0].PWMPercent != 60 || curve[1].TempC != 35 || curve[1].PWMPercent != 85 || curve[2].TempC != 50 || curve[2].PWMPercent != 100 {
+			t.Fatalf("unexpected default %s curve: %+v", name, curve)
+		}
 	}
 }
 
@@ -128,7 +130,7 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	if !normalizeConfig(&cfg) {
 		t.Fatal("legacy config was not migrated")
 	}
-	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.DiskCurve) != 3 {
+	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 {
 		t.Fatalf("unexpected migrated fan config: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
@@ -136,19 +138,30 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	}
 }
 
-func TestNormalizeConfigAddsDiskCurveWithoutReplacingCPUCurve(t *testing.T) {
+func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) {
 	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
 	cfg.Fan.MinPWMPercent = 30
 	cfg.Fan.Curve = []FanPoint{{TempC: 40, PWMPercent: 30}, {TempC: 70, PWMPercent: 90}}
-	cfg.Fan.DiskCurve = nil
+	cfg.Fan.DiskCurve = []FanPoint{{TempC: 28, PWMPercent: 30}, {TempC: 48, PWMPercent: 100}}
+	cfg.Fan.HDDCurve = nil
+	cfg.Fan.NVMeCurve = nil
 	if !normalizeConfig(&cfg) {
-		t.Fatal("config without disk curve was not migrated")
+		t.Fatal("v0.5 config was not migrated")
 	}
 	if len(cfg.Fan.Curve) != 2 || cfg.Fan.Curve[0].PWMPercent != 30 {
 		t.Fatalf("CPU curve was replaced during migration: %+v", cfg.Fan.Curve)
 	}
-	if len(cfg.Fan.DiskCurve) != 3 || cfg.Fan.DiskCurve[0].PWMPercent != 30 || cfg.Fan.DiskCurve[1].PWMPercent != 85 {
-		t.Fatalf("disk curve did not inherit the configured minimum: %+v", cfg.Fan.DiskCurve)
+	if len(cfg.Fan.HDDCurve) != 2 || cfg.Fan.HDDCurve[0].TempC != 28 || cfg.Fan.HDDCurve[1].PWMPercent != 100 {
+		t.Fatalf("legacy disk curve was not copied to HDD: %+v", cfg.Fan.HDDCurve)
+	}
+	if len(cfg.Fan.NVMeCurve) != 3 || cfg.Fan.NVMeCurve[0].PWMPercent != 30 || cfg.Fan.NVMeCurve[1].PWMPercent != 85 {
+		t.Fatalf("NVMe curve did not inherit the configured minimum: %+v", cfg.Fan.NVMeCurve)
+	}
+	if cfg.Fan.DiskCurve != nil {
+		t.Fatalf("legacy disk curve was not cleared: %+v", cfg.Fan.DiskCurve)
+	}
+	if normalizeConfig(&cfg) {
+		t.Fatal("migrated config changed a second time")
 	}
 }
 
@@ -156,34 +169,49 @@ func TestFanTargetsUseHigherCurve(t *testing.T) {
 	cfg := DefaultFanConfig()
 	cfg.MinPWMPercent = 30
 	cfg.Curve = []FanPoint{{TempC: 40, PWMPercent: 30}, {TempC: 80, PWMPercent: 100}}
-	cfg.DiskCurve = defaultDiskFanCurve(cfg.MinPWMPercent)
+	cfg.HDDCurve = defaultStorageFanCurve(cfg.MinPWMPercent)
+	cfg.NVMeCurve = []FanPoint{{TempC: 30, PWMPercent: 30}, {TempC: 70, PWMPercent: 90}}
 
-	cpu, disk, target := fanTargets(cfg, 60, 25, true)
-	if cpu != 65 || disk != 30 || target != 65 {
-		t.Fatalf("CPU should control at a cool disk temperature: cpu=%d disk=%d target=%d", cpu, disk, target)
+	cpu, hdd, nvme, target := fanTargets(cfg, 60, 25, true, 30, true)
+	if cpu != 65 || hdd != 30 || nvme != 30 || target != 65 {
+		t.Fatalf("CPU should control cool storage: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
-	cpu, disk, target = fanTargets(cfg, 45, 35, true)
-	if cpu != 39 || disk != 85 || target != 85 {
-		t.Fatalf("disk should control: cpu=%d disk=%d target=%d", cpu, disk, target)
+	cpu, hdd, nvme, target = fanTargets(cfg, 45, 35, true, 30, true)
+	if cpu != 39 || hdd != 85 || nvme != 30 || target != 85 {
+		t.Fatalf("HDD should control: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
-	_, disk, target = fanTargets(cfg, 45, 50, true)
-	if disk != 100 || target != 100 {
-		t.Fatalf("disk at 50C should force full speed: disk=%d target=%d", disk, target)
+	cpu, hdd, nvme, target = fanTargets(cfg, 45, 25, true, 70, true)
+	if cpu != 39 || hdd != 30 || nvme != 90 || target != 90 {
+		t.Fatalf("NVMe should control: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
-	_, disk, target = fanTargets(cfg, 45, 0, false)
-	if disk != 0 || target != 39 {
-		t.Fatalf("missing disk temperature should not affect target: disk=%d target=%d", disk, target)
+	_, hdd, nvme, target = fanTargets(cfg, 45, 0, false, 0, false)
+	if hdd != 0 || nvme != 0 || target != 39 {
+		t.Fatalf("missing storage temperature should not affect target: hdd=%d nvme=%d target=%d", hdd, nvme, target)
 	}
 }
 
-func TestMaximumStorageTemperature(t *testing.T) {
-	temperature, available := maximumStorageTemperature(StorageStatus{Slots: []StorageSlot{
+func TestMaximumStorageTemperatureByKind(t *testing.T) {
+	storage := StorageStatus{Slots: []StorageSlot{
 		{ID: "front-1", TemperatureC: 43},
-		{ID: "front-2", TemperatureC: 0},
-		{ID: "m2-1", TemperatureC: 58},
-	}})
-	if !available || temperature != 58 {
-		t.Fatalf("temperature=%.1f available=%v, want 58 true", temperature, available)
+		{ID: "front-2", Kind: "front", TemperatureC: 44},
+		{ID: "m2-1", Kind: "m2", TemperatureC: 58},
+		{ID: "m2-2", Kind: "m2", TemperatureC: 64},
+	}}
+	storage.Slots[0].Kind = "front"
+	if temperature, available := maximumStorageTemperature(storage, "front"); !available || temperature != 44 {
+		t.Fatalf("HDD temperature=%.1f available=%v, want 44 true", temperature, available)
+	}
+	if temperature, available := maximumStorageTemperature(storage, "m2"); !available || temperature != 64 {
+		t.Fatalf("NVMe temperature=%.1f available=%v, want 64 true", temperature, available)
+	}
+}
+
+func TestFanControlSourceReportsAllTiedSources(t *testing.T) {
+	if source := fanControlSource(85, 85, 70); source != "cpu+hdd" {
+		t.Fatalf("source=%q, want cpu+hdd", source)
+	}
+	if source := fanControlSource(100, 100, 100); source != "cpu+hdd+nvme" {
+		t.Fatalf("source=%q, want cpu+hdd+nvme", source)
 	}
 }
 
@@ -195,11 +223,11 @@ func TestFanValidationRejectsDecreasingSpeed(t *testing.T) {
 	}
 }
 
-func TestFanValidationRejectsDecreasingDiskSpeed(t *testing.T) {
+func TestFanValidationRejectsDecreasingStorageSpeed(t *testing.T) {
 	cfg := DefaultFanConfig()
-	cfg.DiskCurve[2].PWMPercent = 40
+	cfg.NVMeCurve[2].PWMPercent = 40
 	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
-		t.Fatal("decreasing disk PWM curve was accepted")
+		t.Fatal("decreasing NVMe PWM curve was accepted")
 	}
 }
 
