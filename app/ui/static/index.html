@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>N100/N305 功耗卫士</title>
+  <title>N100/N305 功耗与风扇卫士</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,8 +12,8 @@
       <div class="brand-mark" aria-hidden="true">⚡</div>
       <div>
         <p class="eyebrow">fnOS Power Guard</p>
-        <h1>N100/N305 功耗卫士</h1>
-        <p class="subtitle">限制 CPU 与核显共享的 Package 功耗，抑制 GPU 调用时的快速升温。</p>
+        <h1>N100/N305 功耗与风扇卫士</h1>
+        <p class="subtitle">限制 CPU 与核显共享的 Package 功耗，并按真实 CPU 温度控制单风扇转速。</p>
       </div>
       <span id="health" class="badge pending">读取中</span>
     </header>
@@ -23,6 +23,7 @@
       <article><span>Package 温度</span><strong id="temperature">—</strong></article>
       <article><span>当前 PL1</span><strong id="current-pl1">—</strong></article>
       <article><span>当前 PL2</span><strong id="current-pl2">—</strong></article>
+      <article><span>机箱风扇</span><strong id="fan-rpm">—</strong></article>
     </section>
 
     <section class="panel">
@@ -50,6 +51,51 @@
           <div class="input-wrap"><input id="interval" type="number" min="5" max="300" step="1" required><b>秒</b></div>
           <small>系统或休眠恢复覆盖限制后自动重应用</small>
         </label>
+
+        <section class="fan-editor" aria-labelledby="fan-heading">
+          <div class="panel-heading fan-heading">
+            <div>
+              <h2 id="fan-heading">单风扇温控曲线</h2>
+              <p>仅控制带有效转速反馈的 IT87 风扇通道；传感器异常或达到紧急温度时自动满速。</p>
+            </div>
+            <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
+          </div>
+
+          <div class="fan-settings">
+            <label>
+              <span>控制风扇</span>
+              <select id="fan-device" required></select>
+              <small id="fan-device-status">正在检测 IT87 风扇</small>
+            </label>
+            <label>
+              <span>最低转速</span>
+              <div class="input-wrap"><input id="fan-min" type="number" min="30" max="100" step="1" required><b>%</b></div>
+              <small>为防止停转，最低允许 30%</small>
+            </label>
+            <label>
+              <span>紧急满速温度</span>
+              <div class="input-wrap"><input id="fan-emergency" type="number" min="70" max="100" step="1" required><b>°C</b></div>
+              <small>达到此温度立即强制 100%</small>
+            </label>
+            <label>
+              <span>采样间隔</span>
+              <div class="input-wrap"><input id="fan-poll" type="number" min="1" max="10" step="1" required><b>秒</b></div>
+              <small>建议保持 2 秒</small>
+            </label>
+          </div>
+
+          <div class="curve-layout">
+            <svg id="fan-curve-chart" viewBox="0 0 640 260" role="img" aria-label="风扇温控曲线"></svg>
+            <div class="curve-points" aria-label="风扇曲线节点">
+              <div class="curve-row curve-labels"><span>温度 °C</span><span>转速 %</span></div>
+              <div class="curve-row"><input class="curve-temp" type="number" min="20" max="100" step="1" required><input class="curve-pwm" type="number" min="30" max="100" step="1" required></div>
+              <div class="curve-row"><input class="curve-temp" type="number" min="20" max="100" step="1" required><input class="curve-pwm" type="number" min="30" max="100" step="1" required></div>
+              <div class="curve-row"><input class="curve-temp" type="number" min="20" max="100" step="1" required><input class="curve-pwm" type="number" min="30" max="100" step="1" required></div>
+              <div class="curve-row"><input class="curve-temp" type="number" min="20" max="100" step="1" required><input class="curve-pwm" type="number" min="30" max="100" step="1" required></div>
+            </div>
+          </div>
+        </section>
+
         <div class="actions">
           <button type="submit" class="primary">保存并应用</button>
           <button id="apply-now" type="button">立即重应用</button>
@@ -64,10 +110,11 @@
       <dl>
         <div><dt>识别配置</dt><dd id="profile">—</dd></div>
         <div><dt>GPU 运行状态</dt><dd id="gpu-runtime">—</dd></div>
+        <div><dt>风扇控制</dt><dd id="fan-control">—</dd></div>
         <div><dt>最近应用</dt><dd id="last-apply">—</dd></div>
         <div><dt>状态</dt><dd id="last-error">—</dd></div>
       </dl>
-      <p class="notice">降低功耗可能减少极限性能，但不会修改 BIOS、内核或飞牛系统文件。停止或卸载插件时会恢复首次安装前捕获的限制。</p>
+      <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
     </section>
   </main>
   <script src="app.js" defer></script>

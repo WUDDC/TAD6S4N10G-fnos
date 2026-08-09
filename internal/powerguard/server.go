@@ -9,17 +9,20 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
 type Server struct {
-	Manager  *Manager
-	Socket   string
-	WebRoot  string
-	BasePath string
-	Logger   *log.Logger
+	Manager     *Manager
+	Socket      string
+	WebRoot     string
+	BasePath    string
+	SocketGroup string
+	Logger      *log.Logger
 }
 
 func (s *Server) ListenAndServe() error {
@@ -34,6 +37,9 @@ func (s *Server) ListenAndServe() error {
 	}
 	if s.Logger == nil {
 		s.Logger = log.Default()
+	}
+	if s.SocketGroup == "" {
+		s.SocketGroup = "www-data"
 	}
 	if err := os.MkdirAll(filepath.Dir(s.Socket), 0o755); err != nil {
 		return err
@@ -54,7 +60,18 @@ func (s *Server) ListenAndServe() error {
 	}
 	defer listener.Close()
 	defer os.Remove(s.Socket)
-	if err := os.Chmod(s.Socket, 0o666); err != nil {
+	group, err := user.LookupGroup(s.SocketGroup)
+	if err != nil {
+		return fmt.Errorf("lookup socket group %s: %w", s.SocketGroup, err)
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		return fmt.Errorf("parse socket group %s gid %q: %w", s.SocketGroup, group.Gid, err)
+	}
+	if err := os.Chown(s.Socket, -1, gid); err != nil {
+		return fmt.Errorf("set socket group %s: %w", s.SocketGroup, err)
+	}
+	if err := os.Chmod(s.Socket, 0o660); err != nil {
 		return err
 	}
 
@@ -94,7 +111,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以修改功耗配置")
+		writeError(w, http.StatusForbidden, "仅管理员可以修改功耗与风扇配置")
 		return
 	}
 	defer r.Body.Close()
@@ -118,7 +135,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以应用功耗配置")
+		writeError(w, http.StatusForbidden, "仅管理员可以应用功耗与风扇配置")
 		return
 	}
 	if err := s.Manager.ApplyCurrent(); err != nil {
@@ -134,7 +151,7 @@ func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以恢复原始功耗配置")
+		writeError(w, http.StatusForbidden, "仅管理员可以恢复原始功耗与风扇配置")
 		return
 	}
 	if err := s.Manager.DisableAndRestore(); err != nil {

@@ -33,10 +33,11 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool  `json:"enabled"`
-	PL1W           int64 `json:"pl1_w"`
-	PL2W           int64 `json:"pl2_w"`
-	ReapplySeconds int   `json:"reapply_seconds"`
+	Enabled        bool      `json:"enabled"`
+	PL1W           int64     `json:"pl1_w"`
+	PL2W           int64     `json:"pl2_w"`
+	ReapplySeconds int       `json:"reapply_seconds"`
+	Fan            FanConfig `json:"fan"`
 }
 
 type Constraint struct {
@@ -84,18 +85,19 @@ type PackageStatus struct {
 }
 
 type Status struct {
-	Version          string          `json:"version"`
-	CPUModel         string          `json:"cpu_model"`
-	Profile          Profile         `json:"profile"`
-	Supported        bool            `json:"supported"`
-	Config           Config          `json:"config"`
-	EffectiveMaxPL1W int64           `json:"effective_max_pl1_w"`
-	EffectiveMaxPL2W int64           `json:"effective_max_pl2_w"`
-	Packages         []PackageStatus `json:"packages"`
-	Temperatures     []Temperature   `json:"temperatures"`
-	GPURuntime       []string        `json:"gpu_runtime"`
-	LastApply        time.Time       `json:"last_apply,omitempty"`
-	LastError        string          `json:"last_error,omitempty"`
+	Version          string           `json:"version"`
+	CPUModel         string           `json:"cpu_model"`
+	Profile          Profile          `json:"profile"`
+	Supported        bool             `json:"supported"`
+	Config           Config           `json:"config"`
+	EffectiveMaxPL1W int64            `json:"effective_max_pl1_w"`
+	EffectiveMaxPL2W int64            `json:"effective_max_pl2_w"`
+	Packages         []PackageStatus  `json:"packages"`
+	Temperatures     []Temperature    `json:"temperatures"`
+	GPURuntime       []string         `json:"gpu_runtime"`
+	FanControl       FanControlStatus `json:"fan_control"`
+	LastApply        time.Time        `json:"last_apply,omitempty"`
+	LastError        string           `json:"last_error,omitempty"`
 }
 
 type Manager struct {
@@ -104,9 +106,13 @@ type Manager struct {
 	StatePath  string
 	Version    string
 
-	mu        sync.Mutex
-	lastApply time.Time
-	lastError string
+	mu            sync.Mutex
+	lastApply     time.Time
+	lastError     string
+	fanLastApply  time.Time
+	fanLastError  string
+	fanLastTarget int
+	fanLastTemp   float64
 }
 
 func DetectProfile(model string) (Profile, error) {
@@ -125,7 +131,7 @@ func DetectProfile(model string) (Profile, error) {
 }
 
 func DefaultConfig(profile Profile) Config {
-	return Config{Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2, ReapplySeconds: 30}
+	return Config{Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2, ReapplySeconds: 30, Fan: DefaultFanConfig()}
 }
 
 func (m *Manager) CPUModel() (string, error) {
@@ -171,12 +177,19 @@ func (m *Manager) LoadOrCreateConfig() (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
+	if normalizeConfig(&cfg) {
+		if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+			return Config{}, fmt.Errorf("migrate config: %w", err)
+		}
+	}
 	return cfg, nil
 }
 
 func (m *Manager) SaveAndApply(cfg Config) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	normalizeConfig(&cfg)
+	previous, previousErr := m.loadConfigLocked()
 	if err := m.validateLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
@@ -185,7 +198,12 @@ func (m *Manager) SaveAndApply(cfg Config) error {
 		m.lastError = err.Error()
 		return err
 	}
-	err := m.applyLocked(cfg)
+	var errs []error
+	if previousErr == nil && previous.Fan.Enabled && !cfg.Fan.Enabled {
+		errs = append(errs, m.restoreFansLocked())
+	}
+	errs = append(errs, m.applyLocked(cfg))
+	err := errors.Join(errs...)
 	if err != nil {
 		m.lastError = err.Error()
 		return err
@@ -234,6 +252,7 @@ func (m *Manager) DisableAndRestore() error {
 		return err
 	}
 	cfg.Enabled = false
+	cfg.Fan.Enabled = false
 	if err := m.validateLocked(cfg); err != nil {
 		return err
 	}
@@ -271,6 +290,9 @@ func (m *Manager) validateLocked(cfg Config) error {
 	}
 	if cfg.PL2W < cfg.PL1W || cfg.PL2W > profile.MaxPL2 {
 		return fmt.Errorf("PL2 must be at least PL1 and no more than %dW for %s", profile.MaxPL2, profile.Display)
+	}
+	if err := m.validateFanLocked(cfg.Fan); err != nil {
+		return err
 	}
 	packages, err := m.DiscoverPackages()
 	if err != nil {
@@ -344,9 +366,19 @@ func (m *Manager) DiscoverPackages() ([]Package, error) {
 }
 
 func (m *Manager) applyLocked(cfg Config) error {
-	if !cfg.Enabled {
-		return m.restoreLocked()
+	var errs []error
+	if cfg.Enabled {
+		errs = append(errs, m.applyPowerLocked(cfg))
+	} else {
+		errs = append(errs, m.restorePowerLocked())
 	}
+	if cfg.Fan.Enabled {
+		errs = append(errs, m.applyFanLocked(cfg.Fan))
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) applyPowerLocked(cfg Config) error {
 	packages, err := m.DiscoverPackages()
 	if err != nil {
 		return err
@@ -439,6 +471,10 @@ func (m *Manager) captureOriginalLocked(packages []Package) error {
 }
 
 func (m *Manager) restoreLocked() error {
+	return errors.Join(m.restorePowerLocked(), m.restoreFansLocked())
+}
+
+func (m *Manager) restorePowerLocked() error {
 	data, err := os.ReadFile(m.StatePath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -479,6 +515,9 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status := Status{Version: m.Version, LastApply: m.lastApply, LastError: m.lastError}
+	if m.fanLastError != "" {
+		status.LastError = combineError(status.LastError, errors.New(m.fanLastError))
+	}
 	model, err := m.CPUModel()
 	if err != nil {
 		status.LastError = combineError(status.LastError, err)
@@ -527,6 +566,7 @@ func (m *Manager) Status() Status {
 	}
 	status.Temperatures = m.temperatures()
 	status.GPURuntime = m.gpuRuntime()
+	status.FanControl = m.fanStatusLocked(status.Config.Fan)
 	return status
 }
 
@@ -541,6 +581,7 @@ func (m *Manager) loadConfigLocked() (Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, fmt.Errorf("decode config: %w", err)
 	}
+	normalizeConfig(&cfg)
 	return cfg, nil
 }
 

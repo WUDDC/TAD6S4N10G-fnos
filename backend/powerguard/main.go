@@ -171,16 +171,15 @@ func serve(args []string) error {
 		done <- server.ListenAndServe()
 	}()
 	go reapplyLoop(ctx, manager, logger)
+	go fanLoop(ctx, manager, logger)
 
 	select {
 	case <-ctx.Done():
-		logger.Printf("stopping: restoring captured power limits")
+		logger.Printf("stopping: restoring captured power and fan settings")
 		return manager.Restore()
 	case err := <-done:
-		if err != nil {
-			return err
-		}
-		return nil
+		logger.Printf("server stopped: restoring captured power and fan settings")
+		return errors.Join(err, manager.Restore())
 	}
 }
 
@@ -199,6 +198,26 @@ func reapplyLoop(ctx context.Context, manager *powerguard.Manager, logger *log.L
 		case <-timer.C:
 			if err := manager.ApplyCurrent(); err != nil {
 				logger.Printf("reapply failed: %v", err)
+			}
+		}
+	}
+}
+
+func fanLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	for {
+		cfg, err := manager.LoadOrCreateConfig()
+		interval := 2 * time.Second
+		if err == nil && cfg.Fan.PollSeconds >= 1 && cfg.Fan.PollSeconds <= 10 {
+			interval = time.Duration(cfg.Fan.PollSeconds) * time.Second
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			if err := manager.ApplyFanCurrent(); err != nil {
+				logger.Printf("fan control failed: %v", err)
 			}
 		}
 	}

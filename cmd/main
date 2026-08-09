@@ -59,7 +59,7 @@ stop_service() {
   pid="$(cat "${PID_FILE}")"
   kill -TERM "${pid}" 2>/dev/null || true
   count=0
-  while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 50 ]; do
+  while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 100 ]; do
     count=$((count + 1))
     sleep 0.1
   done
