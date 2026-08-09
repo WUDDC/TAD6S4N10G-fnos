@@ -13,7 +13,9 @@
       <div class="title-row">
         <h1>TAD6S4N模块</h1>
         <span id="app-version" class="app-version">v—</span>
-        <a class="project-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub · 检查更新</a>
+        <button id="check-updates" type="button" class="project-link">GitHub · 检查更新</button>
+        <span id="update-status" class="update-status" role="status" aria-live="polite"></span>
+        <a id="update-release-link" class="update-release-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden></a>
       </div>
       <div class="health-summary">
         <span id="health" class="badge pending" tabindex="0" aria-describedby="health-tooltip">读取中</span>
@@ -209,7 +211,7 @@
           <div class="panel-heading gpio-heading">
             <div>
               <h2 id="gpio-heading">机箱按键映射</h2>
-              <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；每种按压时长可独立绑定安全动作。</p>
+              <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；每种按压时长可独立绑定内置动作或自定义 Bash 脚本。</p>
             </div>
             <label class="toggle"><input id="gpio-enabled" type="checkbox"><span></span>启用按键映射</label>
           </div>
@@ -224,7 +226,38 @@
             </table>
           </div>
           <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
-          <p class="notice">出于安全考虑，当前只提供记录日志、刷新硬盘仓位、SMART 检查和重新应用插件配置；不会执行任意命令，也暂不调用未经验证的飞牛私有接口。</p>
+          <p class="notice">按键动作在松开时触发；自定义脚本由插件服务以 root 运行，单次最长 30 秒并限制日志输出。请只保存你完全信任的脚本。</p>
+        </section>
+        <section class="panel gpio-scripts-panel" aria-labelledby="gpio-scripts-heading">
+          <div class="panel-heading">
+            <div>
+              <h2 id="gpio-scripts-heading">Shell 脚本管理</h2>
+              <p>新增或编辑 Bash 脚本后，再到上方短按/长按下拉框选择对应脚本；最后点击“保存按钮控制”统一持久化。</p>
+            </div>
+            <button id="gpio-script-add" type="button" class="primary">＋ 新增脚本</button>
+          </div>
+          <div id="gpio-script-list" class="gpio-script-list"></div>
+          <div id="gpio-script-editor" class="gpio-script-editor" hidden>
+            <input id="gpio-script-id" type="hidden">
+            <label class="script-name-field">
+              <span>脚本名称</span>
+              <input id="gpio-script-name" class="text-input" type="text" maxlength="64" placeholder="例如：重启 Docker 服务" autocomplete="off">
+            </label>
+            <label class="script-body-label" for="gpio-script-body">Bash 脚本内容</label>
+            <div class="bash-editor">
+              <pre id="gpio-script-highlight" aria-hidden="true"><code></code></pre>
+              <textarea id="gpio-script-body" aria-label="Bash 脚本内容" spellcheck="false" autocapitalize="off" autocomplete="off" wrap="off" placeholder="#!/usr/bin/env bash&#10;set -euo pipefail&#10;&#10;# 在这里编写脚本"></textarea>
+            </div>
+            <div class="script-editor-footer">
+              <span id="gpio-script-size">0 / 65536 字节</span>
+              <div class="actions">
+                <button id="gpio-script-cancel" type="button">取消</button>
+                <button id="gpio-script-commit" type="button" class="primary">应用脚本修改</button>
+              </div>
+            </div>
+          </div>
+          <p id="gpio-script-message" class="inline-status" role="status" aria-live="polite"></p>
+          <p class="notice script-risk-notice">高风险功能：脚本拥有 root 权限，可以修改或删除系统数据。插件只负责固定使用 Bash、限制执行时间和输出大小，不会分析脚本是否安全。</p>
         </section>
         <div class="actions app-actions">
           <button id="save-gpio" type="button" class="primary">保存按钮控制</button>

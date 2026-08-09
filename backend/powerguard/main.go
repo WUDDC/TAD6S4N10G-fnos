@@ -246,6 +246,23 @@ func storageLoop(ctx context.Context, manager *powerguard.Manager, logger *log.L
 }
 
 func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	actions := make(chan powerguard.GPIOEvent, 4)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-actions:
+				output, err := manager.ExecuteGPIOActionContext(ctx, event)
+				if output != "" {
+					logger.Printf("gpio script output button=%s action=%s: %s", event.ButtonID, event.Action, output)
+				}
+				if err != nil {
+					logger.Printf("gpio action failed button=%s action=%s: %v", event.ButtonID, event.Action, err)
+				}
+			}
+		}
+	}()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	var port *os.File
@@ -309,8 +326,12 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 			lastLoggedError = ""
 			for _, event := range events {
 				logger.Printf("gpio event button=%s stage=%s duration=%s action=%s", event.ButtonID, event.Stage, event.Duration.Round(100*time.Millisecond), event.Action)
-				if err := manager.ExecuteGPIOAction(event); err != nil {
-					logger.Printf("gpio action failed button=%s action=%s: %v", event.ButtonID, event.Action, err)
+				select {
+				case actions <- event:
+				default:
+					err := errors.New("gpio action queue is full")
+					manager.SetGPIOActionError(err)
+					logger.Printf("gpio action dropped button=%s action=%s: %v", event.ButtonID, event.Action, err)
 				}
 			}
 		}

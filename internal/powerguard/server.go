@@ -25,6 +25,8 @@ type Server struct {
 	Logger      *log.Logger
 }
 
+const configRequestMaxBytes = 3 << 20
+
 func (s *Server) ListenAndServe() error {
 	if s.Manager == nil {
 		return errors.New("manager is required")
@@ -118,7 +120,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	dec := json.NewDecoder(io.LimitReader(r.Body, configRequestMaxBytes))
 	dec.DisallowUnknownFields()
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
@@ -194,7 +196,7 @@ func (s *Server) authorizeConfigRequest(w http.ResponseWriter, r *http.Request) 
 
 func decodeConfigRequest(r *http.Request, target any) error {
 	defer r.Body.Close()
-	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	dec := json.NewDecoder(io.LimitReader(r.Body, configRequestMaxBytes))
 	dec.DisallowUnknownFields()
 	return dec.Decode(target)
 }
@@ -236,7 +238,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'self'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; connect-src 'self' https://api.github.com; style-src 'self'; script-src 'self'; img-src 'self' data:; frame-ancestors 'self'")
 		next.ServeHTTP(w, r)
 	})
 }

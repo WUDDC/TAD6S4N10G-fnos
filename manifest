@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.7.1
+version=0.8.0
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=启动后自动检查 IT87、风扇通道、CPU 温度、硬盘枚举与硬盘温度来源并弹出针对性提示；HDD 1–6 与 NVMe 1–4 可分别选择是否参与风扇温控。
+changelog=按键控制新增自定义 Bash 脚本管理、语法高亮和短按/长按绑定；标题新增手动 GitHub Release 更新检查；硬件异常提示改为每次打开界面都重新弹出。

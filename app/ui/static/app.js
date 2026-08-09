@@ -17,6 +17,9 @@ const GPIO_ACTIONS = [
   ['smart_check', '刷新仓位并检查 SMART'],
   ['reapply_plugin', '重新应用插件配置'],
 ];
+const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/luodaoyi/TAD6S4N10G-fnos/releases/latest';
+const GPIO_SCRIPT_MAX_COUNT = 32;
+const GPIO_SCRIPT_MAX_BODY_BYTES = 65536;
 const STORAGE_STATE_LABELS = {
   empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
 };
@@ -55,6 +58,8 @@ let currentStatus = null;
 let uiBusy = false;
 let startupCheckComplete = false;
 let startupDialogPreviousFocus = null;
+let gpioScripts = [];
+let gpioEditingScriptID = '';
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -70,6 +75,58 @@ async function request(path, options = {}) {
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
   return body;
+}
+
+function parseSemanticVersion(value) {
+  const match = String(value || '').trim().match(/^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/i);
+  return match ? match.slice(1, 4).map(Number) : null;
+}
+
+function compareSemanticVersions(left, right) {
+  for (let index = 0; index < 3; index += 1) {
+    if (left[index] !== right[index]) return left[index] > right[index] ? 1 : -1;
+  }
+  return 0;
+}
+
+async function checkForUpdates() {
+  const button = $('check-updates');
+  const status = $('update-status');
+  const releaseLink = $('update-release-link');
+  const currentVersion = parseSemanticVersion(currentStatus?.version);
+  releaseLink.hidden = true;
+  status.textContent = '正在检查…';
+  status.className = 'update-status';
+  button.disabled = true;
+  try {
+    if (!currentVersion) throw new Error('当前运行版本无法比较');
+    const response = await fetch(GITHUB_LATEST_RELEASE_API, {
+      cache: 'no-store',
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`);
+    const release = await response.json();
+    const latestVersion = parseSemanticVersion(release.tag_name);
+    if (!latestVersion) throw new Error('最新 Release 版本格式无法识别');
+    if (compareSemanticVersions(latestVersion, currentVersion) > 0) {
+      const releaseURL = new URL(release.html_url);
+      if (releaseURL.protocol !== 'https:' || releaseURL.hostname !== 'github.com') {
+        throw new Error('Release 地址不安全');
+      }
+      status.textContent = '';
+      releaseLink.href = releaseURL.toString();
+      releaseLink.textContent = `有新版本 v${latestVersion.join('.')}，前去更新`;
+      releaseLink.hidden = false;
+    } else {
+      status.textContent = `当前 v${currentVersion.join('.')} 已是最新版本`;
+      status.className = 'update-status ok';
+    }
+  } catch (error) {
+    status.textContent = `检查失败：${error.message}`;
+    status.className = 'update-status error';
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function formatTemperature(value, available = true) {
@@ -332,13 +389,6 @@ function maybeShowStartupWarning(status) {
   startupCheckComplete = true;
   const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
   if (!issues.length) return;
-  const storageKey = `tad-module:startup-health:${status.version || 'unknown'}`;
-  try {
-    if (window.sessionStorage.getItem(storageKey)) return;
-    window.sessionStorage.setItem(storageKey, 'shown');
-  } catch (_) {
-    // 禁用会话存储时仍显示一次；内存标记会阻止轮询重复弹出。
-  }
   const list = $('startup-warning-list');
   list.replaceChildren();
   issues.forEach((issue) => {
@@ -407,16 +457,199 @@ function renderFanSlotTemperatures(storage = {}) {
   });
 }
 
-function setupGPIOActions() {
+function gpioScriptAction(scriptID) {
+  return `script:${scriptID}`;
+}
+
+function setupGPIOActions(scripts = gpioScripts, preserveValues = true) {
   document.querySelectorAll('.gpio-action').forEach((select) => {
+    const prior = preserveValues ? select.value : 'none';
     select.replaceChildren();
+    const builtInGroup = document.createElement('optgroup');
+    builtInGroup.label = '内置动作';
     GPIO_ACTIONS.forEach(([value, label]) => {
       const option = document.createElement('option');
       option.value = value;
       option.textContent = label;
-      select.append(option);
+      builtInGroup.append(option);
     });
+    select.append(builtInGroup);
+    if (scripts.length) {
+      const scriptGroup = document.createElement('optgroup');
+      scriptGroup.label = 'Shell 脚本';
+      scripts.forEach((script) => {
+        const option = document.createElement('option');
+        option.value = gpioScriptAction(script.id);
+        option.textContent = `脚本：${script.name}`;
+        scriptGroup.append(option);
+      });
+      select.append(scriptGroup);
+    }
+    select.value = [...select.options].some((option) => option.value === prior) ? prior : 'none';
   });
+}
+
+function showGPIOScriptMessage(message, error = false) {
+  $('gpio-script-message').textContent = message;
+  $('gpio-script-message').className = `inline-status${error ? ' error' : ''}`;
+}
+
+function generateGPIOScriptID() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `script-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function renderGPIOScriptList() {
+  const list = $('gpio-script-list');
+  list.replaceChildren();
+  if (!gpioScripts.length) {
+    const empty = document.createElement('p');
+    empty.className = 'gpio-script-empty';
+    empty.textContent = '尚未创建脚本。点击“新增脚本”开始编写。';
+    list.append(empty);
+    return;
+  }
+  gpioScripts.forEach((script) => {
+    const action = gpioScriptAction(script.id);
+    const bindings = [...document.querySelectorAll('.gpio-action')]
+      .filter((select) => select.value === action).length;
+    const card = document.createElement('article');
+    card.className = 'gpio-script-card';
+    const name = document.createElement('strong');
+    name.textContent = script.name;
+    const detail = document.createElement('small');
+    detail.textContent = `${new TextEncoder().encode(script.body).length} 字节 · ${bindings ? `已绑定 ${bindings} 项` : '尚未绑定'}`;
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.textContent = '编辑';
+    edit.addEventListener('click', () => openGPIOScriptEditor(script.id));
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'delete-script';
+    remove.textContent = '删除';
+    remove.addEventListener('click', () => deleteGPIOScript(script.id));
+    actions.append(edit, remove);
+    card.append(name, detail, actions);
+    list.append(card);
+  });
+}
+
+function bashTokenClass(token) {
+  if (token.startsWith('#')) return 'bash-token-comment';
+  if (token.startsWith("'") || token.startsWith('"')) return 'bash-token-string';
+  if (token.startsWith('$')) return 'bash-token-variable';
+  if (/^\d+$/.test(token)) return 'bash-token-number';
+  return 'bash-token-keyword';
+}
+
+function renderBashHighlight() {
+  const textarea = $('gpio-script-body');
+  const code = $('gpio-script-highlight').querySelector('code');
+  const source = textarea.value;
+  const pattern = /'(?:[^']*)'|"(?:\\.|[^"\\])*"|\$\{[^}\n]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9#?*@!_-]|#[^\n]*|\b(?:if|then|else|elif|fi|for|while|until|do|done|case|esac|in|function|select|time|coproc|break|continue|return|exit|local|readonly|declare|typeset|export|unset|shift|source|alias|unalias|set|trap|true|false)\b|\b\d+\b/g;
+  code.replaceChildren();
+  let offset = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > offset) code.append(document.createTextNode(source.slice(offset, match.index)));
+    const token = document.createElement('span');
+    token.className = bashTokenClass(match[0]);
+    token.textContent = match[0];
+    code.append(token);
+    offset = match.index + match[0].length;
+  }
+  code.append(document.createTextNode(`${source.slice(offset)}\n`));
+  const bytes = new TextEncoder().encode(source).length;
+  $('gpio-script-size').textContent = `${bytes} / ${GPIO_SCRIPT_MAX_BODY_BYTES} 字节`;
+  $('gpio-script-size').className = bytes > GPIO_SCRIPT_MAX_BODY_BYTES ? 'error' : '';
+  syncBashEditorScroll();
+}
+
+function syncBashEditorScroll() {
+  const textarea = $('gpio-script-body');
+  const highlight = $('gpio-script-highlight');
+  highlight.scrollTop = textarea.scrollTop;
+  highlight.scrollLeft = textarea.scrollLeft;
+}
+
+function openGPIOScriptEditor(scriptID = '') {
+  const script = gpioScripts.find((item) => item.id === scriptID);
+  gpioEditingScriptID = script?.id || generateGPIOScriptID();
+  $('gpio-script-id').value = gpioEditingScriptID;
+  $('gpio-script-name').value = script?.name || '';
+  $('gpio-script-body').value = script?.body || '#!/usr/bin/env bash\nset -euo pipefail\n\n';
+  $('gpio-script-editor').hidden = false;
+  showGPIOScriptMessage(script ? `正在编辑“${script.name}”` : '正在创建新脚本');
+  renderBashHighlight();
+  $('gpio-script-name').focus();
+}
+
+function closeGPIOScriptEditor() {
+  gpioEditingScriptID = '';
+  $('gpio-script-editor').hidden = true;
+  $('gpio-script-id').value = '';
+  $('gpio-script-name').value = '';
+  $('gpio-script-body').value = '';
+  renderBashHighlight();
+}
+
+function commitGPIOScriptEditor() {
+  if ($('gpio-script-editor').hidden) return true;
+  const id = $('gpio-script-id').value;
+  const name = $('gpio-script-name').value.trim();
+  const body = $('gpio-script-body').value.replace(/\r\n?/g, '\n');
+  const bodyBytes = new TextEncoder().encode(body).length;
+  if (!name) {
+    showGPIOScriptMessage('脚本名称不能为空。', true);
+    $('gpio-script-name').focus();
+    return false;
+  }
+  if (gpioScripts.some((script) => script.id !== id && script.name.trim().toLowerCase() === name.toLowerCase())) {
+    showGPIOScriptMessage(`脚本名称“${name}”已经存在。`, true);
+    $('gpio-script-name').focus();
+    return false;
+  }
+  if (!body.trim()) {
+    showGPIOScriptMessage('脚本内容不能为空。', true);
+    $('gpio-script-body').focus();
+    return false;
+  }
+  if (bodyBytes > GPIO_SCRIPT_MAX_BODY_BYTES) {
+    showGPIOScriptMessage(`脚本内容不能超过 ${GPIO_SCRIPT_MAX_BODY_BYTES} 字节。`, true);
+    return false;
+  }
+  const existingIndex = gpioScripts.findIndex((script) => script.id === id);
+  if (existingIndex < 0 && gpioScripts.length >= GPIO_SCRIPT_MAX_COUNT) {
+    showGPIOScriptMessage(`最多只能创建 ${GPIO_SCRIPT_MAX_COUNT} 个脚本。`, true);
+    return false;
+  }
+  const script = { id, name, body };
+  if (existingIndex >= 0) gpioScripts[existingIndex] = script;
+  else gpioScripts.push(script);
+  setupGPIOActions(gpioScripts, true);
+  renderGPIOScriptList();
+  closeGPIOScriptEditor();
+  showGPIOScriptMessage(`脚本“${name}”已加入本页草稿；点击“保存按钮控制”后生效。`);
+  return true;
+}
+
+function deleteGPIOScript(scriptID) {
+  const script = gpioScripts.find((item) => item.id === scriptID);
+  if (!script) return;
+  const action = gpioScriptAction(scriptID);
+  const binding = [...document.querySelectorAll('.gpio-action')].find((select) => select.value === action);
+  if (binding) {
+    showGPIOScriptMessage(`脚本“${script.name}”仍被按键动作引用，请先在上方下拉框改成其他动作。`, true);
+    binding.focus();
+    return;
+  }
+  if (!window.confirm(`确定删除脚本“${script.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`)) return;
+  gpioScripts = gpioScripts.filter((item) => item.id !== scriptID);
+  if (gpioEditingScriptID === scriptID) closeGPIOScriptEditor();
+  setupGPIOActions(gpioScripts, true);
+  renderGPIOScriptList();
+  showGPIOScriptMessage(`脚本“${script.name}”已从本页草稿删除。`);
 }
 
 function activateTab(tabID, focus = false) {
@@ -456,6 +689,10 @@ function updateGPIOEnabledState() {
 
 function fillGPIOInputs(gpio = {}) {
   $('gpio-enabled').checked = Boolean(gpio.enabled);
+  gpioScripts = Array.isArray(gpio.scripts)
+    ? gpio.scripts.map((script) => ({ id: String(script.id), name: String(script.name), body: String(script.body) }))
+    : [];
+  setupGPIOActions(gpioScripts, false);
   const buttons = new Map((gpio.buttons || []).map((button) => [button.id, button]));
   document.querySelectorAll('.gpio-table tbody tr').forEach((row) => {
     const actions = buttons.get(row.dataset.button)?.actions || {};
@@ -463,6 +700,9 @@ function fillGPIOInputs(gpio = {}) {
       select.value = actions[select.dataset.stage] || 'none';
     });
   });
+  closeGPIOScriptEditor();
+  renderGPIOScriptList();
+  showGPIOScriptMessage(gpioScripts.length ? `已加载 ${gpioScripts.length} 个脚本。` : '尚未创建自定义脚本。');
   updateGPIOEnabledState();
 }
 
@@ -470,6 +710,7 @@ function gpioConfigFromInputs() {
   return {
     version: 1,
     enabled: $('gpio-enabled').checked,
+    scripts: gpioScripts.map((script) => ({ ...script })),
     buttons: [...document.querySelectorAll('.gpio-table tbody tr')].map((row) => {
       const actions = {};
       row.querySelectorAll('.gpio-action').forEach((select) => { actions[select.dataset.stage] = select.value; });
@@ -907,6 +1148,7 @@ $('save-fan').addEventListener('click', async () => {
 });
 
 $('save-gpio').addEventListener('click', async () => {
+  if (!commitGPIOScriptEditor()) return;
   const config = gpioConfigFromInputs();
   setBusy(true);
   try {
@@ -1015,7 +1257,24 @@ $('config-form').addEventListener('invalid', (event) => {
 setupTabs();
 setupFanSlotSelectors();
 setupGPIOActions();
+$('check-updates').addEventListener('click', checkForUpdates);
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
+$('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
+$('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);
+$('gpio-script-commit').addEventListener('click', commitGPIOScriptEditor);
+$('gpio-script-body').addEventListener('input', renderBashHighlight);
+$('gpio-script-body').addEventListener('scroll', syncBashEditorScroll);
+$('gpio-script-body').addEventListener('keydown', (event) => {
+  if (event.key !== 'Tab') return;
+  event.preventDefault();
+  const textarea = event.currentTarget;
+  const start = textarea.selectionStart;
+  textarea.setRangeText('  ', start, textarea.selectionEnd, 'end');
+  renderBashHighlight();
+});
+document.querySelectorAll('.gpio-action').forEach((select) => {
+  select.addEventListener('change', renderGPIOScriptList);
+});
 $('startup-warning-close').addEventListener('click', closeStartupWarning);
 $('startup-warning-modal').addEventListener('click', (event) => {
   if (event.target === $('startup-warning-modal')) closeStartupWarning();

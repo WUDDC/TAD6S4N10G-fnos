@@ -1,13 +1,20 @@
 package powerguard
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 const (
@@ -19,6 +26,17 @@ const (
 	GPIOActionRefreshStorage = "refresh_storage"
 	GPIOActionSMARTCheck     = "smart_check"
 	GPIOActionReapplyPlugin  = "reapply_plugin"
+	GPIOActionScriptPrefix   = "script:"
+
+	gpioScriptMaxCount  = 32
+	gpioScriptMaxName   = 64
+	gpioScriptMaxBody   = 64 << 10
+	gpioScriptOutputMax = 64 << 10
+)
+
+var (
+	gpioScriptIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+	gpioScriptTimeout   = 30 * time.Second
 )
 
 type GPIOActions struct {
@@ -33,9 +51,16 @@ type GPIOButtonConfig struct {
 	Actions GPIOActions `json:"actions"`
 }
 
+type GPIOScript struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Body string `json:"body"`
+}
+
 type GPIOConfig struct {
 	Version int                `json:"version"`
 	Enabled bool               `json:"enabled"`
+	Scripts []GPIOScript       `json:"scripts,omitempty"`
 	Buttons []GPIOButtonConfig `json:"buttons"`
 }
 
@@ -63,6 +88,7 @@ type GPIOEvent struct {
 	Duration time.Duration
 	Stage    string
 	Action   string
+	Script   *GPIOScript
 }
 
 type gpioButtonSpec struct {
@@ -122,6 +148,25 @@ func validateGPIOConfig(config GPIOConfig) error {
 	if len(config.Buttons) != len(gpioButtonSpecs) {
 		return fmt.Errorf("gpio buttons must contain exactly %d entries", len(gpioButtonSpecs))
 	}
+	if len(config.Scripts) > gpioScriptMaxCount {
+		return fmt.Errorf("gpio scripts must contain no more than %d entries", gpioScriptMaxCount)
+	}
+	scripts := make(map[string]GPIOScript, len(config.Scripts))
+	names := make(map[string]bool, len(config.Scripts))
+	for _, script := range config.Scripts {
+		if err := validateGPIOScript(script); err != nil {
+			return err
+		}
+		if _, exists := scripts[script.ID]; exists {
+			return fmt.Errorf("duplicate gpio script id %q", script.ID)
+		}
+		nameKey := strings.ToLower(strings.TrimSpace(script.Name))
+		if names[nameKey] {
+			return fmt.Errorf("duplicate gpio script name %q", strings.TrimSpace(script.Name))
+		}
+		scripts[script.ID] = script
+		names[nameKey] = true
+	}
 	wanted := make(map[string]bool, len(gpioButtonSpecs))
 	for _, spec := range gpioButtonSpecs {
 		wanted[spec.ID] = true
@@ -140,8 +185,59 @@ func validateGPIOConfig(config GPIOConfig) error {
 			"hold_9s": button.Actions.Hold9S, "hold_15s": button.Actions.Hold15S,
 		} {
 			if !allowedGPIOActions[action] {
+				scriptID, isScript := gpioScriptIDFromAction(action)
+				if isScript {
+					if _, exists := scripts[scriptID]; exists {
+						continue
+					}
+					return fmt.Errorf("gpio button %s stage %s references missing script %q", button.ID, stage, scriptID)
+				}
 				return fmt.Errorf("gpio button %s stage %s has unsupported action %q", button.ID, stage, action)
 			}
+		}
+	}
+	return nil
+}
+
+func validateGPIOScript(script GPIOScript) error {
+	if !gpioScriptIDPattern.MatchString(script.ID) {
+		return fmt.Errorf("gpio script id %q must use 1-64 ASCII letters, numbers, dot, underscore or hyphen", script.ID)
+	}
+	name := strings.TrimSpace(script.Name)
+	if name == "" || utf8.RuneCountInString(name) > gpioScriptMaxName {
+		return fmt.Errorf("gpio script %q name must contain 1-%d characters", script.ID, gpioScriptMaxName)
+	}
+	if strings.IndexFunc(name, unicode.IsControl) >= 0 {
+		return fmt.Errorf("gpio script %q name contains control characters", script.ID)
+	}
+	if strings.TrimSpace(script.Body) == "" {
+		return fmt.Errorf("gpio script %q body must not be empty", script.ID)
+	}
+	if len(script.Body) > gpioScriptMaxBody {
+		return fmt.Errorf("gpio script %q body exceeds %d bytes", script.ID, gpioScriptMaxBody)
+	}
+	if strings.ContainsRune(script.Body, '\x00') {
+		return fmt.Errorf("gpio script %q body contains a NUL byte", script.ID)
+	}
+	return nil
+}
+
+func gpioScriptIDFromAction(action string) (string, bool) {
+	if !strings.HasPrefix(action, GPIOActionScriptPrefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(action, GPIOActionScriptPrefix), true
+}
+
+func gpioScriptForAction(config GPIOConfig, action string) *GPIOScript {
+	id, ok := gpioScriptIDFromAction(action)
+	if !ok {
+		return nil
+	}
+	for _, script := range config.Scripts {
+		if script.ID == id {
+			copy := script
+			return &copy
 		}
 	}
 	return nil
@@ -227,7 +323,8 @@ func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time)
 		state.pressedAt = time.Time{}
 		state.lastAction = action
 		event := GPIOEvent{ButtonID: spec.ID, Name: spec.Name, Duration: duration, Stage: stage, Action: action}
-		m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ %s", spec.Name, stage, duration.Seconds(), GPIOActionDisplay(action))
+		event.Script = gpioScriptForAction(config, action)
+		m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ %s", spec.Name, stage, duration.Seconds(), gpioActionDisplay(config, action))
 		events = append(events, event)
 	}
 	return events, nil
@@ -255,7 +352,13 @@ func gpioActionForDuration(actions GPIOActions, duration time.Duration) (string,
 }
 
 func (m *Manager) ExecuteGPIOAction(event GPIOEvent) error {
+	_, err := m.ExecuteGPIOActionContext(context.Background(), event)
+	return err
+}
+
+func (m *Manager) ExecuteGPIOActionContext(ctx context.Context, event GPIOEvent) (string, error) {
 	var err error
+	var output string
 	switch event.Action {
 	case GPIOActionNone, GPIOActionLog:
 	case GPIOActionRefreshStorage:
@@ -265,7 +368,11 @@ func (m *Manager) ExecuteGPIOAction(event GPIOEvent) error {
 	case GPIOActionReapplyPlugin:
 		err = m.ApplyCurrent()
 	default:
-		err = fmt.Errorf("unsupported gpio action %q", event.Action)
+		if _, isScript := gpioScriptIDFromAction(event.Action); isScript && event.Script != nil {
+			output, err = executeGPIOScript(ctx, event)
+		} else {
+			err = fmt.Errorf("unsupported gpio action %q", event.Action)
+		}
 	}
 	m.gpioMu.Lock()
 	if err != nil {
@@ -274,7 +381,73 @@ func (m *Manager) ExecuteGPIOAction(event GPIOEvent) error {
 		m.gpioRuntime.lastError = ""
 	}
 	m.gpioMu.Unlock()
-	return err
+	return output, err
+}
+
+func (m *Manager) SetGPIOActionError(err error) {
+	m.gpioMu.Lock()
+	defer m.gpioMu.Unlock()
+	if err == nil {
+		m.gpioRuntime.lastError = ""
+		return
+	}
+	m.gpioRuntime.lastError = err.Error()
+}
+
+type cappedBuffer struct {
+	bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (buffer *cappedBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	remaining := buffer.limit - buffer.Len()
+	if remaining <= 0 {
+		buffer.truncated = true
+		return written, nil
+	}
+	if len(data) > remaining {
+		_, _ = buffer.Buffer.Write(data[:remaining])
+		buffer.truncated = true
+		return written, nil
+	}
+	_, _ = buffer.Buffer.Write(data)
+	return written, nil
+}
+
+func executeGPIOScript(parent context.Context, event GPIOEvent) (string, error) {
+	if event.Script == nil {
+		return "", errors.New("gpio script is missing")
+	}
+	ctx, cancel := context.WithTimeout(parent, gpioScriptTimeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, "/bin/bash", "--noprofile", "--norc")
+	command.Dir = "/"
+	command.Env = append(os.Environ(),
+		"TAD_GPIO_BUTTON_ID="+event.ButtonID,
+		"TAD_GPIO_STAGE="+event.Stage,
+		"TAD_GPIO_DURATION_MS="+strconv.FormatInt(event.Duration.Milliseconds(), 10),
+		"TAD_GPIO_SCRIPT_NAME="+event.Script.Name,
+	)
+	body := strings.ReplaceAll(event.Script.Body, "\r\n", "\n")
+	body = strings.ReplaceAll(body, "\r", "\n")
+	command.Stdin = strings.NewReader(body)
+	output := &cappedBuffer{limit: gpioScriptOutputMax}
+	command.Stdout = output
+	command.Stderr = output
+	err := command.Run()
+	text := strings.TrimSpace(output.String())
+	if output.truncated {
+		text += "\n[输出已截断]"
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return text, fmt.Errorf("gpio script %q timed out after %s", event.Script.Name, gpioScriptTimeout)
+	}
+	if err != nil {
+		return text, fmt.Errorf("gpio script %q failed: %w", event.Script.Name, err)
+	}
+	return text, nil
 }
 
 func (m *Manager) GPIOStatus(config GPIOConfig) GPIOStatus {
@@ -322,6 +495,16 @@ func GPIOActionDisplay(action string) string {
 	case GPIOActionReapplyPlugin:
 		return "重新应用插件配置"
 	default:
+		if id, ok := gpioScriptIDFromAction(action); ok {
+			return "脚本 " + id
+		}
 		return strings.TrimSpace(action)
 	}
+}
+
+func gpioActionDisplay(config GPIOConfig, action string) string {
+	if script := gpioScriptForAction(config, action); script != nil {
+		return "脚本：" + script.Name
+	}
+	return GPIOActionDisplay(action)
 }

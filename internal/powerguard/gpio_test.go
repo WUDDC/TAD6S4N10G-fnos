@@ -1,7 +1,10 @@
 package powerguard
 
 import (
+	"context"
 	"io"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,11 +44,46 @@ func TestDefaultGPIOConfigIsDisabledAndSafe(t *testing.T) {
 	}
 }
 
-func TestGPIOValidationRejectsArbitraryCommand(t *testing.T) {
+func TestGPIOValidationRejectsUnknownAction(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Buttons[0].Actions.Short = "shell_command"
 	if err := validateGPIOConfig(config); err == nil {
-		t.Fatal("arbitrary GPIO action was accepted")
+		t.Fatal("unknown GPIO action was accepted")
+	}
+}
+
+func TestGPIOValidationAcceptsScriptBinding(t *testing.T) {
+	config := DefaultGPIOConfig()
+	config.Scripts = []GPIOScript{{ID: "backup-1", Name: "备份脚本", Body: "printf 'ok'\n"}}
+	config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "backup-1"
+	if err := validateGPIOConfig(config); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGPIOValidationRejectsInvalidScripts(t *testing.T) {
+	valid := GPIOScript{ID: "script-1", Name: "测试脚本", Body: "true\n"}
+	for _, test := range []struct {
+		name   string
+		mutate func(*GPIOConfig)
+	}{
+		{"path id", func(config *GPIOConfig) { config.Scripts[0].ID = "../bad" }},
+		{"empty name", func(config *GPIOConfig) { config.Scripts[0].Name = "  " }},
+		{"empty body", func(config *GPIOConfig) { config.Scripts[0].Body = "\n" }},
+		{"missing binding", func(config *GPIOConfig) { config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "missing" }},
+		{"duplicate id", func(config *GPIOConfig) { config.Scripts = append(config.Scripts, config.Scripts[0]) }},
+		{"duplicate name", func(config *GPIOConfig) {
+			config.Scripts = append(config.Scripts, GPIOScript{ID: "script-2", Name: " 测试脚本 ", Body: "true\n"})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			config := DefaultGPIOConfig()
+			config.Scripts = []GPIOScript{valid}
+			test.mutate(&config)
+			if err := validateGPIOConfig(config); err == nil {
+				t.Fatal("invalid GPIO script configuration was accepted")
+			}
+		})
 	}
 }
 
@@ -91,5 +129,50 @@ func TestGPIOActionThresholds(t *testing.T) {
 		if got != test.want {
 			t.Fatalf("duration %s got %q, want %q", test.duration, got, test.want)
 		}
+	}
+}
+
+func TestGPIOPollResolvesBoundScript(t *testing.T) {
+	config := DefaultGPIOConfig()
+	config.Enabled = true
+	config.Scripts = []GPIOScript{{ID: "hello", Name: "问候", Body: "printf hello\n"}}
+	config.Buttons[0].Actions.Short = GPIOActionScriptPrefix + "hello"
+	port := &fakeGPIOPort{values: make([]byte, 0xA05)}
+	for _, spec := range gpioButtonSpecs {
+		port.set(spec, true)
+	}
+	manager := &Manager{}
+	start := time.Unix(200, 0)
+	_, _ = manager.PollGPIO(config, port, start)
+	copyButton := gpioButtonSpecs[0]
+	port.set(copyButton, false)
+	_, _ = manager.PollGPIO(config, port, start.Add(10*time.Millisecond))
+	_, _ = manager.PollGPIO(config, port, start.Add(120*time.Millisecond))
+	port.set(copyButton, true)
+	_, _ = manager.PollGPIO(config, port, start.Add(time.Second))
+	events, err := manager.PollGPIO(config, port, start.Add(1120*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Script == nil || events[0].Script.ID != "hello" || events[0].Script.Body != "printf hello\n" {
+		t.Fatalf("script was not resolved into GPIO event: %+v", events)
+	}
+}
+
+func TestExecuteGPIOScriptUsesBashAndEventEnvironment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("/bin/bash execution is verified by Linux CI")
+	}
+	event := GPIOEvent{
+		ButtonID: "copy", Stage: "短按", Duration: 1250 * time.Millisecond,
+		Action: GPIOActionScriptPrefix + "env-test",
+		Script: &GPIOScript{ID: "env-test", Name: "环境测试", Body: `printf '%s|%s|%s|%s' "$TAD_GPIO_BUTTON_ID" "$TAD_GPIO_STAGE" "$TAD_GPIO_DURATION_MS" "$TAD_GPIO_SCRIPT_NAME"`},
+	}
+	output, err := executeGPIOScript(context.Background(), event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output, "copy|短按|1250|环境测试") {
+		t.Fatalf("unexpected script output %q", output)
 	}
 }
