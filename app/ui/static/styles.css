@@ -28,6 +28,9 @@ h1 { margin-bottom: 6px; font-size: clamp(24px, 4vw, 36px); letter-spacing: -.03
 h2 { margin-bottom: 6px; font-size: 18px; }
 .subtitle, .panel-heading p, small { color: var(--muted); }
 .subtitle { margin-bottom: 0; }
+.project-link { margin: 8px 0 0; font-size: 13px; }
+.project-link a { color: var(--mint); font-weight: 700; text-underline-offset: 3px; }
+.project-link a:hover { color: #8cf3c9; }
 .badge { align-self: start; padding: 8px 12px; border: 1px solid var(--line); border-radius: 999px; font-size: 13px; font-weight: 700; }
 .badge.ok { color: var(--mint); background: rgba(88, 230, 173, .09); }
 .badge.error { color: var(--danger); background: rgba(255, 141, 120, .08); }

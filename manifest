@@ -1,5 +1,5 @@
 appname=powerguard
-version=0.2.3
+version=0.2.4
 display_name=N100/N305 功耗与风扇卫士
 desc=限制 Intel N100 与 i3-N305 的 Package 功耗，并通过 IT87 控制单风扇温控曲线。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=powerguard.Application
 checkport=false
 disable_authorization_path=false
-changelog=修复 IT87 满速进入模式 0 后无法自动退回温控曲线；单风扇默认最低 PWM 保持保守的 60%。
+changelog=新增 GitHub 项目主页与版本检查入口；保留 IT87 单风扇温控曲线和满速模式回退修复。
