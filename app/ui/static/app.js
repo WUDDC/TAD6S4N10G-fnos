@@ -27,6 +27,16 @@ const CURVE_MIN_POINTS = 2;
 const CURVE_MAX_POINTS = 8;
 const CHART = { left: 52, right: 616, top: 20, bottom: 222 };
 const CURVE_KINDS = ['cpu', 'hdd', 'nvme'];
+const FAN_SLOT_GROUPS = {
+  hdd: {
+    containerID: 'hdd-slot-options', configField: 'hdd_slot_ids',
+    slots: [6, 5, 4, 3, 2, 1].map((slot) => ({ id: `front-${slot}`, label: `SATA ${slot}` })),
+  },
+  nvme: {
+    containerID: 'nvme-slot-options', configField: 'nvme_slot_ids',
+    slots: [1, 2, 3, 4].map((slot) => ({ id: `m2-${slot}`, label: `NVMe ${slot}` })),
+  },
+};
 const curveEditors = {
   cpu: {
     chartID: 'fan-curve-chart', addID: 'curve-add', removeID: 'curve-remove', selectedID: 'curve-selected',
@@ -212,7 +222,9 @@ function renderDiagnostics(status, fanStatus) {
 
   if (!fanStatus.active) {
     renderDiagnosticChips('fan-control', [{
-      value: fanStatus.available ? '可用，尚未启用' : '驱动或风扇不可用',
+      value: fanStatus.driver_detected === false
+        ? '未检测到或未加载 IT87 驱动'
+        : (fanStatus.available ? '可用，尚未启用' : '驱动已检测，但风扇无有效转速反馈'),
       tone: fanStatus.available ? 'muted' : 'warning',
     }]);
     return;
@@ -241,6 +253,7 @@ function renderDiagnostics(status, fanStatus) {
 function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   const issues = [];
   if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
+  if (fanStatus.driver_detected === false) issues.push('未检测到或未加载 IT87 风扇驱动');
   if (status.last_error) issues.push(`模块：${status.last_error}`);
   if (fanStatus.last_error) issues.push(`风扇：${fanStatus.last_error}`);
   (storageStatus.slots || []).filter((slot) => slot.state === 'warning').forEach((slot) => {
@@ -251,6 +264,61 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
     issues.push(`按钮控制：${gpioStatus.last_error || 'GPIO 硬件接口不可用'}`);
   }
   return [...new Set(issues)];
+}
+
+function setupFanSlotSelectors() {
+  Object.values(FAN_SLOT_GROUPS).forEach((group) => {
+    const container = $(group.containerID);
+    group.slots.forEach((slot) => {
+      const label = document.createElement('label');
+      label.className = 'curve-slot-option';
+      label.dataset.slotId = slot.id;
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.value = slot.id;
+      input.checked = true;
+      const name = document.createElement('b');
+      name.textContent = slot.label;
+      const temperature = document.createElement('small');
+      temperature.textContent = '等待温度';
+      label.append(input, name, temperature);
+      container.append(label);
+    });
+  });
+}
+
+function fillFanSlotSelections(fan = {}) {
+  Object.values(FAN_SLOT_GROUPS).forEach((group) => {
+    const configured = Array.isArray(fan[group.configField])
+      ? fan[group.configField] : group.slots.map((slot) => slot.id);
+    const selected = new Set(configured);
+    $(group.containerID).querySelectorAll('input[type="checkbox"]').forEach((input) => {
+      input.checked = selected.has(input.value);
+    });
+  });
+}
+
+function selectedFanSlotIDs(kind) {
+  const group = FAN_SLOT_GROUPS[kind];
+  return [...$(group.containerID).querySelectorAll('input[type="checkbox"]:checked')]
+    .map((input) => input.value);
+}
+
+function renderFanSlotTemperatures(storage = {}) {
+  const slots = new Map((storage.slots || []).map((slot) => [slot.id, slot]));
+  Object.values(FAN_SLOT_GROUPS).forEach((group) => {
+    group.slots.forEach((definition) => {
+      const label = $(group.containerID).querySelector(`[data-slot-id="${definition.id}"]`);
+      const slot = slots.get(definition.id);
+      const state = slot?.state || 'unknown';
+      label.className = `curve-slot-option storage-${state}`;
+      const temperature = Number(slot?.temperature_c);
+      const stateLabel = STORAGE_STATE_LABELS[state] || state;
+      label.querySelector('small').textContent = temperature > 0
+        ? `${formatTemperature(temperature)} · ${stateLabel}`
+        : stateLabel;
+    });
+  });
 }
 
 function setupGPIOActions() {
@@ -540,7 +608,9 @@ function populateFanDevices(status, keepInputs) {
     option.textContent = '未检测到可控风扇';
     select.append(option);
     select.disabled = true;
-    $('fan-device-status').textContent = '需要 IT87 驱动及 fan/pwm 转速节点';
+    $('fan-device-status').textContent = status.fan_control?.driver_detected === false
+      ? '未检测到或未加载 IT87 驱动'
+      : '已检测到 IT87，但没有有效的 fan/pwm 转速通道';
     return;
   }
   fans.forEach((fan) => {
@@ -571,6 +641,7 @@ function fillFanInputs(fan = {}) {
   fillCurve('cpu', fan.curve, DEFAULT_CPU_CURVE);
   fillCurve('hdd', fan.hdd_curve || fan.disk_curve, DEFAULT_STORAGE_CURVE);
   fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
+  fillFanSlotSelections(fan);
 }
 
 function render(status, keepInputs = false) {
@@ -602,6 +673,8 @@ function render(status, keepInputs = false) {
   renderDiagnostics(status, fanStatus);
   renderStorageTemperatureCards(storageStatus);
   renderStorageTable(storageStatus);
+  renderFanSlotTemperatures(storageStatus);
+  $('fan-driver-warning').hidden = fanStatus.driver_detected !== false;
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
     : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
@@ -679,6 +752,8 @@ function fanConfigFromInputs() {
     curve: cpuCurve,
     hdd_curve: hddCurve,
     nvme_curve: nvmeCurve,
+    hdd_slot_ids: selectedFanSlotIDs('hdd'),
+    nvme_slot_ids: selectedFanSlotIDs('nvme'),
   };
 }
 
@@ -850,6 +925,7 @@ $('config-form').addEventListener('invalid', (event) => {
   if (tabID) activateTab(tabID);
 }, true);
 setupTabs();
+setupFanSlotSelectors();
 setupGPIOActions();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 CURVE_KINDS.forEach(renderFanChart);

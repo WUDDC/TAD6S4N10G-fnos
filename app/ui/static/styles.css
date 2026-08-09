@@ -252,9 +252,33 @@ select:focus, .input-wrap:focus-within { border-color: #8cafff; box-shadow: 0 0 
 small { display: block; margin-top: 6px; line-height: 1.4; }
 .fan-editor, .gpio-editor { min-width: 0; }
 .fan-heading, .gpio-heading { padding-bottom: 4px; border-bottom: 0; }
-.fan-heading .driver-link { margin-top: 8px; color: var(--muted); font-size: 12px; }
-.driver-link a { color: var(--primary); font-weight: 600; text-decoration: none; }
-.driver-link a:hover { text-decoration: underline; }
+.fan-driver-warning {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 14px;
+  padding: 14px 16px;
+  border: 1px solid #f0b8b5;
+  border-radius: 12px;
+  color: #a73430;
+  background: #fff1f0;
+}
+.fan-driver-warning[hidden] { display: none; }
+.fan-driver-warning .warning-icon {
+  display: grid;
+  flex: 0 0 24px;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  color: #fff;
+  background: var(--danger);
+  font-size: 15px;
+  font-weight: 800;
+}
+.fan-driver-warning strong { display: block; margin: 2px 0 5px; font-size: 14px; }
+.fan-driver-warning p { margin: 0; color: #9a4b47; font-size: 12px; line-height: 1.55; }
+.fan-driver-warning a { color: #c43732; font-weight: 700; text-underline-offset: 2px; }
 .fan-settings { display: grid; grid-template-columns: 1.4fr repeat(3, minmax(0, 1fr)); gap: 13px; margin-top: 16px; }
 .curve-editors { display: grid; grid-template-columns: 1fr; gap: 18px; margin-top: 18px; }
 .curve-editor { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 12px; background: #fafbfc; }
@@ -272,6 +296,29 @@ small { display: block; margin-top: 6px; line-height: 1.4; }
 .curve-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .curve-toolbar strong { color: var(--primary); font-size: 14px; }
 #curve-remove, #disk-curve-remove, #nvme-curve-remove { color: var(--danger); background: #fff7f6; }
+.curve-slot-selector { min-width: 0; margin: 14px 0 0; padding: 13px 14px 14px; border: 1px solid #dfe3e9; border-radius: 10px; background: #fff; }
+.curve-slot-selector legend { padding: 0 6px; color: #3b424f; font-size: 13px; font-weight: 700; }
+.curve-slot-selector > p { margin: 0 0 10px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.curve-slot-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 8px; }
+.curve-slot-option {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid #dfe3e9;
+  border-radius: 9px;
+  background: #f8f9fb;
+  cursor: pointer;
+}
+.curve-slot-option input { grid-row: 1 / 3; margin: 0; accent-color: var(--primary); }
+.curve-slot-option b { color: #3d4451; font-size: 12px; }
+.curve-slot-option small { margin: 0; color: var(--muted); font-size: 10px; white-space: nowrap; }
+.curve-slot-option.storage-warning { border-color: #f0c1be; background: #fff5f4; }
+.curve-slot-option.storage-warning b, .curve-slot-option.storage-warning small { color: var(--danger); }
+.curve-slot-option.storage-empty { border-style: dashed; opacity: .65; }
+.curve-slot-option:focus-within { border-color: #8cafff; box-shadow: 0 0 0 3px rgba(63, 111, 245, .11); }
 #curve-help, #disk-curve-help, #nvme-curve-help { margin: 8px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .curve-notice { margin-top: 13px; }
 .storage-panel .panel-heading { padding-bottom: 15px; }

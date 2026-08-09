@@ -100,12 +100,18 @@
       </section>
 
       <section id="panel-fan" class="tab-panel" role="tabpanel" aria-labelledby="tab-fan" hidden>
+        <div id="fan-driver-warning" class="fan-driver-warning" role="alert" hidden>
+          <span class="warning-icon" aria-hidden="true">!</span>
+          <div>
+            <strong>未检测到或未加载 IT87 风扇驱动</strong>
+            <p>风扇转速和 PWM 控制暂不可用。<a href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">前往 GitHub 下载并安装 IT87 驱动</a></p>
+          </div>
+        </div>
         <section class="panel fan-editor" aria-labelledby="fan-heading">
           <div class="panel-heading fan-heading">
             <div>
               <h2 id="fan-heading">CPU、HDD 与 NVMe 三温控曲线</h2>
               <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
-              <p class="driver-link">未检测到风扇？<a href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">前往 GitHub 下载并安装 IT87 驱动</a></p>
             </div>
             <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
           </div>
@@ -152,7 +158,7 @@
             <section class="curve-editor" aria-labelledby="disk-curve-heading">
               <div class="curve-editor-heading">
                 <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
-                <span>取六个前置仓最高温度</span>
+                <span>取已勾选前置仓的最高温度</span>
               </div>
               <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 HDD 温控曲线" aria-describedby="disk-curve-help"></svg>
               <div class="curve-toolbar">
@@ -162,12 +168,17 @@
                 </div>
                 <strong id="disk-curve-selected">—</strong>
               </div>
+              <fieldset class="curve-slot-selector">
+                <legend>参与 HDD/SATA 温控的槽位</legend>
+                <p>取消勾选后，该槽位温度不再影响风扇；温度缓存约每 60 秒更新。</p>
+                <div id="hdd-slot-options" class="curve-slot-options"></div>
+              </fieldset>
               <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
             </section>
             <section class="curve-editor" aria-labelledby="nvme-curve-heading">
               <div class="curve-editor-heading">
                 <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
-                <span>取四个 M.2 槽最高温度</span>
+                <span>取已勾选 M.2 槽的最高温度</span>
               </div>
               <svg id="nvme-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 NVMe 温控曲线" aria-describedby="nvme-curve-help"></svg>
               <div class="curve-toolbar">
@@ -177,6 +188,11 @@
                 </div>
                 <strong id="nvme-curve-selected">—</strong>
               </div>
+              <fieldset class="curve-slot-selector">
+                <legend>参与 NVMe/SSD 温控的槽位</legend>
+                <p>取消勾选后，该槽位温度不再影响风扇；全部取消则停用 NVMe 温控曲线。</p>
+                <div id="nvme-slot-options" class="curve-slot-options"></div>
+              </fieldset>
               <p id="nvme-curve-help">默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
             </section>
           </div>

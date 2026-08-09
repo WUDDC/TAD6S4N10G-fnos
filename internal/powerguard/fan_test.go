@@ -22,6 +22,9 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 			t.Fatalf("unexpected default %s curve: %+v", name, curve)
 		}
 	}
+	if len(cfg.HDDSlotIDs) != 6 || len(cfg.NVMeSlotIDs) != 4 {
+		t.Fatalf("all storage slots must participate by default: HDD=%v NVMe=%v", cfg.HDDSlotIDs, cfg.NVMeSlotIDs)
+	}
 }
 
 func TestInterpolatePWMPercent(t *testing.T) {
@@ -66,6 +69,9 @@ func TestDiscoverFansRequiresMatchingRPMAndPWMNodes(t *testing.T) {
 	}
 	if len(fans) != 2 {
 		t.Fatalf("got %d complete fan channels, want 2: %+v", len(fans), fans)
+	}
+	if !(&Manager{Root: root}).IT87DriverDetected() {
+		t.Fatal("IT87 hwmon node was not detected")
 	}
 	if fans[1].ID != "it8613:hwmon7:fan3" || fans[1].RPM != 1662 || fans[1].Channel != 3 {
 		t.Fatalf("unexpected spinning fan: %+v", fans[1])
@@ -130,7 +136,7 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	if !normalizeConfig(&cfg) {
 		t.Fatal("legacy config was not migrated")
 	}
-	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 {
+	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 || len(cfg.Fan.HDDSlotIDs) != 6 || len(cfg.Fan.NVMeSlotIDs) != 4 {
 		t.Fatalf("unexpected migrated fan config: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
@@ -162,6 +168,18 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 	}
 	if normalizeConfig(&cfg) {
 		t.Fatal("migrated config changed a second time")
+	}
+}
+
+func TestNormalizeConfigPreservesExplicitlyDisabledStorageMonitoring(t *testing.T) {
+	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
+	cfg.Fan.HDDSlotIDs = []string{}
+	cfg.Fan.NVMeSlotIDs = []string{}
+	if normalizeConfig(&cfg) {
+		t.Fatal("normalized config unexpectedly changed")
+	}
+	if len(cfg.Fan.HDDSlotIDs) != 0 || len(cfg.Fan.NVMeSlotIDs) != 0 {
+		t.Fatalf("disabled storage monitoring was re-enabled: HDD=%v NVMe=%v", cfg.Fan.HDDSlotIDs, cfg.Fan.NVMeSlotIDs)
 	}
 }
 
@@ -198,11 +216,17 @@ func TestMaximumStorageTemperatureByKind(t *testing.T) {
 		{ID: "m2-2", Kind: "m2", TemperatureC: 64},
 	}}
 	storage.Slots[0].Kind = "front"
-	if temperature, available := maximumStorageTemperature(storage, "front"); !available || temperature != 44 {
+	if temperature, available := maximumStorageTemperature(storage, "front", []string{"front-1", "front-2"}); !available || temperature != 44 {
 		t.Fatalf("HDD temperature=%.1f available=%v, want 44 true", temperature, available)
 	}
-	if temperature, available := maximumStorageTemperature(storage, "m2"); !available || temperature != 64 {
+	if temperature, available := maximumStorageTemperature(storage, "m2", []string{"m2-1", "m2-2"}); !available || temperature != 64 {
 		t.Fatalf("NVMe temperature=%.1f available=%v, want 64 true", temperature, available)
+	}
+	if temperature, available := maximumStorageTemperature(storage, "m2", []string{"m2-1"}); !available || temperature != 58 {
+		t.Fatalf("filtered NVMe temperature=%.1f available=%v, want 58 true", temperature, available)
+	}
+	if temperature, available := maximumStorageTemperature(storage, "m2", []string{}); available || temperature != 0 {
+		t.Fatalf("disabled NVMe slots returned temperature=%.1f available=%v", temperature, available)
 	}
 }
 
@@ -228,6 +252,25 @@ func TestFanValidationRejectsDecreasingStorageSpeed(t *testing.T) {
 	cfg.NVMeCurve[2].PWMPercent = 40
 	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
 		t.Fatal("decreasing NVMe PWM curve was accepted")
+	}
+}
+
+func TestFanValidationRejectsInvalidOrDuplicateStorageSlots(t *testing.T) {
+	cfg := DefaultFanConfig()
+	cfg.HDDSlotIDs = []string{"front-1", "front-1"}
+	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+		t.Fatal("duplicate HDD slot was accepted")
+	}
+	cfg = DefaultFanConfig()
+	cfg.NVMeSlotIDs = []string{"front-1"}
+	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+		t.Fatal("HDD slot was accepted as NVMe slot")
+	}
+	cfg = DefaultFanConfig()
+	cfg.HDDSlotIDs = []string{}
+	cfg.NVMeSlotIDs = []string{}
+	if err := (&Manager{}).validateFanLocked(cfg); err != nil {
+		t.Fatalf("explicitly disabling storage monitoring was rejected: %v", err)
 	}
 }
 

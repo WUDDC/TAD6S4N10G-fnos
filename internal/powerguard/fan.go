@@ -31,6 +31,8 @@ type FanConfig struct {
 	DiskCurve      []FanPoint `json:"disk_curve,omitempty"`
 	HDDCurve       []FanPoint `json:"hdd_curve"`
 	NVMeCurve      []FanPoint `json:"nvme_curve"`
+	HDDSlotIDs     []string   `json:"hdd_slot_ids"`
+	NVMeSlotIDs    []string   `json:"nvme_slot_ids"`
 }
 
 type FanDevice struct {
@@ -58,6 +60,7 @@ type FanStatus struct {
 
 type FanControlStatus struct {
 	Available            bool        `json:"available"`
+	DriverDetected       bool        `json:"driver_detected"`
 	Active               bool        `json:"active"`
 	TemperatureC         float64     `json:"temperature_c,omitempty"`
 	CPUTemperatureC      float64     `json:"cpu_temperature_c,omitempty"`
@@ -102,7 +105,19 @@ func DefaultFanConfig() FanConfig {
 	}
 	config.HDDCurve = defaultStorageFanCurve(config.MinPWMPercent)
 	config.NVMeCurve = defaultStorageFanCurve(config.MinPWMPercent)
+	config.HDDSlotIDs = storageSlotIDs("front")
+	config.NVMeSlotIDs = storageSlotIDs("m2")
 	return config
+}
+
+func storageSlotIDs(kind string) []string {
+	var ids []string
+	for _, spec := range storageSlotSpecs {
+		if spec.Kind == kind {
+			ids = append(ids, spec.ID)
+		}
+	}
+	return ids
 }
 
 func defaultStorageFanCurve(minimum int) []FanPoint {
@@ -136,6 +151,14 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.Fan.NVMeCurve = defaultStorageFanCurve(cfg.Fan.MinPWMPercent)
 		changed = true
 	}
+	if cfg.Fan.HDDSlotIDs == nil {
+		cfg.Fan.HDDSlotIDs = storageSlotIDs("front")
+		changed = true
+	}
+	if cfg.Fan.NVMeSlotIDs == nil {
+		cfg.Fan.NVMeSlotIDs = storageSlotIDs("m2")
+		changed = true
+	}
 	if cfg.Fan.DiskCurve != nil {
 		cfg.Fan.DiskCurve = nil
 		changed = true
@@ -166,6 +189,12 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if err := validateFanCurve("NVMe", cfg.NVMeCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
 		return err
 	}
+	if err := validateFanSlotIDs("HDD", "front", cfg.HDDSlotIDs); err != nil {
+		return err
+	}
+	if err := validateFanSlotIDs("NVMe", "m2", cfg.NVMeSlotIDs); err != nil {
+		return err
+	}
 	if !cfg.Enabled {
 		return nil
 	}
@@ -185,6 +214,26 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 		}
 	}
 	return fmt.Errorf("configured fan %s was not found", cfg.DeviceID)
+}
+
+func validateFanSlotIDs(name, kind string, ids []string) error {
+	allowed := make(map[string]bool)
+	for _, spec := range storageSlotSpecs {
+		if spec.Kind == kind {
+			allowed[spec.ID] = true
+		}
+	}
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if !allowed[id] {
+			return fmt.Errorf("fan %s slot %q is not a supported %s slot", name, id, kind)
+		}
+		if seen[id] {
+			return fmt.Errorf("fan %s slot %q is duplicated", name, id)
+		}
+		seen[id] = true
+	}
+	return nil
 }
 
 func validateFanCurve(name string, curve []FanPoint, minimum int, emergencyTempC float64) error {
@@ -272,6 +321,17 @@ func isIT87Name(name string) bool {
 	return name == "it87" || strings.HasPrefix(name, "it8")
 }
 
+func (m *Manager) IT87DriverDetected() bool {
+	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
+	for _, namePath := range namePaths {
+		name, err := readTrim(namePath)
+		if err == nil && isIT87Name(name) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) ApplyFanCurrent() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -329,8 +389,8 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		return errors.Join(fmt.Errorf("temperature sensor failed; fan forced to full speed: %w", tempErr), failSafeErr)
 	}
 	storage := m.StorageStatus()
-	hddTemperature, hddAvailable := maximumStorageTemperature(storage, "front")
-	nvmeTemperature, nvmeAvailable := maximumStorageTemperature(storage, "m2")
+	hddTemperature, hddAvailable := maximumStorageTemperature(storage, "front", cfg.HDDSlotIDs)
+	nvmeTemperature, nvmeAvailable := maximumStorageTemperature(storage, "m2", cfg.NVMeSlotIDs)
 	_, _, _, target := fanTargets(cfg, temperature, hddTemperature, hddAvailable, nvmeTemperature, nvmeAvailable)
 	if err := setFanPWM(*selected, target); err != nil {
 		failSafeErr := setFanPWM(*selected, 100)
@@ -434,11 +494,15 @@ func fanTargets(cfg FanConfig, cpuTemperature, hddTemperature float64, hddAvaila
 	return cpuTarget, hddTarget, nvmeTarget, max(cpuTarget, hddTarget, nvmeTarget)
 }
 
-func maximumStorageTemperature(status StorageStatus, kind string) (float64, bool) {
+func maximumStorageTemperature(status StorageStatus, kind string, slotIDs []string) (float64, bool) {
+	selected := make(map[string]bool, len(slotIDs))
+	for _, id := range slotIDs {
+		selected[id] = true
+	}
 	maximum := 0.0
 	available := false
 	for _, slot := range status.Slots {
-		if slot.Kind != kind || slot.TemperatureC <= 0 {
+		if slot.Kind != kind || !selected[slot.ID] || slot.TemperatureC <= 0 {
 			continue
 		}
 		if !available || slot.TemperatureC > maximum {
@@ -596,6 +660,7 @@ func (m *Manager) failSafeCapturedFansLocked() error {
 func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 	result := FanControlStatus{
 		Active:           cfg.Enabled,
+		DriverDetected:   m.IT87DriverDetected(),
 		LastApply:        m.fanLastApply,
 		LastError:        m.fanLastError,
 		TargetPWMPercent: m.fanLastTarget,
@@ -631,13 +696,13 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 		result.LastError = combineError(result.LastError, err)
 	}
 	storage := m.StorageStatus()
-	if temperature, available := maximumStorageTemperature(storage, "front"); available {
+	if temperature, available := maximumStorageTemperature(storage, "front", cfg.HDDSlotIDs); available {
 		result.HDDTemperatureC = temperature
 		if len(cfg.HDDCurve) >= 2 {
 			result.HDDTargetPWMPercent = interpolatePWMPercent(cfg.HDDCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	}
-	if temperature, available := maximumStorageTemperature(storage, "m2"); available {
+	if temperature, available := maximumStorageTemperature(storage, "m2", cfg.NVMeSlotIDs); available {
 		result.NVMeTemperatureC = temperature
 		if len(cfg.NVMeCurve) >= 2 {
 			result.NVMeTargetPWMPercent = interpolatePWMPercent(cfg.NVMeCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
