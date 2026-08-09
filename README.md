@@ -1,4 +1,4 @@
-# TAD模块（fnOS）
+# TAD6S4N模块（fnOS）
 
 这是一个面向飞牛 fnOS 与 TAD6S4N10G 的第三方模块。它按 RR CPUinfo 的口径显示 Intel Processor N100 与 Intel Core i3-N305 的 CPU 核心最高温度，同时保留 Package 原始温度供核对；还可限制 Package 功耗、按 CPU/HDD/NVMe 三温度曲线控制单风扇、显示硬盘物理仓位与活动状态，并配置机箱 GPIO 按键映射。
 

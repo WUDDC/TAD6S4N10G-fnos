@@ -4,7 +4,7 @@ set -eu
 case "$(uname -m)" in
   x86_64|amd64) ;;
   *)
-    echo "TAD模块仅支持 x86_64 平台。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    echo "TAD6S4N模块仅支持 x86_64 平台。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
     exit 1
     ;;
 esac
