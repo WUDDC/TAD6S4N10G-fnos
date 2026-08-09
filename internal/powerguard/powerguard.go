@@ -41,6 +41,13 @@ type Config struct {
 	GPIO           GPIOConfig `json:"gpio"`
 }
 
+type GlobalConfig struct {
+	Enabled        bool  `json:"enabled"`
+	PL1W           int64 `json:"pl1_w"`
+	PL2W           int64 `json:"pl2_w"`
+	ReapplySeconds int   `json:"reapply_seconds"`
+}
+
 type Constraint struct {
 	Index     int    `json:"index"`
 	Name      string `json:"name"`
@@ -237,6 +244,95 @@ func (m *Manager) SaveAndApply(cfg Config) error {
 	return nil
 }
 
+func (m *Manager) SaveGlobalConfig(global GlobalConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.Enabled = global.Enabled
+	cfg.PL1W = global.PL1W
+	cfg.PL2W = global.PL2W
+	cfg.ReapplySeconds = global.ReapplySeconds
+	if err := m.validateGlobalLocked(cfg); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if cfg.Enabled {
+		err = m.applyPowerLocked(cfg)
+	} else {
+		err = m.restorePowerLocked()
+	}
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	m.lastApply = time.Now()
+	return nil
+}
+
+func (m *Manager) SaveFanConfig(fan FanConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	previous := cfg.Fan
+	cfg.Fan = fan
+	normalizeConfig(&cfg)
+	if err := m.validateFanLocked(cfg.Fan); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if previous.Enabled && !cfg.Fan.Enabled {
+		err = m.restoreFansLocked()
+	} else if cfg.Fan.Enabled {
+		err = m.applyFanLocked(cfg.Fan)
+	}
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	m.lastApply = time.Now()
+	return nil
+}
+
+func (m *Manager) SaveGPIOConfig(gpio GPIOConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.GPIO = gpio
+	normalizeConfig(&cfg)
+	if err := validateGPIOConfig(cfg.GPIO); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
 func (m *Manager) ApplyCurrent() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -299,6 +395,16 @@ func (m *Manager) Validate(cfg Config) error {
 }
 
 func (m *Manager) validateLocked(cfg Config) error {
+	if err := m.validateGlobalLocked(cfg); err != nil {
+		return err
+	}
+	if err := m.validateFanLocked(cfg.Fan); err != nil {
+		return err
+	}
+	return validateGPIOConfig(cfg.GPIO)
+}
+
+func (m *Manager) validateGlobalLocked(cfg Config) error {
 	model, err := m.CPUModel()
 	if err != nil {
 		return err
@@ -315,12 +421,6 @@ func (m *Manager) validateLocked(cfg Config) error {
 	}
 	if cfg.PL2W < cfg.PL1W || cfg.PL2W > profile.MaxPL2 {
 		return fmt.Errorf("PL2 must be at least PL1 and no more than %dW for %s", profile.MaxPL2, profile.Display)
-	}
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
-		return err
-	}
-	if err := validateGPIOConfig(cfg.GPIO); err != nil {
-		return err
 	}
 	packages, err := m.DiscoverPackages()
 	if err != nil {

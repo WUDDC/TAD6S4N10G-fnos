@@ -78,6 +78,9 @@ func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
+	mux.HandleFunc("/api/config/fan", s.handleFanConfig)
+	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -127,6 +130,73 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleGlobalConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg GlobalConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveGlobalConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg FanConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveFanConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg GPIOConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveGPIOConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) authorizeConfigRequest(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return false
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以修改模块配置")
+		return false
+	}
+	return true
+}
+
+func decodeConfigRequest(r *http.Request, target any) error {
+	defer r.Body.Close()
+	dec := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	dec.DisallowUnknownFields()
+	return dec.Decode(target)
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {

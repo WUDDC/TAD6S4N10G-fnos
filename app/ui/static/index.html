@@ -19,7 +19,7 @@
 
     <div class="app-layout">
       <nav class="app-tabs" role="tablist" aria-label="插件功能">
-        <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">🌡</span>温度</button>
+        <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">⚙</span>全局配置</button>
         <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><span aria-hidden="true">◉</span>风扇控制</button>
         <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><span aria-hidden="true">⌁</span>按键控制</button>
         <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1"><span aria-hidden="true">▱</span>硬盘面板</button>
@@ -87,6 +87,12 @@
           <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
           <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
         </section>
+        <div class="actions app-actions">
+          <button id="save-global" type="button" class="primary">保存全局配置</button>
+          <button id="apply-now" type="button">立即重应用</button>
+          <button id="restore" type="button" class="danger">恢复安装前配置</button>
+        </div>
+        <p id="message-global" class="message" role="status" aria-live="polite"></p>
       </section>
 
       <section id="panel-fan" class="tab-panel" role="tabpanel" aria-labelledby="tab-fan" hidden>
@@ -172,6 +178,10 @@
           </div>
           <p class="notice curve-notice">最终转速 = CPU、HDD/SATA 与 NVMe 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
         </section>
+        <div class="actions app-actions">
+          <button id="save-fan" type="button" class="primary">保存风扇控制</button>
+        </div>
+        <p id="message-fan" class="message" role="status" aria-live="polite"></p>
       </section>
 
       <section id="panel-gpio" class="tab-panel" role="tabpanel" aria-labelledby="tab-gpio" hidden>
@@ -196,6 +206,10 @@
           <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
           <p class="notice">出于安全考虑，当前只提供记录日志、刷新硬盘仓位、SMART 检查和重新应用插件配置；不会执行任意命令，也暂不调用未经验证的飞牛私有接口。</p>
         </section>
+        <div class="actions app-actions">
+          <button id="save-gpio" type="button" class="primary">保存按钮控制</button>
+        </div>
+        <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
       </section>
 
       <section id="panel-storage" class="tab-panel" role="tabpanel" aria-labelledby="tab-storage" hidden>
@@ -217,12 +231,6 @@
         </section>
       </section>
 
-      <div class="actions app-actions">
-        <button type="submit" class="primary">保存并应用</button>
-        <button id="apply-now" type="button">立即重应用</button>
-        <button id="restore" type="button" class="danger">恢复安装前配置</button>
-      </div>
-      <p id="message" class="message" role="status" aria-live="polite"></p>
       </form>
     </div>
   </main>

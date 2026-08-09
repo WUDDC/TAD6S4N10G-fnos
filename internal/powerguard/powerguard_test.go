@@ -3,6 +3,7 @@ package powerguard
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -71,6 +72,89 @@ func TestWriteJSONAtomic(t *testing.T) {
 	}
 	if len(data) == 0 || data[len(data)-1] != '\n' {
 		t.Fatal("JSON file is empty or lacks final newline")
+	}
+}
+
+func TestScopedConfigSavesPreserveOtherSections(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot create the intel-rapl:0 fixture path")
+	}
+	root := t.TempDir()
+	procDir := filepath.Join(root, "proc")
+	raplDir := filepath.Join(root, "sys", "devices", "virtual", "powercap", "intel-rapl", "intel-rapl:0")
+	for _, dir := range []string{procDir, raplDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(procDir, "cpuinfo"), []byte("model name : Intel(R) Core(TM) i3-N305\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		"name": "package-0", "constraint_0_name": "long_term", "constraint_0_power_limit_uw": "15000000",
+		"constraint_0_max_power_uw": "20000000", "constraint_1_name": "short_term",
+		"constraint_1_power_limit_uw": "15000000", "constraint_1_max_power_uw": "35000000",
+	}
+	for name, value := range files {
+		if err := os.WriteFile(filepath.Join(raplDir, name), []byte(value), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager := &Manager{
+		Root: root, ConfigPath: filepath.Join(root, "config.json"), StatePath: filepath.Join(root, "state.json"),
+	}
+	cfg := DefaultConfig(profiles[0])
+	cfg.Enabled = false
+	cfg.GPIO.Buttons[0].Actions.Short = GPIOActionLog
+	if err := writeJSONAtomic(manager.ConfigPath, cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.SaveGlobalConfig(GlobalConfig{Enabled: false, PL1W: 12, PL2W: 18, ReapplySeconds: 45}); err != nil {
+		t.Fatal(err)
+	}
+	afterGlobal, err := manager.loadConfigLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGlobal.Fan.MinPWMPercent != cfg.Fan.MinPWMPercent || afterGlobal.GPIO.Buttons[0].Actions.Short != GPIOActionLog {
+		t.Fatalf("global save changed another section: %+v", afterGlobal)
+	}
+
+	newFan := afterGlobal.Fan
+	newFan.MinPWMPercent = 35
+	for index := range newFan.Curve {
+		newFan.Curve[index].PWMPercent = max(newFan.Curve[index].PWMPercent, 35)
+	}
+	for index := range newFan.HDDCurve {
+		newFan.HDDCurve[index].PWMPercent = max(newFan.HDDCurve[index].PWMPercent, 35)
+	}
+	for index := range newFan.NVMeCurve {
+		newFan.NVMeCurve[index].PWMPercent = max(newFan.NVMeCurve[index].PWMPercent, 35)
+	}
+	if err := manager.SaveFanConfig(newFan); err != nil {
+		t.Fatal(err)
+	}
+	afterFan, err := manager.loadConfigLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterFan.PL1W != 12 || afterFan.GPIO.Buttons[0].Actions.Short != GPIOActionLog {
+		t.Fatalf("fan save changed another section: %+v", afterFan)
+	}
+
+	newGPIO := afterFan.GPIO
+	newGPIO.Enabled = true
+	if err := manager.SaveGPIOConfig(newGPIO); err != nil {
+		t.Fatal(err)
+	}
+	afterGPIO, err := manager.loadConfigLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterGPIO.PL1W != 12 || afterGPIO.Fan.MinPWMPercent != 35 || !afterGPIO.GPIO.Enabled {
+		t.Fatalf("GPIO save changed another section: %+v", afterGPIO)
 	}
 }
 

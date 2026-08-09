@@ -617,9 +617,10 @@ function render(status, keepInputs = false) {
   CURVE_KINDS.forEach(renderFanChart);
 }
 
-function showMessage(message, error = false) {
-  $('message').textContent = message;
-  $('message').className = `message${error ? ' error' : ''}`;
+function showMessage(message, error = false, targetID = 'message-global') {
+  const target = $(targetID);
+  target.textContent = message;
+  target.className = `message${error ? ' error' : ''}`;
 }
 
 function setBusy(busy) {
@@ -639,57 +640,99 @@ async function refresh(keepInputs = false) {
   }
 }
 
-$('config-form').addEventListener('submit', async (event) => {
-  event.preventDefault();
+function reportPanelValidity(panelID) {
+  const invalid = [...$(panelID).querySelectorAll('[required]')]
+    .find((control) => !control.disabled && !control.checkValidity());
+  if (!invalid) return true;
+  invalid.reportValidity();
+  return false;
+}
+
+function fanConfigFromInputs() {
   const cpuCurve = curveFromInputs('cpu');
   const hddCurve = curveFromInputs('hdd');
   const nvmeCurve = curveFromInputs('nvme');
+  return {
+    enabled: $('fan-enabled').checked,
+    device_id: $('fan-device').value,
+    min_pwm_percent: Number($('fan-min').value),
+    emergency_temp_c: Number($('fan-emergency').value),
+    poll_seconds: Number($('fan-poll').value),
+    curve: cpuCurve,
+    hdd_curve: hddCurve,
+    nvme_curve: nvmeCurve,
+  };
+}
+
+$('save-global').addEventListener('click', async () => {
+  if (!reportPanelValidity('panel-temperature')) return;
   const config = {
     enabled: $('enabled').checked,
     pl1_w: Number($('pl1').value),
     pl2_w: Number($('pl2').value),
     reapply_seconds: Number($('interval').value),
-    fan: {
-      enabled: $('fan-enabled').checked,
-      device_id: $('fan-device').value,
-      min_pwm_percent: Number($('fan-min').value),
-      emergency_temp_c: Number($('fan-emergency').value),
-      poll_seconds: Number($('fan-poll').value),
-      curve: cpuCurve,
-      hdd_curve: hddCurve,
-      nvme_curve: nvmeCurve,
-    },
-    gpio: gpioConfigFromInputs(),
   };
   if (config.pl2_w < config.pl1_w) {
-    showMessage('PL2 不能低于 PL1。', true);
+    showMessage('PL2 不能低于 PL1。', true, 'message-global');
     return;
   }
-  if (config.fan.enabled && !config.fan.device_id) {
-    showMessage('启用风扇曲线前必须检测到有转速反馈的风扇。', true);
+  setBusy(true);
+  try {
+    render(await request('api/config/global', { method: 'POST', body: JSON.stringify(config) }), true);
+    showMessage('全局配置已保存并应用；风扇和按钮配置未修改。', false, 'message-global');
+  } catch (error) {
+    showMessage(`保存失败：${error.message}`, true, 'message-global');
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('save-fan').addEventListener('click', async () => {
+  if (!reportPanelValidity('panel-fan')) return;
+  const config = fanConfigFromInputs();
+  if (config.enabled && !config.device_id) {
+    showMessage('启用风扇曲线前必须检测到有转速反馈的风扇。', true, 'message-fan');
     return;
   }
-  for (const [label, curve] of [['CPU', cpuCurve], ['HDD/SATA', hddCurve], ['NVMe', nvmeCurve]]) {
+  const curves = [
+    ['CPU', config.curve],
+    ['HDD/SATA', config.hdd_curve],
+    ['NVMe', config.nvme_curve],
+  ];
+  for (const [label, curve] of curves) {
     if (curve.length < CURVE_MIN_POINTS || curve.length > CURVE_MAX_POINTS) {
-      showMessage(`${label}曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true);
+      showMessage(`${label}曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true, 'message-fan');
       return;
     }
-    if (curve.some((point, index) => point.pwm_percent < config.fan.min_pwm_percent
+    if (curve.some((point, index) => point.pwm_percent < config.min_pwm_percent
         || (index > 0 && (point.temp_c <= curve[index - 1].temp_c || point.pwm_percent < curve[index - 1].pwm_percent)))) {
-      showMessage(`${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true);
+      showMessage(`${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true, 'message-fan');
       return;
     }
-    if (config.fan.emergency_temp_c < curve[curve.length - 1].temp_c) {
-      showMessage(`紧急满速温度不能低于最后一个${label}曲线节点。`, true);
+    if (config.emergency_temp_c < curve[curve.length - 1].temp_c) {
+      showMessage(`紧急满速温度不能低于最后一个${label}曲线节点。`, true, 'message-fan');
       return;
     }
   }
   setBusy(true);
   try {
-    render(await request('api/config', { method: 'POST', body: JSON.stringify(config) }));
-    showMessage('功耗、CPU/HDD/NVMe 三温控曲线与按键映射配置已保存并应用。');
+    render(await request('api/config/fan', { method: 'POST', body: JSON.stringify(config) }), true);
+    showMessage('风扇控制与三条温控曲线已保存并应用；其他配置未修改。', false, 'message-fan');
   } catch (error) {
-    showMessage(`应用失败：${error.message}`, true);
+    showMessage(`保存失败：${error.message}`, true, 'message-fan');
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('save-gpio').addEventListener('click', async () => {
+  const config = gpioConfigFromInputs();
+  setBusy(true);
+  try {
+    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
+    showMessage('按钮控制配置已保存；全局和风扇配置未修改。', false, 'message-gpio');
+  } catch (error) {
+    showMessage(`保存失败：${error.message}`, true, 'message-gpio');
   } finally {
     setBusy(false);
   }
@@ -698,7 +741,7 @@ $('config-form').addEventListener('submit', async (event) => {
 $('apply-now').addEventListener('click', async () => {
   setBusy(true);
   try {
-    render(await request('api/apply', { method: 'POST', body: '{}' }));
+    render(await request('api/apply', { method: 'POST', body: '{}' }), true);
     showMessage('已重新应用当前功耗与风扇配置。');
   } catch (error) {
     showMessage(`重应用失败：${error.message}`, true);
