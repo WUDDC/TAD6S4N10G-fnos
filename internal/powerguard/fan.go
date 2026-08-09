@@ -78,13 +78,13 @@ type originalFanState struct {
 func DefaultFanConfig() FanConfig {
 	return FanConfig{
 		Enabled:        false,
-		MinPWMPercent:  35,
+		MinPWMPercent:  60,
 		EmergencyTempC: 85,
 		PollSeconds:    2,
 		Curve: []FanPoint{
-			{TempC: 40, PWMPercent: 35},
-			{TempC: 55, PWMPercent: 50},
-			{TempC: 70, PWMPercent: 75},
+			{TempC: 40, PWMPercent: 60},
+			{TempC: 55, PWMPercent: 70},
+			{TempC: 70, PWMPercent: 85},
 			{TempC: 80, PWMPercent: 100},
 		},
 	}

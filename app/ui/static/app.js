@@ -1,8 +1,8 @@
 const $ = (id) => document.getElementById(id);
 const DEFAULT_CURVE = [
-  { temp_c: 40, pwm_percent: 35 },
-  { temp_c: 55, pwm_percent: 50 },
-  { temp_c: 70, pwm_percent: 75 },
+  { temp_c: 40, pwm_percent: 60 },
+  { temp_c: 55, pwm_percent: 70 },
+  { temp_c: 70, pwm_percent: 85 },
   { temp_c: 80, pwm_percent: 100 },
 ];
 let currentStatus = null;
@@ -107,7 +107,7 @@ function populateFanDevices(status, keepInputs) {
 
 function fillFanInputs(fan = {}) {
   $('fan-enabled').checked = Boolean(fan.enabled);
-  $('fan-min').value = fan.min_pwm_percent ?? 35;
+  $('fan-min').value = fan.min_pwm_percent ?? 60;
   $('fan-emergency').value = fan.emergency_temp_c ?? 85;
   $('fan-poll').value = fan.poll_seconds ?? 2;
   const curve = Array.isArray(fan.curve) && fan.curve.length === 4 ? fan.curve : DEFAULT_CURVE;

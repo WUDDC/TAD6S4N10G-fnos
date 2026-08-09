@@ -11,7 +11,7 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 	if cfg.Enabled {
 		t.Fatal("fan control must be disabled by default")
 	}
-	if cfg.MinPWMPercent != 35 || cfg.EmergencyTempC != 85 || cfg.PollSeconds != 2 {
+	if cfg.MinPWMPercent != 60 || cfg.EmergencyTempC != 85 || cfg.PollSeconds != 2 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 	if len(cfg.Curve) != 4 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
@@ -25,16 +25,16 @@ func TestInterpolatePWMPercent(t *testing.T) {
 		temp float64
 		want int
 	}{
-		{30, 35},
-		{40, 35},
-		{47.5, 43},
-		{55, 50},
-		{70, 75},
+		{30, 60},
+		{40, 60},
+		{47.5, 65},
+		{55, 70},
+		{70, 85},
 		{80, 100},
 		{85, 100},
 	}
 	for _, test := range tests {
-		if got := interpolatePWMPercent(curve, test.temp, 35, 85); got != test.want {
+		if got := interpolatePWMPercent(curve, test.temp, 60, 85); got != test.want {
 			t.Errorf("temperature %.1f: got %d%%, want %d%%", test.temp, got, test.want)
 		}
 	}
@@ -100,7 +100,7 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	if !normalizeConfig(&cfg) {
 		t.Fatal("legacy config was not migrated")
 	}
-	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 35 || len(cfg.Fan.Curve) != 4 {
+	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 60 || len(cfg.Fan.Curve) != 4 {
 		t.Fatalf("unexpected migrated fan config: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
