@@ -28,7 +28,7 @@ type Profile struct {
 }
 
 var profiles = []Profile{
-	{ID: "n305", Display: "Intel Core i3-N305", DefaultPL1: 15, DefaultPL2: 25, MinPL1: 6, MaxPL1: 20, MaxPL2: 35},
+	{ID: "n305", Display: "Intel Core i3-N305", DefaultPL1: 15, DefaultPL2: 15, MinPL1: 6, MaxPL1: 20, MaxPL2: 35},
 	{ID: "n100", Display: "Intel Processor N100", DefaultPL1: 6, DefaultPL2: 15, MinPL1: 4, MaxPL1: 10, MaxPL2: 25},
 }
 

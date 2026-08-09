@@ -8,12 +8,14 @@ import (
 
 func TestDetectProfile(t *testing.T) {
 	tests := []struct {
-		model string
-		want  string
+		model   string
+		want    string
+		wantPL1 int64
+		wantPL2 int64
 	}{
-		{"Intel(R) Core(TM) i3-N305", "n305"},
-		{"Intel(R) Processor N100", "n100"},
-		{"Intel N100 CPU @ 0.80GHz", "n100"},
+		{"Intel(R) Core(TM) i3-N305", "n305", 15, 15},
+		{"Intel(R) Processor N100", "n100", 6, 15},
+		{"Intel N100 CPU @ 0.80GHz", "n100", 6, 15},
 	}
 	for _, test := range tests {
 		profile, err := DetectProfile(test.model)
@@ -22,6 +24,9 @@ func TestDetectProfile(t *testing.T) {
 		}
 		if profile.ID != test.want {
 			t.Fatalf("DetectProfile(%q)=%q, want %q", test.model, profile.ID, test.want)
+		}
+		if profile.DefaultPL1 != test.wantPL1 || profile.DefaultPL2 != test.wantPL2 {
+			t.Fatalf("DetectProfile(%q) defaults=%d/%d, want %d/%d", test.model, profile.DefaultPL1, profile.DefaultPL2, test.wantPL1, test.wantPL2)
 		}
 	}
 	if _, err := DetectProfile("Intel Core i5-12500"); err == nil {
