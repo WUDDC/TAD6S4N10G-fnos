@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>N100/N305 温度、硬盘与功耗卫士</title>
+  <title>TAD模块</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,8 +11,8 @@
     <header>
       <div class="brand-mark" aria-hidden="true">⚡</div>
       <div>
-        <p class="eyebrow">fnOS Power Guard</p>
-        <h1>N100/N305 温度、硬盘与功耗卫士</h1>
+        <p class="eyebrow">TAD MODULE</p>
+        <h1>TAD模块</h1>
         <p class="subtitle">按 RR 口径显示 CPU 核心最高温度，并与 fnOS 使用的 Package 原始温度分开。</p>
         <p class="project-link"><a href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 项目主页 · 检查新版本</a></p>
       </div>
@@ -85,8 +85,8 @@
         <section class="panel fan-editor" aria-labelledby="fan-heading">
           <div class="panel-heading fan-heading">
             <div>
-              <h2 id="fan-heading">单风扇温控曲线</h2>
-              <p>仅控制带有效转速反馈的 IT87 风扇通道；传感器异常或达到紧急温度时自动满速。</p>
+              <h2 id="fan-heading">CPU 与硬盘双温控曲线</h2>
+              <p>两条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
               <p class="driver-link">未检测到风扇？<a href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer">前往 GitHub 下载并安装 IT87 驱动</a></p>
             </div>
             <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
@@ -115,17 +115,39 @@
             </label>
           </div>
 
-          <div class="curve-editor">
-            <svg id="fan-curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的风扇温控曲线" aria-describedby="curve-help"></svg>
-            <div class="curve-toolbar">
-              <div class="curve-actions">
-                <button id="curve-add" type="button">＋ 增加节点</button>
-                <button id="curve-remove" type="button">删除选中节点</button>
+          <div class="curve-editors">
+            <section class="curve-editor" aria-labelledby="cpu-curve-heading">
+              <div class="curve-editor-heading">
+                <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
+                <span>读取 coretemp 最高值</span>
               </div>
-              <strong id="curve-selected">—</strong>
-            </div>
-            <p id="curve-help">拖动圆点调整温度和转速；节点会自动保持温度递增、转速不下降。支持 2–8 个节点，也可选中节点后使用方向键微调。</p>
+              <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线" aria-describedby="curve-help"></svg>
+              <div class="curve-toolbar">
+                <div class="curve-actions">
+                  <button id="curve-add" type="button">＋ 增加节点</button>
+                  <button id="curve-remove" type="button">删除选中节点</button>
+                </div>
+                <strong id="curve-selected">—</strong>
+              </div>
+              <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
+            </section>
+            <section class="curve-editor" aria-labelledby="disk-curve-heading">
+              <div class="curve-editor-heading">
+                <h3 id="disk-curve-heading">硬盘温度曲线</h3>
+                <span>取所有仓位最高盘温</span>
+              </div>
+              <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的硬盘温控曲线" aria-describedby="disk-curve-help"></svg>
+              <div class="curve-toolbar">
+                <div class="curve-actions">
+                  <button id="disk-curve-add" type="button">＋ 增加节点</button>
+                  <button id="disk-curve-remove" type="button">删除选中节点</button>
+                </div>
+                <strong id="disk-curve-selected">—</strong>
+              </div>
+              <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；盘温来自 60 秒 SMART 缓存。</p>
+            </section>
           </div>
+          <p class="notice curve-notice">最终转速 = CPU 曲线目标与硬盘曲线目标的较高值；硬盘温度暂不可用时只按 CPU 曲线控制。</p>
         </section>
       </section>
 

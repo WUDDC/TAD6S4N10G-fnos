@@ -72,10 +72,14 @@ small { display: block; margin-top: 7px; line-height: 1.4; }
 .driver-link a { color: var(--mint); font-weight: 700; text-underline-offset: 3px; }
 .driver-link a:hover { color: #8cf3c9; }
 .fan-settings { display: grid; grid-template-columns: 1.4fr repeat(3, 1fr); gap: 14px; }
-.curve-editor { margin-top: 18px; }
-#fan-curve-chart { width: 100%; min-height: 260px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 12, .66); cursor: grab; touch-action: none; user-select: none; }
-#fan-curve-chart.dragging { cursor: grabbing; }
-#fan-curve-chart:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
+.curve-editors { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-top: 18px; }
+.curve-editor { min-width: 0; padding: 16px; border: 1px solid var(--line); border-radius: 16px; background: rgba(4, 16, 12, .32); }
+.curve-editor-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; margin-bottom: 12px; }
+.curve-editor-heading h3 { margin: 0; font-size: 16px; }
+.curve-editor-heading span { color: var(--muted); font-size: 12px; text-align: right; }
+.curve-chart { width: 100%; min-height: 240px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 12, .66); cursor: grab; touch-action: none; user-select: none; }
+.curve-chart.dragging { cursor: grabbing; }
+.curve-chart:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
 .curve-node { cursor: grab; transition: r .12s, fill .12s; }
 .curve-node.selected { fill: var(--mint); }
 .curve-node-label { pointer-events: none; paint-order: stroke; stroke: #07110f; stroke-width: 4px; stroke-linejoin: round; }
@@ -83,8 +87,9 @@ small { display: block; margin-top: 7px; line-height: 1.4; }
 .curve-actions { display: flex; flex-wrap: wrap; gap: 9px; }
 .curve-actions button:disabled { cursor: not-allowed; }
 .curve-toolbar strong { color: var(--mint); font-size: 14px; }
-#curve-remove { color: var(--danger); background: rgba(255, 141, 120, .06); }
-#curve-help { margin: 9px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+#curve-remove, #disk-curve-remove { color: var(--danger); background: rgba(255, 141, 120, .06); }
+#curve-help, #disk-curve-help { margin: 9px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.curve-notice { margin-top: 14px; }
 .storage-panel .panel-heading { padding-bottom: 16px; }
 .table-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .table-scroll { width: 100%; margin-top: 16px; overflow: visible; }
@@ -131,6 +136,7 @@ dd { margin: 0; text-align: right; }
   button.danger { margin-left: 0; }
   .panel-heading { flex-direction: column; }
   .fan-settings { grid-template-columns: 1fr; }
+  .curve-editors { grid-template-columns: 1fr; }
   .curve-toolbar { align-items: flex-start; flex-direction: column; }
   .table-meta { white-space: normal; }
   .status-table { display: block; }

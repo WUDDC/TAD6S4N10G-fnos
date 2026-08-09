@@ -28,6 +28,7 @@ type FanConfig struct {
 	EmergencyTempC float64    `json:"emergency_temp_c"`
 	PollSeconds    int        `json:"poll_seconds"`
 	Curve          []FanPoint `json:"curve"`
+	DiskCurve      []FanPoint `json:"disk_curve"`
 }
 
 type FanDevice struct {
@@ -54,13 +55,18 @@ type FanStatus struct {
 }
 
 type FanControlStatus struct {
-	Available        bool        `json:"available"`
-	Active           bool        `json:"active"`
-	TemperatureC     float64     `json:"temperature_c,omitempty"`
-	TargetPWMPercent int         `json:"target_pwm_percent,omitempty"`
-	Fans             []FanStatus `json:"fans"`
-	LastApply        time.Time   `json:"last_apply,omitempty"`
-	LastError        string      `json:"last_error,omitempty"`
+	Available            bool        `json:"available"`
+	Active               bool        `json:"active"`
+	TemperatureC         float64     `json:"temperature_c,omitempty"`
+	CPUTemperatureC      float64     `json:"cpu_temperature_c,omitempty"`
+	DiskTemperatureC     float64     `json:"disk_temperature_c,omitempty"`
+	TargetPWMPercent     int         `json:"target_pwm_percent,omitempty"`
+	CPUTargetPWMPercent  int         `json:"cpu_target_pwm_percent,omitempty"`
+	DiskTargetPWMPercent int         `json:"disk_target_pwm_percent,omitempty"`
+	ControlSource        string      `json:"control_source,omitempty"`
+	Fans                 []FanStatus `json:"fans"`
+	LastApply            time.Time   `json:"last_apply,omitempty"`
+	LastError            string      `json:"last_error,omitempty"`
 }
 
 type originalFan struct {
@@ -76,7 +82,7 @@ type originalFanState struct {
 }
 
 func DefaultFanConfig() FanConfig {
-	return FanConfig{
+	config := FanConfig{
 		Enabled:        false,
 		MinPWMPercent:  60,
 		EmergencyTempC: 85,
@@ -88,6 +94,17 @@ func DefaultFanConfig() FanConfig {
 			{TempC: 80, PWMPercent: 100},
 		},
 	}
+	config.DiskCurve = defaultDiskFanCurve(config.MinPWMPercent)
+	return config
+}
+
+func defaultDiskFanCurve(minimum int) []FanPoint {
+	minimum = max(30, min(minimum, 100))
+	return []FanPoint{
+		{TempC: 25, PWMPercent: minimum},
+		{TempC: 35, PWMPercent: max(minimum, 85)},
+		{TempC: 50, PWMPercent: 100},
+	}
 }
 
 func normalizeConfig(cfg *Config) bool {
@@ -98,6 +115,10 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.Fan = DefaultFanConfig()
 		cfg.Fan.Enabled = enabled
 		cfg.Fan.DeviceID = deviceID
+		changed = true
+	}
+	if cfg.Fan.DiskCurve == nil {
+		cfg.Fan.DiskCurve = defaultDiskFanCurve(cfg.Fan.MinPWMPercent)
 		changed = true
 	}
 	if cfg.GPIO.Version == 0 {
@@ -117,29 +138,11 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if cfg.PollSeconds < 1 || cfg.PollSeconds > 10 {
 		return errors.New("fan poll_seconds must be between 1 and 10")
 	}
-	if len(cfg.Curve) < 2 || len(cfg.Curve) > 8 {
-		return errors.New("fan curve must contain between 2 and 8 points")
+	if err := validateFanCurve("CPU", cfg.Curve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+		return err
 	}
-	previousTemp := -1.0
-	previousPWM := -1
-	for i, point := range cfg.Curve {
-		if point.TempC < 20 || point.TempC > 100 {
-			return fmt.Errorf("fan curve point %d temperature must be between 20 and 100", i+1)
-		}
-		if point.TempC <= previousTemp {
-			return errors.New("fan curve temperatures must be strictly increasing")
-		}
-		if point.PWMPercent < cfg.MinPWMPercent || point.PWMPercent > 100 {
-			return fmt.Errorf("fan curve point %d PWM must be between minimum PWM and 100", i+1)
-		}
-		if point.PWMPercent < previousPWM {
-			return errors.New("fan curve PWM values must not decrease as temperature rises")
-		}
-		previousTemp = point.TempC
-		previousPWM = point.PWMPercent
-	}
-	if cfg.EmergencyTempC < cfg.Curve[len(cfg.Curve)-1].TempC {
-		return errors.New("fan emergency temperature must not be below the last curve point")
+	if err := validateFanCurve("disk", cfg.DiskCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+		return err
 	}
 	if !cfg.Enabled {
 		return nil
@@ -160,6 +163,34 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 		}
 	}
 	return fmt.Errorf("configured fan %s was not found", cfg.DeviceID)
+}
+
+func validateFanCurve(name string, curve []FanPoint, minimum int, emergencyTempC float64) error {
+	if len(curve) < 2 || len(curve) > 8 {
+		return fmt.Errorf("fan %s curve must contain between 2 and 8 points", name)
+	}
+	previousTemp := -1.0
+	previousPWM := -1
+	for i, point := range curve {
+		if point.TempC < 20 || point.TempC > 100 {
+			return fmt.Errorf("fan %s curve point %d temperature must be between 20 and 100", name, i+1)
+		}
+		if point.TempC <= previousTemp {
+			return fmt.Errorf("fan %s curve temperatures must be strictly increasing", name)
+		}
+		if point.PWMPercent < minimum || point.PWMPercent > 100 {
+			return fmt.Errorf("fan %s curve point %d PWM must be between minimum PWM and 100", name, i+1)
+		}
+		if point.PWMPercent < previousPWM {
+			return fmt.Errorf("fan %s curve PWM values must not decrease as temperature rises", name)
+		}
+		previousTemp = point.TempC
+		previousPWM = point.PWMPercent
+	}
+	if emergencyTempC < curve[len(curve)-1].TempC {
+		return fmt.Errorf("fan emergency temperature must not be below the last %s curve point", name)
+	}
+	return nil
 }
 
 func (m *Manager) DiscoverFans() ([]FanDevice, error) {
@@ -275,7 +306,8 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		failSafeErr := setFanPWM(*selected, 100)
 		return errors.Join(fmt.Errorf("temperature sensor failed; fan forced to full speed: %w", tempErr), failSafeErr)
 	}
-	target := interpolatePWMPercent(cfg.Curve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	diskTemperature, diskAvailable := maximumStorageTemperature(m.StorageStatus())
+	_, _, target := fanTargets(cfg, temperature, diskTemperature, diskAvailable)
 	if err := setFanPWM(*selected, target); err != nil {
 		failSafeErr := setFanPWM(*selected, 100)
 		return errors.Join(fmt.Errorf("set fan %s to %d%%: %w", selected.ID, target, err), failSafeErr)
@@ -363,6 +395,30 @@ func interpolatePWMPercent(points []FanPoint, tempC float64, minimum int, emerge
 		value = 100
 	}
 	return value
+}
+
+func fanTargets(cfg FanConfig, cpuTemperature, diskTemperature float64, diskAvailable bool) (int, int, int) {
+	cpuTarget := interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	diskTarget := 0
+	if diskAvailable {
+		diskTarget = interpolatePWMPercent(cfg.DiskCurve, diskTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	}
+	return cpuTarget, diskTarget, max(cpuTarget, diskTarget)
+}
+
+func maximumStorageTemperature(status StorageStatus) (float64, bool) {
+	maximum := 0.0
+	available := false
+	for _, slot := range status.Slots {
+		if slot.TemperatureC <= 0 {
+			continue
+		}
+		if !available || slot.TemperatureC > maximum {
+			maximum = slot.TemperatureC
+			available = true
+		}
+	}
+	return maximum, available
 }
 
 func (m *Manager) controlTemperature() (float64, error) {
@@ -521,8 +577,29 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 	}
 	if temperature, err := m.controlTemperature(); err == nil {
 		result.TemperatureC = temperature
+		result.CPUTemperatureC = temperature
+		if len(cfg.Curve) >= 2 {
+			result.CPUTargetPWMPercent = interpolatePWMPercent(cfg.Curve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+		}
 	} else if cfg.Enabled {
 		result.LastError = combineError(result.LastError, err)
+	}
+	if temperature, available := maximumStorageTemperature(m.StorageStatus()); available {
+		result.DiskTemperatureC = temperature
+		if len(cfg.DiskCurve) >= 2 {
+			result.DiskTargetPWMPercent = interpolatePWMPercent(cfg.DiskCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+		}
+	}
+	if result.CPUTargetPWMPercent > 0 {
+		result.TargetPWMPercent = max(result.CPUTargetPWMPercent, result.DiskTargetPWMPercent)
+		switch {
+		case result.DiskTargetPWMPercent > result.CPUTargetPWMPercent:
+			result.ControlSource = "disk"
+		case result.DiskTargetPWMPercent == result.CPUTargetPWMPercent && result.DiskTargetPWMPercent > 0:
+			result.ControlSource = "cpu+disk"
+		default:
+			result.ControlSource = "cpu"
+		}
 	}
 	return result
 }
