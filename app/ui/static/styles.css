@@ -65,13 +65,19 @@ small { display: block; margin-top: 7px; line-height: 1.4; }
 .driver-link a { color: var(--mint); font-weight: 700; text-underline-offset: 3px; }
 .driver-link a:hover { color: #8cf3c9; }
 .fan-settings { display: grid; grid-template-columns: 1.4fr repeat(3, 1fr); gap: 14px; }
-.curve-layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(210px, 1fr); gap: 18px; margin-top: 18px; }
-#fan-curve-chart { width: 100%; min-height: 260px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 12, .66); }
-.curve-points { padding: 12px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 12, .4); }
-.curve-row { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-bottom: 9px; }
-.curve-row:last-child { margin-bottom: 0; }
-.curve-row input { padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(8, 27, 20, .9); }
-.curve-labels { color: var(--muted); font-size: 12px; text-align: center; }
+.curve-editor { margin-top: 18px; }
+#fan-curve-chart { width: 100%; min-height: 260px; border: 1px solid var(--line); border-radius: 14px; background: rgba(4, 16, 12, .66); cursor: grab; touch-action: none; user-select: none; }
+#fan-curve-chart.dragging { cursor: grabbing; }
+#fan-curve-chart:focus-visible { outline: 2px solid var(--mint); outline-offset: 3px; }
+.curve-node { cursor: grab; transition: r .12s, fill .12s; }
+.curve-node.selected { fill: var(--mint); }
+.curve-node-label { pointer-events: none; paint-order: stroke; stroke: #07110f; stroke-width: 4px; stroke-linejoin: round; }
+.curve-toolbar { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-top: 12px; }
+.curve-actions { display: flex; flex-wrap: wrap; gap: 9px; }
+.curve-actions button:disabled { cursor: not-allowed; }
+.curve-toolbar strong { color: var(--mint); font-size: 14px; }
+#curve-remove { color: var(--danger); background: rgba(255, 141, 120, .06); }
+#curve-help { margin: 9px 0 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
 .storage-panel .panel-heading { padding-bottom: 16px; }
 .table-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .table-scroll { width: 100%; margin-top: 16px; overflow-x: auto; }
@@ -116,7 +122,8 @@ dd { margin: 0; text-align: right; }
   .actions, .message { grid-column: 1; }
   button.danger { margin-left: 0; }
   .panel-heading { flex-direction: column; }
-  .fan-settings, .curve-layout { grid-template-columns: 1fr; }
+  .fan-settings { grid-template-columns: 1fr; }
+  .curve-toolbar { align-items: flex-start; flex-direction: column; }
   .table-meta { white-space: normal; }
   .details dl { grid-template-columns: 1fr; }
   .temperature-row dd { max-width: 65%; }

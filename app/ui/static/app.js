@@ -12,7 +12,14 @@ const GPIO_ACTIONS = [
   ['smart_check', '刷新仓位并检查 SMART'],
   ['reapply_plugin', '重新应用插件配置'],
 ];
+const CURVE_MIN_POINTS = 2;
+const CURVE_MAX_POINTS = 8;
+const CHART = { left: 52, right: 616, top: 20, bottom: 222 };
 let currentStatus = null;
+let editableCurve = DEFAULT_CURVE.map((point) => ({ ...point }));
+let selectedCurveIndex = 0;
+let draggedCurveIndex = -1;
+let uiBusy = false;
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -133,12 +140,114 @@ function gpioConfigFromInputs() {
 }
 
 function curveFromInputs() {
-  const temperatures = [...document.querySelectorAll('.curve-temp')];
-  const speeds = [...document.querySelectorAll('.curve-pwm')];
-  return temperatures.map((input, index) => ({
-    temp_c: Number(input.value),
-    pwm_percent: Number(speeds[index].value),
-  }));
+  return editableCurve.map((point) => ({ ...point }));
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
+}
+
+function fanMinimumPWM() {
+  const value = Number($('fan-min').value);
+  return Number.isFinite(value) ? clamp(Math.round(value), 30, 100) : 30;
+}
+
+function fanEmergencyTemperature() {
+  const value = Number($('fan-emergency').value);
+  return Number.isFinite(value) && value > 0 ? clamp(Math.round(value), 70, 100) : 100;
+}
+
+function curvePointLimits(index) {
+  const previous = editableCurve[index - 1];
+  const next = editableCurve[index + 1];
+  return {
+    minTemp: previous ? Math.floor(previous.temp_c) + 1 : 20,
+    maxTemp: next ? Math.ceil(next.temp_c) - 1 : fanEmergencyTemperature(),
+    minPWM: Math.max(fanMinimumPWM(), previous ? Math.round(previous.pwm_percent) : 0),
+    maxPWM: next ? Math.round(next.pwm_percent) : 100,
+  };
+}
+
+function setCurvePoint(index, temperature, pwm) {
+  if (!editableCurve[index]) return;
+  const limits = curvePointLimits(index);
+  const minTemp = Math.min(limits.minTemp, limits.maxTemp);
+  const maxTemp = Math.max(limits.minTemp, limits.maxTemp);
+  const minPWM = Math.min(limits.minPWM, limits.maxPWM);
+  const maxPWM = Math.max(limits.minPWM, limits.maxPWM);
+  editableCurve[index] = {
+    temp_c: clamp(Math.round(temperature), minTemp, maxTemp),
+    pwm_percent: clamp(Math.round(pwm), minPWM, maxPWM),
+  };
+}
+
+function normalizeCurveToControls() {
+  let priorPWM = fanMinimumPWM();
+  editableCurve = editableCurve.map((point) => {
+    const pwm = clamp(Math.max(Math.round(point.pwm_percent), priorPWM), priorPWM, 100);
+    priorPWM = pwm;
+    return { temp_c: Math.round(point.temp_c), pwm_percent: pwm };
+  });
+  const maximum = fanEmergencyTemperature();
+  for (let index = editableCurve.length - 1; index >= 0; index -= 1) {
+    const cap = maximum - (editableCurve.length - 1 - index);
+    editableCurve[index].temp_c = Math.min(editableCurve[index].temp_c, cap);
+  }
+  for (let index = 0; index < editableCurve.length; index += 1) {
+    const floor = index === 0 ? 20 : editableCurve[index - 1].temp_c + 1;
+    editableCurve[index].temp_c = Math.max(editableCurve[index].temp_c, floor);
+  }
+  renderFanChart();
+}
+
+function findCurveAddCandidate() {
+  if (editableCurve.length >= CURVE_MAX_POINTS) return null;
+  const maximum = fanEmergencyTemperature();
+  let best = null;
+  for (let index = 0; index <= editableCurve.length; index += 1) {
+    const lower = index === 0 ? 20 : Math.floor(editableCurve[index - 1].temp_c) + 1;
+    const upper = index === editableCurve.length ? maximum : Math.ceil(editableCurve[index].temp_c) - 1;
+    if (lower > upper) continue;
+    const width = upper - lower;
+    if (best && width <= best.width) continue;
+    const previous = editableCurve[index - 1];
+    const next = editableCurve[index];
+    let pwm = fanMinimumPWM();
+    if (previous && next) pwm = Math.round((previous.pwm_percent + next.pwm_percent) / 2);
+    else if (previous) pwm = previous.pwm_percent;
+    else if (next) pwm = next.pwm_percent;
+    best = {
+      index,
+      width,
+      point: { temp_c: Math.round((lower + upper) / 2), pwm_percent: Math.round(pwm) },
+    };
+  }
+  return best;
+}
+
+function updateCurveControls() {
+  selectedCurveIndex = clamp(selectedCurveIndex, 0, Math.max(0, editableCurve.length - 1));
+  const selected = editableCurve[selectedCurveIndex];
+  $('curve-selected').textContent = selected
+    ? `节点 ${selectedCurveIndex + 1}/${editableCurve.length} · ${selected.temp_c} °C · ${selected.pwm_percent}%`
+    : '—';
+  $('curve-add').disabled = uiBusy || !findCurveAddCandidate();
+  $('curve-remove').disabled = uiBusy || editableCurve.length <= CURVE_MIN_POINTS;
+}
+
+function addCurvePoint() {
+  const candidate = findCurveAddCandidate();
+  if (!candidate) return;
+  editableCurve.splice(candidate.index, 0, candidate.point);
+  selectedCurveIndex = candidate.index;
+  renderFanChart();
+}
+
+function removeSelectedCurvePoint() {
+  if (editableCurve.length <= CURVE_MIN_POINTS) return;
+  editableCurve.splice(selectedCurveIndex, 1);
+  selectedCurveIndex = clamp(selectedCurveIndex, 0, editableCurve.length - 1);
+  renderFanChart();
 }
 
 function svgElement(name, attributes = {}, text = '') {
@@ -152,12 +261,9 @@ function renderFanChart() {
   const svg = $('fan-curve-chart');
   const curve = curveFromInputs();
   if (curve.some((point) => !Number.isFinite(point.temp_c) || !Number.isFinite(point.pwm_percent))) return;
-  const left = 52;
-  const right = 616;
-  const top = 20;
-  const bottom = 222;
-  const x = (temp) => left + ((Math.max(20, Math.min(100, temp)) - 20) / 80) * (right - left);
-  const y = (speed) => bottom - ((Math.max(30, Math.min(100, speed)) - 30) / 70) * (bottom - top);
+  const { left, right, top, bottom } = CHART;
+  const x = (temp) => left + ((clamp(temp, 20, 100) - 20) / 80) * (right - left);
+  const y = (speed) => bottom - ((clamp(speed, 30, 100) - 30) / 70) * (bottom - top);
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
@@ -172,14 +278,49 @@ function renderFanChart() {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
     fill: 'none', stroke: '#58e6ad', 'stroke-width': 4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
   }));
-  curve.forEach((point) => {
-    svg.append(svgElement('circle', { cx: x(point.temp_c), cy: y(point.pwm_percent), r: 6, fill: '#07110f', stroke: '#8cf3c9', 'stroke-width': 3 }));
-  });
   const actualTemp = Number(currentStatus?.fan_control?.temperature_c);
   if (Number.isFinite(actualTemp) && actualTemp > 0) {
     svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#ffb76b', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
     svg.append(svgElement('text', { x: x(actualTemp), y: 14, fill: '#ffca8f', 'font-size': 12, 'text-anchor': 'middle' }, `当前 ${actualTemp.toFixed(1)}°C`));
   }
+  curve.forEach((point, index) => {
+    const selected = index === selectedCurveIndex;
+    const node = svgElement('circle', {
+      cx: x(point.temp_c), cy: y(point.pwm_percent), r: selected ? 9 : 7,
+      fill: selected ? '#58e6ad' : '#07110f', stroke: '#8cf3c9', 'stroke-width': 3,
+      class: `curve-node${selected ? ' selected' : ''}`, 'data-index': index,
+      tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
+    });
+    svg.append(node);
+    const labelY = y(point.pwm_percent) < 44 ? y(point.pwm_percent) + 25 : y(point.pwm_percent) - 14;
+    svg.append(svgElement('text', {
+      x: x(point.temp_c), y: labelY, fill: selected ? '#8cf3c9' : '#b8d1c6',
+      'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
+    }, `${point.temp_c}° · ${point.pwm_percent}%`));
+  });
+  updateCurveControls();
+}
+
+function curvePositionFromPointer(event) {
+  const svg = $('fan-curve-chart');
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const local = point.matrixTransform(matrix.inverse());
+  return {
+    temperature: 20 + ((local.x - CHART.left) / (CHART.right - CHART.left)) * 80,
+    pwm: 30 + ((CHART.bottom - local.y) / (CHART.bottom - CHART.top)) * 70,
+  };
+}
+
+function updateCurveFromPointer(event) {
+  if (draggedCurveIndex < 0) return;
+  const position = curvePositionFromPointer(event);
+  if (!position) return;
+  setCurvePoint(draggedCurveIndex, position.temperature, position.pwm);
+  renderFanChart();
 }
 
 function populateFanDevices(status, keepInputs) {
@@ -213,9 +354,11 @@ function fillFanInputs(fan = {}) {
   $('fan-min').value = fan.min_pwm_percent ?? 60;
   $('fan-emergency').value = fan.emergency_temp_c ?? 85;
   $('fan-poll').value = fan.poll_seconds ?? 2;
-  const curve = Array.isArray(fan.curve) && fan.curve.length === 4 ? fan.curve : DEFAULT_CURVE;
-  document.querySelectorAll('.curve-temp').forEach((input, index) => { input.value = curve[index].temp_c; });
-  document.querySelectorAll('.curve-pwm').forEach((input, index) => { input.value = curve[index].pwm_percent; });
+  const curve = Array.isArray(fan.curve) && fan.curve.length >= CURVE_MIN_POINTS && fan.curve.length <= CURVE_MAX_POINTS
+    && fan.curve.every((point) => Number.isFinite(Number(point.temp_c)) && Number.isFinite(Number(point.pwm_percent)))
+    ? fan.curve : DEFAULT_CURVE;
+  editableCurve = curve.map((point) => ({ temp_c: Number(point.temp_c), pwm_percent: Number(point.pwm_percent) }));
+  selectedCurveIndex = clamp(selectedCurveIndex, 0, editableCurve.length - 1);
 }
 
 function render(status, keepInputs = false) {
@@ -290,7 +433,9 @@ function showMessage(message, error = false) {
 }
 
 function setBusy(busy) {
+  uiBusy = busy;
   document.querySelectorAll('button').forEach((button) => { button.disabled = busy; });
+  updateCurveControls();
 }
 
 async function refresh(keepInputs = false) {
@@ -329,6 +474,10 @@ $('config-form').addEventListener('submit', async (event) => {
     showMessage('启用风扇曲线前必须检测到有转速反馈的风扇。', true);
     return;
   }
+  if (curve.length < CURVE_MIN_POINTS || curve.length > CURVE_MAX_POINTS) {
+    showMessage(`风扇曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true);
+    return;
+  }
   if (curve.some((point, index) => point.pwm_percent < config.fan.min_pwm_percent
       || (index > 0 && (point.temp_c <= curve[index - 1].temp_c || point.pwm_percent < curve[index - 1].pwm_percent)))) {
     showMessage('曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。', true);
@@ -341,7 +490,7 @@ $('config-form').addEventListener('submit', async (event) => {
   setBusy(true);
   try {
     render(await request('api/config', { method: 'POST', body: JSON.stringify(config) }));
-    showMessage('功耗、风扇与按键映射配置已保存并应用。');
+    showMessage('功耗、拖拽风扇曲线与按键映射配置已保存并应用。');
   } catch (error) {
     showMessage(`应用失败：${error.message}`, true);
   } finally {
@@ -374,8 +523,66 @@ $('restore').addEventListener('click', async () => {
   }
 });
 
-document.querySelectorAll('.curve-temp, .curve-pwm').forEach((input) => input.addEventListener('input', renderFanChart));
+const curveChart = $('fan-curve-chart');
+curveChart.addEventListener('pointerdown', (event) => {
+  const node = event.target.closest?.('.curve-node');
+  if (!node) return;
+  selectedCurveIndex = Number(node.dataset.index);
+  draggedCurveIndex = selectedCurveIndex;
+  curveChart.classList.add('dragging');
+  curveChart.setPointerCapture(event.pointerId);
+  event.preventDefault();
+  updateCurveFromPointer(event);
+});
+curveChart.addEventListener('pointermove', (event) => {
+  if (draggedCurveIndex < 0) return;
+  event.preventDefault();
+  updateCurveFromPointer(event);
+});
+function finishCurveDrag(event, update = true) {
+  if (draggedCurveIndex < 0) return;
+  if (update) updateCurveFromPointer(event);
+  draggedCurveIndex = -1;
+  curveChart.classList.remove('dragging');
+  if (curveChart.hasPointerCapture(event.pointerId)) curveChart.releasePointerCapture(event.pointerId);
+}
+curveChart.addEventListener('pointerup', finishCurveDrag);
+curveChart.addEventListener('pointercancel', (event) => finishCurveDrag(event, false));
+curveChart.addEventListener('lostpointercapture', () => {
+  draggedCurveIndex = -1;
+  curveChart.classList.remove('dragging');
+});
+curveChart.addEventListener('keydown', (event) => {
+  const node = event.target.closest?.('.curve-node');
+  if (node) selectedCurveIndex = Number(node.dataset.index);
+  const point = editableCurve[selectedCurveIndex];
+  if (!point) return;
+  let temperature = point.temp_c;
+  let pwm = point.pwm_percent;
+  if (event.key === 'ArrowLeft') temperature -= 1;
+  else if (event.key === 'ArrowRight') temperature += 1;
+  else if (event.key === 'ArrowDown') pwm -= 1;
+  else if (event.key === 'ArrowUp') pwm += 1;
+  else if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    removeSelectedCurvePoint();
+    return;
+  } else return;
+  event.preventDefault();
+  setCurvePoint(selectedCurveIndex, temperature, pwm);
+  renderFanChart();
+  requestAnimationFrame(() => curveChart.querySelector(`.curve-node[data-index="${selectedCurveIndex}"]`)?.focus());
+});
+$('curve-add').addEventListener('click', addCurvePoint);
+$('curve-remove').addEventListener('click', removeSelectedCurvePoint);
+$('fan-min').addEventListener('input', () => {
+  if ($('fan-min').value !== '') normalizeCurveToControls();
+});
+$('fan-emergency').addEventListener('input', () => {
+  if ($('fan-emergency').value !== '') normalizeCurveToControls();
+});
 setupGPIOActions();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
+renderFanChart();
 refresh();
 setInterval(() => refresh(true), 5000);

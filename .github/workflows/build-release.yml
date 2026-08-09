@@ -38,6 +38,7 @@ jobs:
         run: |
           go test ./...
           go vet ./...
+          node --check app/ui/static/app.js
           bash -n cmd/* scripts/build.sh
 
       - name: Download official fnpack

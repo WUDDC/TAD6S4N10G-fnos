@@ -1,5 +1,5 @@
 appname=powerguard
-version=0.4.0
+version=0.4.1
 display_name=N100/N305 温度、硬盘与功耗卫士
 desc=按 RR 口径显示 CPU 温度，并提供功耗、单风扇、TAD6S4N10G 硬盘仓位与 GPIO 按键映射。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=powerguard.Application
 checkport=false
 disable_authorization_path=false
-changelog=新增 6 个前置 SATA 与 4 个 M.2 物理仓位表，显示空置、插入、使用和 SMART/阵列告警；新增复制、网络及后置重置按键的短按与 3/9/15 秒安全动作映射。
+changelog=风扇温控曲线改为鼠标或触屏直接拖拽，支持增加、删除及方向键微调 2–8 个节点，不再逐项手动输入节点温度和转速。
