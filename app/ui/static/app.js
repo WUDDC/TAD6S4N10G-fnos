@@ -77,8 +77,10 @@ function renderStorageTable(storage = {}) {
       slot.warning || slot.health || '—',
       formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0),
     ];
+    const labels = ['仓位', '状态', '设备', '用途', '健康', '温度'];
     values.forEach((value, index) => {
       const cell = document.createElement(index === 0 ? 'th' : 'td');
+      cell.dataset.label = labels[index];
       cell.textContent = value;
       row.append(cell);
     });
@@ -88,6 +90,7 @@ function renderStorageTable(storage = {}) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
     cell.colSpan = 6;
+    cell.dataset.label = '状态';
     cell.textContent = '尚未获得仓位信息';
     row.append(cell);
     body.append(row);
@@ -106,6 +109,36 @@ function setupGPIOActions() {
       option.value = value;
       option.textContent = label;
       select.append(option);
+    });
+  });
+}
+
+function activateTab(tabID, focus = false) {
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  tabs.forEach((tab) => {
+    const active = tab.id === tabID;
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+    const panel = $(tab.getAttribute('aria-controls'));
+    if (panel) panel.hidden = !active;
+    if (active && focus) tab.focus();
+  });
+  if (tabID === 'tab-fan') requestAnimationFrame(renderFanChart);
+}
+
+function setupTabs() {
+  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  tabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => activateTab(tab.id));
+    tab.addEventListener('keydown', (event) => {
+      let target = index;
+      if (event.key === 'ArrowLeft') target = (index - 1 + tabs.length) % tabs.length;
+      else if (event.key === 'ArrowRight') target = (index + 1) % tabs.length;
+      else if (event.key === 'Home') target = 0;
+      else if (event.key === 'End') target = tabs.length - 1;
+      else return;
+      event.preventDefault();
+      activateTab(tabs[target].id, true);
     });
   });
 }
@@ -581,6 +614,12 @@ $('fan-min').addEventListener('input', () => {
 $('fan-emergency').addEventListener('input', () => {
   if ($('fan-emergency').value !== '') normalizeCurveToControls();
 });
+$('config-form').addEventListener('invalid', (event) => {
+  const panel = event.target.closest?.('.tab-panel');
+  const tabID = panel?.getAttribute('aria-labelledby');
+  if (tabID) activateTab(tabID);
+}, true);
+setupTabs();
 setupGPIOActions();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 renderFanChart();

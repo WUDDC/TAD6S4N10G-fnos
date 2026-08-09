@@ -2,6 +2,8 @@
 
 这是一个面向飞牛 fnOS 的第三方应用。它按 RR CPUinfo 的口径显示 Intel Processor N100 与 Intel Core i3-N305 的 CPU 核心最高温度，同时保留 Package 原始温度供核对；还可限制 Package 功耗、控制单风扇、显示 TAD6S4N10G 的硬盘物理仓位，并配置机箱 GPIO 按键映射。
 
+配置界面分为温度、风扇控制、按键控制和硬盘槽位四个 Tab；每次只显示当前功能，窄屏下硬盘及按键信息改用卡片布局，不需要横向拖动表格。
+
 ## 下载与安装
 
 从 [GitHub Releases](https://github.com/luodaoyi/TAD6S4N10G-fnos/releases) 下载最新的 `powerguard.fpk` 和 `powerguard.fpk.sha256`，校验 SHA256 后，在飞牛应用中心选择手动安装。
