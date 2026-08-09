@@ -581,6 +581,7 @@ function render(status, keepInputs = false) {
   const storageStatus = status.storage || {};
   const gpioStatus = status.gpio || {};
   const selectedFan = fanStatus.fans?.find((fan) => fan.selected) || fanStatus.fans?.find((fan) => Number(fan.rpm) > 0);
+  $('app-version').textContent = status.version ? `v${status.version}` : 'v—';
   $('cpu-model').textContent = status.cpu_model || '未识别';
   $('cpu-display-label').textContent = cpuTemperature.display_source === 'package_fallback'
     ? 'CPU 温度（Package 回退）'

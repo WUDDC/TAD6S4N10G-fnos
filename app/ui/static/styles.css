@@ -61,6 +61,11 @@ body {
 h1, h2, h3, p { margin-top: 0; }
 h1 { margin: 0; color: #181b20; font-size: 20px; letter-spacing: -.02em; }
 h2 { margin-bottom: 6px; color: #242832; font-size: 18px; }
+.app-version {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
 .project-link {
   color: var(--primary);
   font-size: 12px;
