@@ -53,6 +53,8 @@ const curveEditors = {
 };
 let currentStatus = null;
 let uiBusy = false;
+let startupCheckComplete = false;
+let startupDialogPreviousFocus = null;
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -254,9 +256,32 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   const issues = [];
   if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
   if (fanStatus.driver_detected === false) issues.push('未检测到或未加载 IT87 风扇驱动');
+  const fans = Array.isArray(fanStatus.fans) ? fanStatus.fans : [];
+  if (fanStatus.driver_detected === true && !fans.length) {
+    issues.push('IT87 驱动已检测，但未发现可读取 PWM/RPM 的风扇通道');
+  } else if (fanStatus.driver_detected === true && fans.length && !fans.some((fan) => Number(fan.rpm) > 0)) {
+    issues.push('已发现风扇通道，但当前转速反馈均为 0 RPM；请检查风扇接线或驱动状态');
+  }
+  if (status.cpu_temperature?.available === false) {
+    issues.push('未读取到 CPU coretemp 温度；请检查 coretemp 内核驱动是否已加载');
+  }
   if (status.last_error) issues.push(`模块：${status.last_error}`);
   if (fanStatus.last_error) issues.push(`风扇：${fanStatus.last_error}`);
-  (storageStatus.slots || []).filter((slot) => slot.state === 'warning').forEach((slot) => {
+  const storagePending = !storageStatus.updated_at
+    && String(storageStatus.last_error || '').includes('尚未完成首次刷新');
+  if (storageStatus.last_error && !storagePending) issues.push(`硬盘检测：${storageStatus.last_error}`);
+  const slots = Array.isArray(storageStatus.slots) ? storageStatus.slots : [];
+  const detectedSlots = slots.filter((slot) => slot.device
+    || ['present', 'used', 'warning'].includes(slot.state));
+  if (storageStatus.updated_at && !detectedSlots.length) {
+    issues.push('未检测到任何已插入硬盘；若机器实际装有硬盘，请检查 AHCI/NVMe 驱动和槽位映射');
+  }
+  const missingTemperatureSlots = detectedSlots.filter((slot) => !(Number(slot.temperature_c) > 0));
+  if (missingTemperatureSlots.length) {
+    const labels = missingTemperatureSlots.map((slot) => (slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`));
+    issues.push(`${labels.join('、')} 未读取到温度；请检查 SMART/NVMe 温度接口与相关驱动`);
+  }
+  slots.filter((slot) => slot.state === 'warning').forEach((slot) => {
     const label = slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`;
     issues.push(`${label}：${slot.warning || slot.health || '硬盘健康状态告警'}`);
   });
@@ -264,6 +289,67 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
     issues.push(`按钮控制：${gpioStatus.last_error || 'GPIO 硬件接口不可用'}`);
   }
   return [...new Set(issues)];
+}
+
+function renderFanHardwareWarning(fanStatus = {}) {
+  const warning = $('fan-driver-warning');
+  const fans = Array.isArray(fanStatus.fans) ? fanStatus.fans : [];
+  const missingDriver = fanStatus.driver_detected === false;
+  const noChannel = fanStatus.driver_detected === true && !fans.length;
+  const noRPM = fanStatus.driver_detected === true && fans.length
+    && !fans.some((fan) => Number(fan.rpm) > 0);
+  warning.hidden = !(missingDriver || noChannel || noRPM);
+  $('fan-warning-driver-link').hidden = !missingDriver;
+  if (missingDriver) {
+    $('fan-warning-title').textContent = '未检测到或未加载 IT87 风扇驱动';
+    $('fan-warning-description').textContent = '风扇转速和 PWM 控制暂不可用。';
+  } else if (noChannel) {
+    $('fan-warning-title').textContent = '未发现可控风扇通道';
+    $('fan-warning-description').textContent = 'IT87 驱动已检测，但没有同时暴露 fan、pwm 与 pwm_enable 的通道，请检查驱动适配。';
+  } else if (noRPM) {
+    $('fan-warning-title').textContent = '风扇转速反馈为 0 RPM';
+    $('fan-warning-description').textContent = '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
+  }
+}
+
+function startupHealthReady(storageStatus = {}) {
+  return Boolean(storageStatus.updated_at)
+    || !String(storageStatus.last_error || '').includes('尚未完成首次刷新');
+}
+
+function closeStartupWarning() {
+  $('startup-warning-modal').hidden = true;
+  startupDialogPreviousFocus?.focus?.();
+  startupDialogPreviousFocus = null;
+}
+
+function maybeShowStartupWarning(status) {
+  if (startupCheckComplete) return;
+  const fanStatus = status.fan_control || {};
+  const storageStatus = status.storage || {};
+  const gpioStatus = status.gpio || {};
+  if (!startupHealthReady(storageStatus)) return;
+  startupCheckComplete = true;
+  const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
+  if (!issues.length) return;
+  const storageKey = `tad-module:startup-health:${status.version || 'unknown'}`;
+  try {
+    if (window.sessionStorage.getItem(storageKey)) return;
+    window.sessionStorage.setItem(storageKey, 'shown');
+  } catch (_) {
+    // 禁用会话存储时仍显示一次；内存标记会阻止轮询重复弹出。
+  }
+  const list = $('startup-warning-list');
+  list.replaceChildren();
+  issues.forEach((issue) => {
+    const item = document.createElement('li');
+    item.textContent = issue;
+    list.append(item);
+  });
+  $('startup-warning-driver-link').hidden = fanStatus.driver_detected !== false;
+  startupDialogPreviousFocus = document.activeElement;
+  $('startup-warning-modal').hidden = false;
+  requestAnimationFrame(() => $('startup-warning-close').focus());
 }
 
 function setupFanSlotSelectors() {
@@ -674,7 +760,7 @@ function render(status, keepInputs = false) {
   renderStorageTemperatureCards(storageStatus);
   renderStorageTable(storageStatus);
   renderFanSlotTemperatures(storageStatus);
-  $('fan-driver-warning').hidden = fanStatus.driver_detected !== false;
+  renderFanHardwareWarning(fanStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
     : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
@@ -723,7 +809,9 @@ function setBusy(busy) {
 
 async function refresh(keepInputs = false) {
   try {
-    render(await request('api/status'), keepInputs);
+    const status = await request('api/status');
+    render(status, keepInputs);
+    maybeShowStartupWarning(status);
   } catch (error) {
     showMessage(`读取状态失败：${error.message}`, true);
     $('health').textContent = '连接失败';
@@ -928,6 +1016,13 @@ setupTabs();
 setupFanSlotSelectors();
 setupGPIOActions();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
+$('startup-warning-close').addEventListener('click', closeStartupWarning);
+$('startup-warning-modal').addEventListener('click', (event) => {
+  if (event.target === $('startup-warning-modal')) closeStartupWarning();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('startup-warning-modal').hidden) closeStartupWarning();
+});
 CURVE_KINDS.forEach(renderFanChart);
 refresh();
 setInterval(() => refresh(true), 5000);
