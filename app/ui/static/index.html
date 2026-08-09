@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>N100/N305 功耗与风扇卫士</title>
+  <title>N100/N305 温度与功耗卫士</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,8 +12,8 @@
       <div class="brand-mark" aria-hidden="true">⚡</div>
       <div>
         <p class="eyebrow">fnOS Power Guard</p>
-        <h1>N100/N305 功耗与风扇卫士</h1>
-        <p class="subtitle">限制 CPU 与核显共享的 Package 功耗，并按真实 CPU 温度控制单风扇转速。</p>
+        <h1>N100/N305 温度与功耗卫士</h1>
+        <p class="subtitle">按 RR 口径显示 CPU 核心最高温度，并与 fnOS 使用的 Package 原始温度分开。</p>
         <p class="project-link"><a href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 项目主页 · 检查新版本</a></p>
       </div>
       <span id="health" class="badge pending">读取中</span>
@@ -21,7 +21,8 @@
 
     <section class="metrics" aria-label="运行状态">
       <article><span>处理器</span><strong id="cpu-model">—</strong></article>
-      <article><span>Package 温度</span><strong id="temperature">—</strong></article>
+      <article><span id="cpu-display-label">CPU 核心最高（RR 口径）</span><strong id="cpu-display-temperature">—</strong></article>
+      <article><span>Package 原始温度</span><strong id="package-temperature">—</strong></article>
       <article><span>当前 PL1</span><strong id="current-pl1">—</strong></article>
       <article><span>当前 PL2</span><strong id="current-pl2">—</strong></article>
       <article><span>机箱风扇</span><strong id="fan-rpm">—</strong></article>
@@ -111,11 +112,14 @@
       <h2>诊断信息</h2>
       <dl>
         <div><dt>识别配置</dt><dd id="profile">—</dd></div>
+        <div><dt>温度显示来源</dt><dd id="temperature-source">—</dd></div>
         <div><dt>GPU 运行状态</dt><dd id="gpu-runtime">—</dd></div>
         <div><dt>风扇控制</dt><dd id="fan-control">—</dd></div>
         <div><dt>最近应用</dt><dd id="last-apply">—</dd></div>
         <div><dt>状态</dt><dd id="last-error">—</dd></div>
+        <div class="temperature-row"><dt>原始 coretemp</dt><dd id="temperature-sensors">—</dd></div>
       </dl>
+      <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
       <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
     </section>
   </main>

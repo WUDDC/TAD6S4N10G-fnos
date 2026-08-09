@@ -74,6 +74,16 @@ type Temperature struct {
 	Celsius float64 `json:"celsius"`
 }
 
+type CPUTemperatureStatus struct {
+	Available      bool    `json:"available"`
+	DisplayC       float64 `json:"display_c,omitempty"`
+	DisplaySource  string  `json:"display_source,omitempty"`
+	CoreMaxC       float64 `json:"core_max_c,omitempty"`
+	PackageMaxC    float64 `json:"package_max_c,omitempty"`
+	CoreSensors    int     `json:"core_sensors"`
+	PackageSensors int     `json:"package_sensors"`
+}
+
 type PackageStatus struct {
 	Name    string `json:"name"`
 	PL1W    int64  `json:"pl1_w,omitempty"`
@@ -85,19 +95,20 @@ type PackageStatus struct {
 }
 
 type Status struct {
-	Version          string           `json:"version"`
-	CPUModel         string           `json:"cpu_model"`
-	Profile          Profile          `json:"profile"`
-	Supported        bool             `json:"supported"`
-	Config           Config           `json:"config"`
-	EffectiveMaxPL1W int64            `json:"effective_max_pl1_w"`
-	EffectiveMaxPL2W int64            `json:"effective_max_pl2_w"`
-	Packages         []PackageStatus  `json:"packages"`
-	Temperatures     []Temperature    `json:"temperatures"`
-	GPURuntime       []string         `json:"gpu_runtime"`
-	FanControl       FanControlStatus `json:"fan_control"`
-	LastApply        time.Time        `json:"last_apply,omitempty"`
-	LastError        string           `json:"last_error,omitempty"`
+	Version          string               `json:"version"`
+	CPUModel         string               `json:"cpu_model"`
+	Profile          Profile              `json:"profile"`
+	Supported        bool                 `json:"supported"`
+	Config           Config               `json:"config"`
+	EffectiveMaxPL1W int64                `json:"effective_max_pl1_w"`
+	EffectiveMaxPL2W int64                `json:"effective_max_pl2_w"`
+	Packages         []PackageStatus      `json:"packages"`
+	Temperatures     []Temperature        `json:"temperatures"`
+	CPUTemperature   CPUTemperatureStatus `json:"cpu_temperature"`
+	GPURuntime       []string             `json:"gpu_runtime"`
+	FanControl       FanControlStatus     `json:"fan_control"`
+	LastApply        time.Time            `json:"last_apply,omitempty"`
+	LastError        string               `json:"last_error,omitempty"`
 }
 
 type Manager struct {
@@ -565,6 +576,7 @@ func (m *Manager) Status() Status {
 		}
 	}
 	status.Temperatures = m.temperatures()
+	status.CPUTemperature = summarizeCPUTemperatures(status.Temperatures)
 	status.GPURuntime = m.gpuRuntime()
 	status.FanControl = m.fanStatusLocked(status.Config.Fan)
 	return status
@@ -608,6 +620,34 @@ func (m *Manager) temperatures() []Temperature {
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
+	return result
+}
+
+func summarizeCPUTemperatures(temperatures []Temperature) CPUTemperatureStatus {
+	var result CPUTemperatureStatus
+	for _, temperature := range temperatures {
+		switch {
+		case strings.HasPrefix(temperature.Label, "Core "):
+			if result.CoreSensors == 0 || temperature.Celsius > result.CoreMaxC {
+				result.CoreMaxC = temperature.Celsius
+			}
+			result.CoreSensors++
+		case strings.HasPrefix(temperature.Label, "Package id "):
+			if result.PackageSensors == 0 || temperature.Celsius > result.PackageMaxC {
+				result.PackageMaxC = temperature.Celsius
+			}
+			result.PackageSensors++
+		}
+	}
+	if result.CoreSensors > 0 {
+		result.Available = true
+		result.DisplayC = result.CoreMaxC
+		result.DisplaySource = "core_max_rr"
+	} else if result.PackageSensors > 0 {
+		result.Available = true
+		result.DisplayC = result.PackageMaxC
+		result.DisplaySource = "package_fallback"
+	}
 	return result
 }
 

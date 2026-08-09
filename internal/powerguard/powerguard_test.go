@@ -73,3 +73,26 @@ func TestWriteJSONAtomic(t *testing.T) {
 		t.Fatal("JSON file is empty or lacks final newline")
 	}
 }
+
+func TestSummarizeCPUTemperaturesPrefersRRCoreMaximum(t *testing.T) {
+	status := summarizeCPUTemperatures([]Temperature{
+		{Label: "Package id 0", Celsius: 95},
+		{Label: "Core 0", Celsius: 72},
+		{Label: "Core 1", Celsius: 78},
+		{Label: "Package id 1", Celsius: 91},
+		{Label: "Core 2", Celsius: 75},
+	})
+	if !status.Available || status.DisplaySource != "core_max_rr" || status.DisplayC != 78 {
+		t.Fatalf("unexpected display temperature: %+v", status)
+	}
+	if status.CoreMaxC != 78 || status.PackageMaxC != 95 || status.CoreSensors != 3 || status.PackageSensors != 2 {
+		t.Fatalf("unexpected temperature summary: %+v", status)
+	}
+}
+
+func TestSummarizeCPUTemperaturesFallsBackToPackage(t *testing.T) {
+	status := summarizeCPUTemperatures([]Temperature{{Label: "Package id 0", Celsius: 64}})
+	if !status.Available || status.DisplaySource != "package_fallback" || status.DisplayC != 64 {
+		t.Fatalf("unexpected package fallback: %+v", status)
+	}
+}

@@ -1,7 +1,7 @@
 appname=powerguard
-version=0.2.4
-display_name=N100/N305 功耗与风扇卫士
-desc=限制 Intel N100 与 i3-N305 的 Package 功耗，并通过 IT87 控制单风扇温控曲线。
+version=0.3.0
+display_name=N100/N305 温度与功耗卫士
+desc=按 RR 口径区分 CPU 核心最高温度与 Package 原始温度，并提供功耗和单风扇控制。
 source=thirdparty
 platform=x86
 arch=x86_64
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=powerguard.Application
 checkport=false
 disable_authorization_path=false
-changelog=新增 GitHub 项目主页与版本检查入口；保留 IT87 单风扇温控曲线和满速模式回退修复。
+changelog=按 RR CPUinfo 口径显示 Core N 最高温度，单独显示 fnOS 读取的 Package 原始温度；风扇控制逻辑保持不变。

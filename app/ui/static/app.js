@@ -23,10 +23,9 @@ async function request(path, options = {}) {
   return body;
 }
 
-function maxTemperature(items) {
-  if (!Array.isArray(items) || !items.length) return null;
-  const values = items.map((item) => Number(item.celsius)).filter(Number.isFinite);
-  return values.length ? Math.max(...values) : null;
+function formatTemperature(value, available = true) {
+  const number = Number(value);
+  return available && Number.isFinite(number) ? `${number.toFixed(1)} °C` : '不可用';
 }
 
 function curveFromInputs() {
@@ -118,15 +117,25 @@ function fillFanInputs(fan = {}) {
 function render(status, keepInputs = false) {
   currentStatus = status;
   const pkg = status.packages?.[0] || {};
-  const temperature = maxTemperature(status.temperatures);
+  const cpuTemperature = status.cpu_temperature || {};
   const fanStatus = status.fan_control || {};
   const selectedFan = fanStatus.fans?.find((fan) => fan.selected) || fanStatus.fans?.find((fan) => Number(fan.rpm) > 0);
   $('cpu-model').textContent = status.cpu_model || '未识别';
-  $('temperature').textContent = temperature == null ? '不可用' : `${temperature.toFixed(1)} °C`;
+  $('cpu-display-label').textContent = cpuTemperature.display_source === 'package_fallback'
+    ? 'CPU 温度（Package 回退）'
+    : 'CPU 核心最高（RR 口径）';
+  $('cpu-display-temperature').textContent = formatTemperature(cpuTemperature.display_c, cpuTemperature.available);
+  $('package-temperature').textContent = formatTemperature(cpuTemperature.package_max_c, Number(cpuTemperature.package_sensors) > 0);
   $('current-pl1').textContent = pkg.has_pl1 ? `${pkg.pl1_w} W` : '不可用';
   $('current-pl2').textContent = pkg.has_pl2 ? `${pkg.pl2_w} W` : '不可用';
   $('fan-rpm').textContent = selectedFan ? `${selectedFan.rpm} RPM` : '不可用';
   $('profile').textContent = status.profile?.display || '不支持';
+  $('temperature-source').textContent = cpuTemperature.display_source === 'core_max_rr'
+    ? `RR 核心最大值（${cpuTemperature.core_sensors} 个 Core）`
+    : (cpuTemperature.display_source === 'package_fallback' ? '未找到 Core 标签，回退到 Package' : '未识别');
+  $('temperature-sensors').textContent = Array.isArray(status.temperatures) && status.temperatures.length
+    ? status.temperatures.map((item) => `${item.label} ${formatTemperature(item.celsius)}`).join(' · ')
+    : '未读取到 coretemp';
   $('gpu-runtime').textContent = status.gpu_runtime?.join('，') || '未暴露';
   $('last-apply').textContent = status.last_apply ? new Date(status.last_apply).toLocaleString() : '尚未应用';
   $('last-error').textContent = status.last_error || fanStatus.last_error || '正常';

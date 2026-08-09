@@ -1,6 +1,6 @@
-# N100/N305 功耗与风扇卫士（fnOS）
+# N100/N305 温度与功耗卫士（fnOS）
 
-这是一个面向飞牛 fnOS 的第三方应用，通过 Linux Intel RAPL 接口限制 Intel Processor N100 与 Intel Core i3-N305 的 Package 功耗，并可通过 IT87 hwmon 接口按 CPU 真实温度控制单风扇。它用于缓解 CPU 与核显共同负载时温度快速升高的问题。
+这是一个面向飞牛 fnOS 的第三方应用。它按 RR CPUinfo 的口径显示 Intel Processor N100 与 Intel Core i3-N305 的 CPU 核心最高温度，同时保留 Package 原始温度供核对；还可通过 Linux Intel RAPL 限制 Package 功耗，并通过 IT87 hwmon 接口控制单风扇。
 
 ## 下载与安装
 
@@ -18,6 +18,14 @@
 插件会读取 `constraint_*_max_power_uw`，当内核提供了有效上限时，界面和后端都会拒绝超过该上限的配置。只支持明确识别出的 N100/N305；其他 CPU 会拒绝安装或启动。
 
 N305 默认将 PL2 与 PL1 同样限制为 15 W，避免 CPU 与核显联合负载在短时窗口内放行过高的 Package 功耗。
+
+## 温度显示口径
+
+在已验证的 fnOS 主机上，系统温度服务会枚举 `coretemp`，但只读取匹配到的首个 `temp*_input`；该节点是 `Package id 0`。飞牛资源监控再把这个 Package 热点作为 CPU 温度显示，并以 65°C/75°C 着色告警。Linux `coretemp` 本身读取 Intel 数字温度传感器，不会把 CPU 与 GPU 温度相加。
+
+RR 的 CPUinfo 实现会筛选标签为 `Core N` 的温度并取最大值。本插件迁移相同口径：主卡片显示所有 `Core N` 中的最高温度，另一个卡片显示所有 `Package id N` 中的最高原始值，诊断区列出每个 `coretemp` 节点方便核对。若系统没有暴露任何 `Core N` 标签，才回退显示 Package 温度并明确标注。
+
+插件不会修改飞牛的私有温度服务、资源监控前端或告警阈值，因此飞牛桌面原有的 Package 温度和红色告警仍会存在；请以插件中分开的两组读数判断二者差异。
 
 ## 单风扇温控曲线
 
