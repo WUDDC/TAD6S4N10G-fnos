@@ -285,10 +285,28 @@ func setFanPWM(fan FanDevice, percent int) error {
 	if percent < 0 || percent > 100 {
 		return fmt.Errorf("invalid fan PWM percent %d", percent)
 	}
+	raw := percentToPWM(percent)
+	currentPWM, err := readInt(fan.PWMPath)
+	if err != nil {
+		return fmt.Errorf("read pwm%d: %w", fan.Channel, err)
+	}
+	currentMode, err := readInt(fan.EnablePath)
+	if err != nil {
+		return fmt.Errorf("read pwm%d mode: %w", fan.Channel, err)
+	}
+	if raw == 255 && currentPWM == 255 && currentMode == 0 {
+		return nil
+	}
+	if raw < 255 && currentMode == 0 {
+		// This IT87 driver represents full speed as mode 0 and refuses mode 1
+		// while PWM is still 255. Lowering PWM first atomically re-enters manual mode.
+		if err := writeAndVerify(fan.PWMPath, int64(raw)); err != nil {
+			return fmt.Errorf("leave pwm%d full-speed mode: %w", fan.Channel, err)
+		}
+	}
 	if err := writeAndVerify(fan.EnablePath, 1); err != nil {
 		return fmt.Errorf("switch pwm%d to manual mode: %w", fan.Channel, err)
 	}
-	raw := percentToPWM(percent)
 	if err := writeAndVerify(fan.PWMPath, int64(raw)); err != nil {
 		return fmt.Errorf("write pwm%d: %w", fan.Channel, err)
 	}

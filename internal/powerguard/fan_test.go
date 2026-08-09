@@ -95,6 +95,31 @@ func TestSetFanPWMAndRestore(t *testing.T) {
 	}
 }
 
+func TestSetFanPWMLeavesDriverFullSpeedMode(t *testing.T) {
+	dir := t.TempDir()
+	pwm := filepath.Join(dir, "pwm3")
+	enable := filepath.Join(dir, "pwm3_enable")
+	writeTestValue(t, pwm, "255")
+	writeTestValue(t, enable, "0")
+	fan := FanDevice{ID: "it8613:test:fan3", Channel: 3, PWMPath: pwm, EnablePath: enable}
+
+	if err := setFanPWM(fan, 70); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readInt(pwm); got != 179 {
+		t.Fatalf("pwm=%d, want 179", got)
+	}
+	if got, _ := readInt(enable); got != 1 {
+		t.Fatalf("mode=%d, want manual mode 1", got)
+	}
+
+	writeTestValue(t, pwm, "255")
+	writeTestValue(t, enable, "0")
+	if err := setFanPWM(fan, 100); err != nil {
+		t.Fatalf("already-full fan should be accepted: %v", err)
+	}
+}
+
 func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	cfg := Config{Enabled: true, PL1W: 15, PL2W: 15, ReapplySeconds: 30}
 	if !normalizeConfig(&cfg) {
