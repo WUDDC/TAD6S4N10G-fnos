@@ -42,7 +42,7 @@ func main() {
 		os.Exit(2)
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "powerguard:", err)
+		fmt.Fprintln(os.Stderr, "tad-module:", err)
 		os.Exit(1)
 	}
 }
@@ -167,7 +167,7 @@ func serve(args []string) error {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/powerguard", Logger: logger}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger}
 		done <- server.ListenAndServe()
 	}()
 	go reapplyLoop(ctx, manager, logger)
@@ -318,5 +318,5 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: powerguard <serve|probe|init|apply|restore|version> [options]")
+	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|probe|init|apply|restore|version> [options]")
 }

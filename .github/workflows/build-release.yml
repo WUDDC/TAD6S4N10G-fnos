@@ -55,19 +55,19 @@ jobs:
 
       - name: Verify package
         run: |
-          test -s powerguard.fpk
-          tar -tf powerguard.fpk | grep -Fx manifest
-          tar -tf powerguard.fpk | grep -Fx app.tgz
-          tar -tf powerguard.fpk | grep -Fx cmd/main
-          sha256sum powerguard.fpk > powerguard.fpk.sha256
+          test -s tad-module.fpk
+          tar -tf tad-module.fpk | grep -Fx manifest
+          tar -tf tad-module.fpk | grep -Fx app.tgz
+          tar -tf tad-module.fpk | grep -Fx cmd/main
+          sha256sum tad-module.fpk > tad-module.fpk.sha256
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: powerguard-${{ github.ref_name }}
+          name: tad-module-${{ github.ref_name }}
           path: |
-            powerguard.fpk
-            powerguard.fpk.sha256
+            tad-module.fpk
+            tad-module.fpk.sha256
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -76,6 +76,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            powerguard.fpk powerguard.fpk.sha256 \
+            tad-module.fpk tad-module.fpk.sha256 \
             --title "TAD模块 ${GITHUB_REF_NAME}" \
             --generate-notes

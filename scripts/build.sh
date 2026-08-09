@@ -10,7 +10,7 @@ mkdir -p "${PROJECT_ROOT}/app/bin" "${PROJECT_ROOT}/app/ui/images" "${PROJECT_RO
 cd "${PROJECT_ROOT}"
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
 GOCACHE="${PROJECT_ROOT}/.cache/go-build" GOTMPDIR="${PROJECT_ROOT}/.cache/go-tmp" \
-go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o app/bin/powerguard ./backend/powerguard
+go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o app/bin/tad-module ./backend/powerguard
 
 GOCACHE="${PROJECT_ROOT}/.cache/go-build" GOTMPDIR="${PROJECT_ROOT}/.cache/go-tmp" \
 go run ./tools/icon-gen -out app/ui/images

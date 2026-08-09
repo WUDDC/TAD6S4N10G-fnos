@@ -6,7 +6,7 @@
 
 ## 下载与安装
 
-从 [GitHub Releases](https://github.com/luodaoyi/TAD6S4N10G-fnos/releases) 下载最新的 `powerguard.fpk` 和 `powerguard.fpk.sha256`，校验 SHA256 后，在飞牛应用中心选择手动安装。
+从 [GitHub Releases](https://github.com/luodaoyi/TAD6S4N10G-fnos/releases) 下载最新的 `tad-module.fpk` 和 `tad-module.fpk.sha256`，校验 SHA256 后，在飞牛应用中心选择手动安装。
 
 仓库的 GitHub Actions 会在每次提交时完成测试和打包；推送与 `manifest` 版本一致的 `v*` 标签时，会自动创建 Release 并附加插件包。
 
@@ -90,7 +90,7 @@ Linux：
 构建完成后使用飞牛应用中心上传生成的 `.fpk`，或者在 NAS 上执行：
 
 ```bash
-appcenter-cli install-fpk powerguard.fpk
+appcenter-cli install-fpk tad-module.fpk
 ```
 
 ## 开发验证

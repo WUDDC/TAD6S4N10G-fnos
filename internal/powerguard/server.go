@@ -33,7 +33,7 @@ func (s *Server) ListenAndServe() error {
 		return errors.New("socket path is required")
 	}
 	if s.BasePath == "" {
-		s.BasePath = "/app/powerguard"
+		s.BasePath = "/app/tad-module"
 	}
 	if s.Logger == nil {
 		s.Logger = log.Default()

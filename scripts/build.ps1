@@ -25,7 +25,7 @@ try {
   $env:CGO_ENABLED = "0"
   $env:GOCACHE = Join-Path $cacheRoot "go-build"
   $env:GOTMPDIR = Join-Path $cacheRoot "go-tmp"
-  & go build -trimpath -ldflags "-s -w -X main.version=$version" -o (Join-Path $appBin "powerguard") ./backend/powerguard
+  & go build -trimpath -ldflags "-s -w -X main.version=$version" -o (Join-Path $appBin "tad-module") ./backend/powerguard
   if ($LASTEXITCODE -ne 0) { throw "go build failed" }
   $env:GOOS = $oldGoos
   $env:GOARCH = $oldGoarch

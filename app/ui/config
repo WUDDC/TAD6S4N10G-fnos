@@ -1,13 +1,13 @@
 {
   ".url": {
-    "powerguard.Application": {
+    "tad-module.Application": {
       "title": "TAD模块",
       "icon": "images/icon_{0}.png",
       "type": "iframe",
       "protocol": "",
-      "gatewayPrefix": "/app/powerguard",
-      "gatewaySocket": "powerguard.sock",
-      "url": "/app/powerguard/",
+      "gatewayPrefix": "/app/tad-module",
+      "gatewaySocket": "tad-module.sock",
+      "url": "/app/tad-module/",
       "allUsers": false
     }
   }

@@ -714,7 +714,7 @@ func writeJSONAtomic(path string, value any, mode fs.FileMode) error {
 		return err
 	}
 	data = append(data, '\n')
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".powerguard-*")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tad-module-*")
 	if err != nil {
 		return err
 	}

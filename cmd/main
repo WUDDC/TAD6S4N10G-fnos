@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-APP_DEST="${TRIM_APPDEST:-/var/apps/powerguard/target}"
-PKG_ETC="${TRIM_PKGETC:-/var/apps/powerguard/etc}"
-PKG_VAR="${TRIM_PKGVAR:-/var/apps/powerguard/var}"
-BIN="${APP_DEST}/bin/powerguard"
-PID_FILE="${PKG_VAR}/powerguard.pid"
-SOCKET="${APP_DEST}/powerguard.sock"
-LOG_FILE="${PKG_VAR}/powerguard.log"
+APP_DEST="${TRIM_APPDEST:-/var/apps/tad-module/target}"
+PKG_ETC="${TRIM_PKGETC:-/var/apps/tad-module/etc}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/tad-module/var}"
+BIN="${APP_DEST}/bin/tad-module"
+PID_FILE="${PKG_VAR}/tad-module.pid"
+SOCKET="${APP_DEST}/tad-module.sock"
+LOG_FILE="${PKG_VAR}/tad-module.log"
 
 is_running() {
   [ -f "${PID_FILE}" ] || return 1
@@ -47,7 +47,7 @@ start_service() {
     count=$((count + 1))
     sleep 0.1
   done
-  echo "PowerGuard did not create its socket in time" >&2
+  echo "tad-module did not create its socket in time" >&2
   exit 1
 }
 
