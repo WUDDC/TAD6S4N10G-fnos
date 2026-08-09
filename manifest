@@ -1,0 +1,16 @@
+appname=powerguard
+version=0.1.0
+display_name=N100/N305 功耗卫士
+desc=限制 Intel N100 与 i3-N305 的 Package 功耗，降低核显负载引起的高温。
+source=thirdparty
+platform=x86
+arch=x86_64
+maintainer=Community
+os_min_version=1.2.0
+ctl_stop=true
+install_type=root
+desktop_uidir=ui
+desktop_applaunchname=powerguard.Application
+checkport=false
+disable_authorization_path=false
+changelog=首个版本：支持 N100/N305、PL1/PL2 配置、自动重应用和安全恢复。

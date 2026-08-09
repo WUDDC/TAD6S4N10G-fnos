@@ -1,0 +1,14 @@
+#!/bin/sh
+set -eu
+
+mkdir -p "${TRIM_PKGETC}" "${TRIM_PKGVAR}"
+chmod 700 "${TRIM_PKGETC}" "${TRIM_PKGVAR}"
+
+if ! "${TRIM_APPDEST}/bin/powerguard" init \
+  --config "${TRIM_PKGETC}/config.json" \
+  --state "${TRIM_PKGVAR}/original-state.json"; then
+  echo "无法识别 N100/N305 或无法写入 Intel RAPL 功耗限制。" >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  exit 1
+fi
+
+exit 0

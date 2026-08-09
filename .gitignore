@@ -1,0 +1,10 @@
+/.cache/
+/dist/
+/*.fpk
+/app/bin/powerguard
+/ICON.PNG
+/ICON_256.PNG
+/app/ui/images/icon_64.png
+/app/ui/images/icon_256.png
+/tools/fnpack.exe
+/图片_2026-08-09_132239_579.png

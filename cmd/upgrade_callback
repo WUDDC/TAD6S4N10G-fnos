@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+"${TRIM_APPDEST}/bin/powerguard" apply \
+  --config "${TRIM_PKGETC}/config.json" \
+  --state "${TRIM_PKGVAR}/original-state.json"
+
+exit 0

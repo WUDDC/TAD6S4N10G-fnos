@@ -1,0 +1,78 @@
+#!/bin/sh
+set -eu
+
+APP_DEST="${TRIM_APPDEST:-/var/apps/powerguard/target}"
+PKG_ETC="${TRIM_PKGETC:-/var/apps/powerguard/etc}"
+PKG_VAR="${TRIM_PKGVAR:-/var/apps/powerguard/var}"
+BIN="${APP_DEST}/bin/powerguard"
+PID_FILE="${PKG_VAR}/powerguard.pid"
+SOCKET="${APP_DEST}/powerguard.sock"
+LOG_FILE="${PKG_VAR}/powerguard.log"
+
+is_running() {
+  [ -f "${PID_FILE}" ] || return 1
+  pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null
+}
+
+start_service() {
+  mkdir -p "${PKG_ETC}" "${PKG_VAR}"
+  if is_running; then
+    exit 0
+  fi
+  rm -f "${PID_FILE}"
+  if [ -S "${SOCKET}" ]; then
+    rm -f "${SOCKET}"
+  elif [ -e "${SOCKET}" ]; then
+    echo "Refusing to remove non-socket path ${SOCKET}" >&2
+    exit 1
+  fi
+  nohup "${BIN}" serve \
+    --config "${PKG_ETC}/config.json" \
+    --state "${PKG_VAR}/original-state.json" \
+    --socket "${SOCKET}" \
+    --web-root "${APP_DEST}/ui/static" \
+    --log "${LOG_FILE}" \
+    >>"${LOG_FILE}" 2>&1 &
+  pid="$!"
+  printf '%s\n' "${pid}" >"${PID_FILE}"
+  count=0
+  while [ "${count}" -lt 50 ]; do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      rm -f "${PID_FILE}"
+      tail -n 20 "${LOG_FILE}" >&2 || true
+      exit 1
+    fi
+    [ -S "${SOCKET}" ] && exit 0
+    count=$((count + 1))
+    sleep 0.1
+  done
+  echo "PowerGuard did not create its socket in time" >&2
+  exit 1
+}
+
+stop_service() {
+  if ! is_running; then
+    rm -f "${PID_FILE}"
+    exit 0
+  fi
+  pid="$(cat "${PID_FILE}")"
+  kill -TERM "${pid}" 2>/dev/null || true
+  count=0
+  while kill -0 "${pid}" 2>/dev/null && [ "${count}" -lt 50 ]; do
+    count=$((count + 1))
+    sleep 0.1
+  done
+  if kill -0 "${pid}" 2>/dev/null; then
+    kill -KILL "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${PID_FILE}"
+}
+
+case "${1:-}" in
+  start) start_service ;;
+  stop) stop_service ;;
+  status) is_running && exit 0 || exit 3 ;;
+  restart) stop_service; start_service ;;
+  *) echo "Usage: $0 {start|stop|status|restart}" >&2; exit 1 ;;
+esac
