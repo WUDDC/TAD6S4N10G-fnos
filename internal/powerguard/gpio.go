@@ -1,0 +1,327 @@
+package powerguard
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	gpioConfigVersion = 1
+	gpioDebounce      = 100 * time.Millisecond
+
+	GPIOActionNone           = "none"
+	GPIOActionLog            = "log"
+	GPIOActionRefreshStorage = "refresh_storage"
+	GPIOActionSMARTCheck     = "smart_check"
+	GPIOActionReapplyPlugin  = "reapply_plugin"
+)
+
+type GPIOActions struct {
+	Short   string `json:"short"`
+	Hold3S  string `json:"hold_3s"`
+	Hold9S  string `json:"hold_9s"`
+	Hold15S string `json:"hold_15s"`
+}
+
+type GPIOButtonConfig struct {
+	ID      string      `json:"id"`
+	Actions GPIOActions `json:"actions"`
+}
+
+type GPIOConfig struct {
+	Version int                `json:"version"`
+	Enabled bool               `json:"enabled"`
+	Buttons []GPIOButtonConfig `json:"buttons"`
+}
+
+type GPIOButtonStatus struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Port       string `json:"port"`
+	Bit        uint   `json:"bit"`
+	Pressed    bool   `json:"pressed"`
+	HeldMS     int64  `json:"held_ms,omitempty"`
+	LastAction string `json:"last_action,omitempty"`
+}
+
+type GPIOStatus struct {
+	Available bool               `json:"available"`
+	Enabled   bool               `json:"enabled"`
+	Buttons   []GPIOButtonStatus `json:"buttons"`
+	LastEvent string             `json:"last_event,omitempty"`
+	LastError string             `json:"last_error,omitempty"`
+}
+
+type GPIOEvent struct {
+	ButtonID string
+	Name     string
+	Duration time.Duration
+	Stage    string
+	Action   string
+}
+
+type gpioButtonSpec struct {
+	ID   string
+	Name string
+	Port int64
+	Bit  uint
+}
+
+var gpioButtonSpecs = []gpioButtonSpec{
+	{ID: "copy", Name: "复制按键", Port: 0xA04, Bit: 6},
+	{ID: "network", Name: "网络按键", Port: 0xA00, Bit: 3},
+	{ID: "rear_reset", Name: "后置重置按键", Port: 0xA03, Bit: 6},
+}
+
+var allowedGPIOActions = map[string]bool{
+	GPIOActionNone: true, GPIOActionLog: true,
+	GPIOActionRefreshStorage: true, GPIOActionSMARTCheck: true,
+	GPIOActionReapplyPlugin: true,
+}
+
+type gpioButtonRuntime struct {
+	initialized  bool
+	baselineHigh bool
+	rawPressed   bool
+	rawChangedAt time.Time
+	pressed      bool
+	pressedAt    time.Time
+	lastAction   string
+}
+
+type gpioRuntime struct {
+	available bool
+	buttons   map[string]*gpioButtonRuntime
+	lastEvent string
+	lastError string
+}
+
+func DefaultGPIOConfig() GPIOConfig {
+	config := GPIOConfig{Version: gpioConfigVersion, Enabled: false}
+	for _, spec := range gpioButtonSpecs {
+		config.Buttons = append(config.Buttons, GPIOButtonConfig{
+			ID: spec.ID,
+			Actions: GPIOActions{
+				Short: GPIOActionNone, Hold3S: GPIOActionNone,
+				Hold9S: GPIOActionNone, Hold15S: GPIOActionNone,
+			},
+		})
+	}
+	return config
+}
+
+func validateGPIOConfig(config GPIOConfig) error {
+	if config.Version != gpioConfigVersion {
+		return fmt.Errorf("gpio version must be %d", gpioConfigVersion)
+	}
+	if len(config.Buttons) != len(gpioButtonSpecs) {
+		return fmt.Errorf("gpio buttons must contain exactly %d entries", len(gpioButtonSpecs))
+	}
+	wanted := make(map[string]bool, len(gpioButtonSpecs))
+	for _, spec := range gpioButtonSpecs {
+		wanted[spec.ID] = true
+	}
+	seen := make(map[string]bool, len(config.Buttons))
+	for _, button := range config.Buttons {
+		if !wanted[button.ID] {
+			return fmt.Errorf("unknown gpio button %q", button.ID)
+		}
+		if seen[button.ID] {
+			return fmt.Errorf("duplicate gpio button %q", button.ID)
+		}
+		seen[button.ID] = true
+		for stage, action := range map[string]string{
+			"short": button.Actions.Short, "hold_3s": button.Actions.Hold3S,
+			"hold_9s": button.Actions.Hold9S, "hold_15s": button.Actions.Hold15S,
+		} {
+			if !allowedGPIOActions[action] {
+				return fmt.Errorf("gpio button %s stage %s has unsupported action %q", button.ID, stage, action)
+			}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) GPIOPortPath() string {
+	return m.rooted("/dev/port")
+}
+
+func (m *Manager) ResetGPIO(enabled, available bool, cause error) {
+	m.gpioMu.Lock()
+	defer m.gpioMu.Unlock()
+	m.gpioRuntime.available = available
+	m.gpioRuntime.buttons = nil
+	if cause != nil {
+		m.gpioRuntime.lastError = cause.Error()
+	} else if !enabled {
+		m.gpioRuntime.lastError = ""
+	}
+}
+
+func (m *Manager) PollGPIO(config GPIOConfig, reader io.ReaderAt, now time.Time) ([]GPIOEvent, error) {
+	if err := validateGPIOConfig(config); err != nil {
+		return nil, err
+	}
+	if !config.Enabled {
+		m.ResetGPIO(false, false, nil)
+		return nil, nil
+	}
+	if reader == nil {
+		err := errors.New("gpio /dev/port reader is unavailable")
+		m.ResetGPIO(true, false, err)
+		return nil, err
+	}
+
+	m.gpioMu.Lock()
+	defer m.gpioMu.Unlock()
+	if m.gpioRuntime.buttons == nil {
+		m.gpioRuntime.buttons = make(map[string]*gpioButtonRuntime, len(gpioButtonSpecs))
+	}
+	m.gpioRuntime.available = true
+	m.gpioRuntime.lastError = ""
+	actions := gpioActionMap(config)
+	var events []GPIOEvent
+	for _, spec := range gpioButtonSpecs {
+		var value [1]byte
+		if _, err := reader.ReadAt(value[:], spec.Port); err != nil {
+			m.gpioRuntime.available = false
+			m.gpioRuntime.lastError = fmt.Sprintf("read GPIO port 0x%X: %v", spec.Port, err)
+			return events, errors.New(m.gpioRuntime.lastError)
+		}
+		high := value[0]&(1<<spec.Bit) != 0
+		state := m.gpioRuntime.buttons[spec.ID]
+		if state == nil {
+			state = &gpioButtonRuntime{}
+			m.gpioRuntime.buttons[spec.ID] = state
+		}
+		if !state.initialized {
+			state.initialized = true
+			state.baselineHigh = high
+			state.rawChangedAt = now
+			continue
+		}
+		rawPressed := high != state.baselineHigh
+		if rawPressed != state.rawPressed {
+			state.rawPressed = rawPressed
+			state.rawChangedAt = now
+			continue
+		}
+		if now.Sub(state.rawChangedAt) < gpioDebounce || rawPressed == state.pressed {
+			continue
+		}
+		state.pressed = rawPressed
+		if rawPressed {
+			state.pressedAt = now
+			continue
+		}
+		if state.pressedAt.IsZero() {
+			continue
+		}
+		duration := now.Sub(state.pressedAt)
+		stage, action := gpioActionForDuration(actions[spec.ID], duration)
+		state.pressedAt = time.Time{}
+		state.lastAction = action
+		event := GPIOEvent{ButtonID: spec.ID, Name: spec.Name, Duration: duration, Stage: stage, Action: action}
+		m.gpioRuntime.lastEvent = fmt.Sprintf("%s %s（%.1f 秒）→ %s", spec.Name, stage, duration.Seconds(), GPIOActionDisplay(action))
+		events = append(events, event)
+	}
+	return events, nil
+}
+
+func gpioActionMap(config GPIOConfig) map[string]GPIOActions {
+	result := make(map[string]GPIOActions, len(config.Buttons))
+	for _, button := range config.Buttons {
+		result[button.ID] = button.Actions
+	}
+	return result
+}
+
+func gpioActionForDuration(actions GPIOActions, duration time.Duration) (string, string) {
+	switch {
+	case duration >= 15*time.Second:
+		return "长按 15 秒", actions.Hold15S
+	case duration >= 9*time.Second:
+		return "长按 9 秒", actions.Hold9S
+	case duration >= 3*time.Second:
+		return "长按 3 秒", actions.Hold3S
+	default:
+		return "短按", actions.Short
+	}
+}
+
+func (m *Manager) ExecuteGPIOAction(event GPIOEvent) error {
+	var err error
+	switch event.Action {
+	case GPIOActionNone, GPIOActionLog:
+	case GPIOActionRefreshStorage:
+		m.RefreshStorage(false)
+	case GPIOActionSMARTCheck:
+		m.RefreshStorage(true)
+	case GPIOActionReapplyPlugin:
+		err = m.ApplyCurrent()
+	default:
+		err = fmt.Errorf("unsupported gpio action %q", event.Action)
+	}
+	m.gpioMu.Lock()
+	if err != nil {
+		m.gpioRuntime.lastError = err.Error()
+	} else {
+		m.gpioRuntime.lastError = ""
+	}
+	m.gpioMu.Unlock()
+	return err
+}
+
+func (m *Manager) GPIOStatus(config GPIOConfig) GPIOStatus {
+	m.gpioMu.Lock()
+	defer m.gpioMu.Unlock()
+	status := GPIOStatus{
+		Available: m.gpioRuntime.available,
+		Enabled:   config.Enabled,
+		LastEvent: m.gpioRuntime.lastEvent,
+		LastError: m.gpioRuntime.lastError,
+	}
+	if !config.Enabled {
+		if _, err := os.Stat(m.GPIOPortPath()); err == nil {
+			status.Available = true
+		}
+	}
+	now := time.Now()
+	for _, spec := range gpioButtonSpecs {
+		button := GPIOButtonStatus{
+			ID: spec.ID, Name: spec.Name, Port: fmt.Sprintf("0x%X", spec.Port), Bit: spec.Bit,
+		}
+		if runtime := m.gpioRuntime.buttons[spec.ID]; runtime != nil {
+			button.Pressed = runtime.pressed
+			button.LastAction = runtime.lastAction
+			if runtime.pressed && !runtime.pressedAt.IsZero() {
+				button.HeldMS = now.Sub(runtime.pressedAt).Milliseconds()
+			}
+		}
+		status.Buttons = append(status.Buttons, button)
+	}
+	sort.Slice(status.Buttons, func(i, j int) bool { return status.Buttons[i].ID < status.Buttons[j].ID })
+	return status
+}
+
+func GPIOActionDisplay(action string) string {
+	switch action {
+	case GPIOActionNone:
+		return "无动作"
+	case GPIOActionLog:
+		return "仅记录日志"
+	case GPIOActionRefreshStorage:
+		return "刷新硬盘仓位"
+	case GPIOActionSMARTCheck:
+		return "刷新仓位并检查 SMART"
+	case GPIOActionReapplyPlugin:
+		return "重新应用插件配置"
+	default:
+		return strings.TrimSpace(action)
+	}
+}

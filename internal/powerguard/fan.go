@@ -91,15 +91,20 @@ func DefaultFanConfig() FanConfig {
 }
 
 func normalizeConfig(cfg *Config) bool {
-	if cfg.Fan.Curve != nil {
-		return false
+	changed := false
+	if cfg.Fan.Curve == nil {
+		enabled := cfg.Fan.Enabled
+		deviceID := cfg.Fan.DeviceID
+		cfg.Fan = DefaultFanConfig()
+		cfg.Fan.Enabled = enabled
+		cfg.Fan.DeviceID = deviceID
+		changed = true
 	}
-	enabled := cfg.Fan.Enabled
-	deviceID := cfg.Fan.DeviceID
-	cfg.Fan = DefaultFanConfig()
-	cfg.Fan.Enabled = enabled
-	cfg.Fan.DeviceID = deviceID
-	return true
+	if cfg.GPIO.Version == 0 {
+		cfg.GPIO = DefaultGPIOConfig()
+		changed = true
+	}
+	return changed
 }
 
 func (m *Manager) validateFanLocked(cfg FanConfig) error {

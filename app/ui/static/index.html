@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>N100/N305 温度与功耗卫士</title>
+  <title>N100/N305 温度、硬盘与功耗卫士</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,7 +12,7 @@
       <div class="brand-mark" aria-hidden="true">⚡</div>
       <div>
         <p class="eyebrow">fnOS Power Guard</p>
-        <h1>N100/N305 温度与功耗卫士</h1>
+        <h1>N100/N305 温度、硬盘与功耗卫士</h1>
         <p class="subtitle">按 RR 口径显示 CPU 核心最高温度，并与 fnOS 使用的 Package 原始温度分开。</p>
         <p class="project-link"><a href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 项目主页 · 检查新版本</a></p>
       </div>
@@ -26,6 +26,23 @@
       <article><span>当前 PL1</span><strong id="current-pl1">—</strong></article>
       <article><span>当前 PL2</span><strong id="current-pl2">—</strong></article>
       <article><span>机箱风扇</span><strong id="fan-rpm">—</strong></article>
+    </section>
+
+    <section class="panel storage-panel" aria-labelledby="storage-heading">
+      <div class="panel-heading">
+        <div>
+          <h2 id="storage-heading">硬盘仓位</h2>
+          <p>前置仓位按机箱正面从左到右 6 → 1 显示；M.2 按主板槽位 1 → 4 显示。</p>
+        </div>
+        <span id="storage-updated" class="table-meta">等待刷新</span>
+      </div>
+      <div class="table-scroll">
+        <table class="status-table">
+          <thead><tr><th>仓位</th><th>状态</th><th>设备</th><th>用途</th><th>健康</th><th>温度</th></tr></thead>
+          <tbody id="storage-body"></tbody>
+        </table>
+      </div>
+      <p id="storage-error" class="inline-status"></p>
     </section>
 
     <section class="panel">
@@ -99,6 +116,28 @@
           </div>
         </section>
 
+        <section class="gpio-editor" aria-labelledby="gpio-heading">
+          <div class="panel-heading gpio-heading">
+            <div>
+              <h2 id="gpio-heading">机箱按键映射</h2>
+              <p>固定读取主板 GPIO：复制键 0xA04/bit6、网络键 0xA00/bit3、后置重置键 0xA03/bit6；每种按压时长可独立绑定安全动作。</p>
+            </div>
+            <label class="toggle"><input id="gpio-enabled" type="checkbox"><span></span>启用按键映射</label>
+          </div>
+          <div class="table-scroll">
+            <table class="status-table gpio-table">
+              <thead><tr><th>按键</th><th>短按</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
+              <tbody>
+                <tr data-button="copy"><th>复制按键</th><td><select class="gpio-action" data-stage="short"></select></td><td><select class="gpio-action" data-stage="hold_3s"></select></td><td><select class="gpio-action" data-stage="hold_9s"></select></td><td><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                <tr data-button="network"><th>网络按键</th><td><select class="gpio-action" data-stage="short"></select></td><td><select class="gpio-action" data-stage="hold_3s"></select></td><td><select class="gpio-action" data-stage="hold_9s"></select></td><td><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                <tr data-button="rear_reset"><th>后置重置按键</th><td><select class="gpio-action" data-stage="short"></select></td><td><select class="gpio-action" data-stage="hold_3s"></select></td><td><select class="gpio-action" data-stage="hold_9s"></select></td><td><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p id="gpio-status" class="inline-status">按键映射默认关闭。</p>
+          <p class="notice">出于安全考虑，当前只提供记录日志、刷新硬盘仓位、SMART 检查和重新应用插件配置；不会执行任意命令，也暂不调用未经验证的飞牛私有接口。</p>
+        </section>
+
         <div class="actions">
           <button type="submit" class="primary">保存并应用</button>
           <button id="apply-now" type="button">立即重应用</button>
@@ -116,6 +155,7 @@
         <div><dt>GPU 运行状态</dt><dd id="gpu-runtime">—</dd></div>
         <div><dt>风扇控制</dt><dd id="fan-control">—</dd></div>
         <div><dt>最近应用</dt><dd id="last-apply">—</dd></div>
+        <div><dt>GPIO 按键</dt><dd id="gpio-diagnostic">—</dd></div>
         <div><dt>状态</dt><dd id="last-error">—</dd></div>
         <div class="temperature-row"><dt>原始 coretemp</dt><dd id="temperature-sensors">—</dd></div>
       </dl>

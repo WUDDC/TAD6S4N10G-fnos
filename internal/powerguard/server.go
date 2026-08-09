@@ -111,7 +111,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以修改功耗与风扇配置")
+		writeError(w, http.StatusForbidden, "仅管理员可以修改功耗、风扇与按键配置")
 		return
 	}
 	defer r.Body.Close()
@@ -135,7 +135,7 @@ func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以应用功耗与风扇配置")
+		writeError(w, http.StatusForbidden, "仅管理员可以应用功耗、风扇与按键配置")
 		return
 	}
 	if err := s.Manager.ApplyCurrent(); err != nil {

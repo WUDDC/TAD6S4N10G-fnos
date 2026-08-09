@@ -33,11 +33,12 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool      `json:"enabled"`
-	PL1W           int64     `json:"pl1_w"`
-	PL2W           int64     `json:"pl2_w"`
-	ReapplySeconds int       `json:"reapply_seconds"`
-	Fan            FanConfig `json:"fan"`
+	Enabled        bool       `json:"enabled"`
+	PL1W           int64      `json:"pl1_w"`
+	PL2W           int64      `json:"pl2_w"`
+	ReapplySeconds int        `json:"reapply_seconds"`
+	Fan            FanConfig  `json:"fan"`
+	GPIO           GPIOConfig `json:"gpio"`
 }
 
 type Constraint struct {
@@ -107,6 +108,8 @@ type Status struct {
 	CPUTemperature   CPUTemperatureStatus `json:"cpu_temperature"`
 	GPURuntime       []string             `json:"gpu_runtime"`
 	FanControl       FanControlStatus     `json:"fan_control"`
+	Storage          StorageStatus        `json:"storage"`
+	GPIO             GPIOStatus           `json:"gpio"`
 	LastApply        time.Time            `json:"last_apply,omitempty"`
 	LastError        string               `json:"last_error,omitempty"`
 }
@@ -124,6 +127,12 @@ type Manager struct {
 	fanLastError  string
 	fanLastTarget int
 	fanLastTemp   float64
+
+	storageMu     sync.RWMutex
+	storageScanMu sync.Mutex
+	storageStatus StorageStatus
+	gpioMu        sync.Mutex
+	gpioRuntime   gpioRuntime
 }
 
 func DetectProfile(model string) (Profile, error) {
@@ -142,7 +151,10 @@ func DetectProfile(model string) (Profile, error) {
 }
 
 func DefaultConfig(profile Profile) Config {
-	return Config{Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2, ReapplySeconds: 30, Fan: DefaultFanConfig()}
+	return Config{
+		Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2,
+		ReapplySeconds: 30, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(),
+	}
 }
 
 func (m *Manager) CPUModel() (string, error) {
@@ -264,6 +276,7 @@ func (m *Manager) DisableAndRestore() error {
 	}
 	cfg.Enabled = false
 	cfg.Fan.Enabled = false
+	cfg.GPIO.Enabled = false
 	if err := m.validateLocked(cfg); err != nil {
 		return err
 	}
@@ -303,6 +316,9 @@ func (m *Manager) validateLocked(cfg Config) error {
 		return fmt.Errorf("PL2 must be at least PL1 and no more than %dW for %s", profile.MaxPL2, profile.Display)
 	}
 	if err := m.validateFanLocked(cfg.Fan); err != nil {
+		return err
+	}
+	if err := validateGPIOConfig(cfg.GPIO); err != nil {
 		return err
 	}
 	packages, err := m.DiscoverPackages()
@@ -579,6 +595,8 @@ func (m *Manager) Status() Status {
 	status.CPUTemperature = summarizeCPUTemperatures(status.Temperatures)
 	status.GPURuntime = m.gpuRuntime()
 	status.FanControl = m.fanStatusLocked(status.Config.Fan)
+	status.Storage = m.StorageStatus()
+	status.GPIO = m.GPIOStatus(status.Config.GPIO)
 	return status
 }
 

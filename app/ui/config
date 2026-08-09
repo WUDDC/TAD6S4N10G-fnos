@@ -1,7 +1,7 @@
 {
   ".url": {
     "powerguard.Application": {
-      "title": "功耗卫士",
+      "title": "硬盘与功耗卫士",
       "icon": "images/icon_{0}.png",
       "type": "iframe",
       "protocol": "",

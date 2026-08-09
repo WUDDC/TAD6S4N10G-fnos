@@ -172,6 +172,8 @@ func serve(args []string) error {
 	}()
 	go reapplyLoop(ctx, manager, logger)
 	go fanLoop(ctx, manager, logger)
+	go storageLoop(ctx, manager, logger)
+	go gpioLoop(ctx, manager, logger)
 
 	select {
 	case <-ctx.Done():
@@ -218,6 +220,98 @@ func fanLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logge
 		case <-timer.C:
 			if err := manager.ApplyFanCurrent(); err != nil {
 				logger.Printf("fan control failed: %v", err)
+			}
+		}
+	}
+}
+
+func storageLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	refresh := func() {
+		status := manager.RefreshStorage(false)
+		if status.LastError != "" {
+			logger.Printf("storage refresh partially failed: %s", status.LastError)
+		}
+	}
+	refresh()
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
+func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	var port *os.File
+	defer func() {
+		if port != nil {
+			_ = port.Close()
+		}
+	}()
+	var config powerguard.GPIOConfig
+	var nextConfigLoad time.Time
+	var lastLoggedError string
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if !now.Before(nextConfigLoad) {
+				cfg, err := manager.LoadOrCreateConfig()
+				if err != nil {
+					if err.Error() != lastLoggedError {
+						logger.Printf("gpio config failed: %v", err)
+						lastLoggedError = err.Error()
+					}
+					nextConfigLoad = now.Add(time.Second)
+					continue
+				}
+				config = cfg.GPIO
+				nextConfigLoad = now.Add(time.Second)
+			}
+			if !config.Enabled {
+				if port != nil {
+					_ = port.Close()
+					port = nil
+				}
+				manager.ResetGPIO(false, false, nil)
+				lastLoggedError = ""
+				continue
+			}
+			if port == nil {
+				var err error
+				port, err = os.Open(manager.GPIOPortPath())
+				if err != nil {
+					manager.ResetGPIO(true, false, err)
+					if err.Error() != lastLoggedError {
+						logger.Printf("gpio open failed: %v", err)
+						lastLoggedError = err.Error()
+					}
+					continue
+				}
+			}
+			events, err := manager.PollGPIO(config, port, now)
+			if err != nil {
+				if err.Error() != lastLoggedError {
+					logger.Printf("gpio poll failed: %v", err)
+					lastLoggedError = err.Error()
+				}
+				_ = port.Close()
+				port = nil
+				continue
+			}
+			lastLoggedError = ""
+			for _, event := range events {
+				logger.Printf("gpio event button=%s stage=%s duration=%s action=%s", event.ButtonID, event.Stage, event.Duration.Round(100*time.Millisecond), event.Action)
+				if err := manager.ExecuteGPIOAction(event); err != nil {
+					logger.Printf("gpio action failed button=%s action=%s: %v", event.ButtonID, event.Action, err)
+				}
 			}
 		}
 	}

@@ -5,6 +5,13 @@ const DEFAULT_CURVE = [
   { temp_c: 70, pwm_percent: 85 },
   { temp_c: 80, pwm_percent: 100 },
 ];
+const GPIO_ACTIONS = [
+  ['none', '无动作'],
+  ['log', '仅记录日志'],
+  ['refresh_storage', '刷新硬盘仓位'],
+  ['smart_check', '刷新仓位并检查 SMART'],
+  ['reapply_plugin', '重新应用插件配置'],
+];
 let currentStatus = null;
 
 function baseUrl(path) {
@@ -26,6 +33,103 @@ async function request(path, options = {}) {
 function formatTemperature(value, available = true) {
   const number = Number(value);
   return available && Number.isFinite(number) ? `${number.toFixed(1)} °C` : '不可用';
+}
+
+function formatSize(bytes) {
+  let value = Number(bytes);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(unit < 3 ? 0 : 1)} ${units[unit]}`;
+}
+
+function renderStorageTable(storage = {}) {
+  const stateLabels = {
+    empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
+  };
+  const slots = [...(storage.slots || [])].sort((left, right) => {
+    if (left.kind !== right.kind) return left.kind === 'front' ? -1 : 1;
+    return left.kind === 'front' ? right.slot - left.slot : left.slot - right.slot;
+  });
+  const body = $('storage-body');
+  body.replaceChildren();
+  slots.forEach((slot) => {
+    const row = document.createElement('tr');
+    row.className = `storage-${slot.state || 'unknown'}`;
+    const label = slot.kind === 'front' ? `前置 ${slot.slot}` : `M.2 ${slot.slot}`;
+    const deviceDetail = [slot.device, slot.model, slot.serial, formatSize(slot.size_bytes)].filter(Boolean).join(' · ');
+    const values = [
+      label,
+      stateLabels[slot.state] || slot.state || '未知',
+      deviceDetail || '—',
+      slot.purpose || (slot.state === 'empty' ? '空仓位' : '—'),
+      slot.warning || slot.health || '—',
+      formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0),
+    ];
+    values.forEach((value, index) => {
+      const cell = document.createElement(index === 0 ? 'th' : 'td');
+      cell.textContent = value;
+      row.append(cell);
+    });
+    body.append(row);
+  });
+  if (!slots.length) {
+    const row = document.createElement('tr');
+    const cell = document.createElement('td');
+    cell.colSpan = 6;
+    cell.textContent = '尚未获得仓位信息';
+    row.append(cell);
+    body.append(row);
+  }
+  $('storage-updated').textContent = storage.updated_at
+    ? `更新于 ${new Date(storage.updated_at).toLocaleTimeString()}` : '等待刷新';
+  $('storage-error').textContent = storage.last_error || '';
+  $('storage-error').className = `inline-status${storage.last_error ? ' error' : ''}`;
+}
+
+function setupGPIOActions() {
+  document.querySelectorAll('.gpio-action').forEach((select) => {
+    select.replaceChildren();
+    GPIO_ACTIONS.forEach(([value, label]) => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = label;
+      select.append(option);
+    });
+  });
+}
+
+function updateGPIOEnabledState() {
+  const enabled = $('gpio-enabled').checked;
+  document.querySelectorAll('.gpio-action').forEach((select) => { select.disabled = !enabled; });
+}
+
+function fillGPIOInputs(gpio = {}) {
+  $('gpio-enabled').checked = Boolean(gpio.enabled);
+  const buttons = new Map((gpio.buttons || []).map((button) => [button.id, button]));
+  document.querySelectorAll('.gpio-table tbody tr').forEach((row) => {
+    const actions = buttons.get(row.dataset.button)?.actions || {};
+    row.querySelectorAll('.gpio-action').forEach((select) => {
+      select.value = actions[select.dataset.stage] || 'none';
+    });
+  });
+  updateGPIOEnabledState();
+}
+
+function gpioConfigFromInputs() {
+  return {
+    version: 1,
+    enabled: $('gpio-enabled').checked,
+    buttons: [...document.querySelectorAll('.gpio-table tbody tr')].map((row) => {
+      const actions = {};
+      row.querySelectorAll('.gpio-action').forEach((select) => { actions[select.dataset.stage] = select.value; });
+      return { id: row.dataset.button, actions };
+    }),
+  };
 }
 
 function curveFromInputs() {
@@ -119,6 +223,8 @@ function render(status, keepInputs = false) {
   const pkg = status.packages?.[0] || {};
   const cpuTemperature = status.cpu_temperature || {};
   const fanStatus = status.fan_control || {};
+  const storageStatus = status.storage || {};
+  const gpioStatus = status.gpio || {};
   const selectedFan = fanStatus.fans?.find((fan) => fan.selected) || fanStatus.fans?.find((fan) => Number(fan.rpm) > 0);
   $('cpu-model').textContent = status.cpu_model || '未识别';
   $('cpu-display-label').textContent = cpuTemperature.display_source === 'package_fallback'
@@ -142,8 +248,18 @@ function render(status, keepInputs = false) {
   $('fan-control').textContent = fanStatus.active
     ? `已启用 · ${Number(fanStatus.temperature_c || 0).toFixed(1)} °C → ${fanStatus.target_pwm_percent || 0}%`
     : (fanStatus.available ? '可用，尚未启用' : '驱动或风扇不可用');
+  renderStorageTable(storageStatus);
+  $('gpio-status').textContent = gpioStatus.enabled
+    ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
+    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
+  $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
+  $('gpio-diagnostic').textContent = gpioStatus.enabled
+    ? (gpioStatus.available ? (gpioStatus.last_event || '监听中') : (gpioStatus.last_error || '不可用'))
+    : '未启用';
 
-  const healthy = status.supported && !status.last_error && !fanStatus.last_error;
+  const storageWarning = storageStatus.slots?.some((slot) => slot.state === 'warning');
+  const gpioError = gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error);
+  const healthy = status.supported && !status.last_error && !fanStatus.last_error && !storageWarning && !gpioError;
   $('health').textContent = healthy ? '运行正常' : '需要检查';
   $('health').className = `badge ${healthy ? 'ok' : 'error'}`;
 
@@ -163,6 +279,7 @@ function render(status, keepInputs = false) {
     $('pl2').value = status.config?.pl2_w ?? profile.default_pl2_w ?? '';
     $('interval').value = status.config?.reapply_seconds ?? 30;
     fillFanInputs(status.config?.fan);
+    fillGPIOInputs(status.config?.gpio);
   }
   renderFanChart();
 }
@@ -202,6 +319,7 @@ $('config-form').addEventListener('submit', async (event) => {
       poll_seconds: Number($('fan-poll').value),
       curve,
     },
+    gpio: gpioConfigFromInputs(),
   };
   if (config.pl2_w < config.pl1_w) {
     showMessage('PL2 不能低于 PL1。', true);
@@ -223,7 +341,7 @@ $('config-form').addEventListener('submit', async (event) => {
   setBusy(true);
   try {
     render(await request('api/config', { method: 'POST', body: JSON.stringify(config) }));
-    showMessage('功耗与风扇配置已保存并应用。');
+    showMessage('功耗、风扇与按键映射配置已保存并应用。');
   } catch (error) {
     showMessage(`应用失败：${error.message}`, true);
   } finally {
@@ -257,5 +375,7 @@ $('restore').addEventListener('click', async () => {
 });
 
 document.querySelectorAll('.curve-temp, .curve-pwm').forEach((input) => input.addEventListener('input', renderFanChart));
+setupGPIOActions();
+$('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 refresh();
 setInterval(() => refresh(true), 5000);

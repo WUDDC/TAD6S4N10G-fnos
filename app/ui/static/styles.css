@@ -72,6 +72,24 @@ small { display: block; margin-top: 7px; line-height: 1.4; }
 .curve-row:last-child { margin-bottom: 0; }
 .curve-row input { padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(8, 27, 20, .9); }
 .curve-labels { color: var(--muted); font-size: 12px; text-align: center; }
+.storage-panel .panel-heading { padding-bottom: 16px; }
+.table-meta { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.table-scroll { width: 100%; margin-top: 16px; overflow-x: auto; }
+.status-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.status-table th, .status-table td { min-width: 88px; padding: 12px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.status-table thead th { color: var(--muted); font-size: 12px; }
+.status-table tbody th { color: #dff8ed; white-space: nowrap; }
+.status-table .storage-empty td { color: #718d81; }
+.status-table .storage-present td:nth-child(2) { color: #8ed6ff; font-weight: 750; }
+.status-table .storage-used td:nth-child(2) { color: var(--mint); font-weight: 750; }
+.status-table .storage-warning td:nth-child(2), .status-table .storage-warning td:nth-child(5) { color: var(--danger); font-weight: 750; }
+.inline-status { min-height: 18px; margin: 12px 0 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+.inline-status.error { color: var(--danger); }
+.gpio-editor { grid-column: 1 / -1; margin-top: 4px; padding-top: 22px; border-top: 1px solid var(--line); }
+.gpio-heading { padding-bottom: 4px; border-bottom: 0; }
+.gpio-table select { min-width: 155px; padding: 9px 10px; font-size: 13px; }
+.gpio-table select:disabled { cursor: not-allowed; opacity: .55; }
+.gpio-editor .notice { margin-top: 12px; }
 .actions { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 10px; padding-top: 4px; }
 button { padding: 11px 16px; border: 1px solid var(--line); border-radius: 11px; color: #dcece5; background: #17362c; font: inherit; font-weight: 750; cursor: pointer; }
 button:hover { filter: brightness(1.14); }
@@ -99,6 +117,7 @@ dd { margin: 0; text-align: right; }
   button.danger { margin-left: 0; }
   .panel-heading { flex-direction: column; }
   .fan-settings, .curve-layout { grid-template-columns: 1fr; }
+  .table-meta { white-space: normal; }
   .details dl { grid-template-columns: 1fr; }
   .temperature-row dd { max-width: 65%; }
 }

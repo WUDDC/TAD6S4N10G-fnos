@@ -76,5 +76,5 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             powerguard.fpk powerguard.fpk.sha256 \
-            --title "N100/N305 功耗卫士 ${GITHUB_REF_NAME}" \
+            --title "N100/N305 温度、硬盘与功耗卫士 ${GITHUB_REF_NAME}" \
             --generate-notes
