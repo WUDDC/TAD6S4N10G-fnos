@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.6.1
+version=0.6.2
 display_name=TAD模块
 desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=应用包标识和发布文件统一改为 tad-module；包含 fnOS 浅色界面、槽位温度与活动状态，以及 CPU/HDD/NVMe 三温控曲线。
+changelog=修复温控曲线节点难以拖拽的问题；CPU、HDD 与 NVMe 曲线改为单列全宽大图并扩大节点命中区域；界面主色调整为 fnOS 蓝色。

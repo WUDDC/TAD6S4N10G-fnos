@@ -30,7 +30,7 @@ const CURVE_KINDS = ['cpu', 'hdd', 'nvme'];
 const curveEditors = {
   cpu: {
     chartID: 'fan-curve-chart', addID: 'curve-add', removeID: 'curve-remove', selectedID: 'curve-selected',
-    curve: DEFAULT_CPU_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#536dfe',
+    curve: DEFAULT_CPU_CURVE.map((point) => ({ ...point })), selectedIndex: 0, draggedIndex: -1, color: '#3f6ff5',
   },
   hdd: {
     chartID: 'disk-curve-chart', addID: 'disk-curve-add', removeID: 'disk-curve-remove', selectedID: 'disk-curve-selected',
@@ -468,10 +468,17 @@ function renderFanChart(kind = 'cpu') {
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
+    const hitTarget = svgElement('circle', {
+      cx: x(point.temp_c), cy: y(point.pwm_percent), r: 20,
+      fill: 'transparent', stroke: 'transparent', 'pointer-events': 'all',
+      class: 'curve-node curve-node-hit', 'data-index': index,
+      'aria-hidden': true, focusable: false,
+    });
+    svg.append(hitTarget);
     const node = svgElement('circle', {
       cx: x(point.temp_c), cy: y(point.pwm_percent), r: selected ? 9 : 7,
       fill: selected ? editor.color : '#ffffff', stroke: editor.color, 'stroke-width': 3,
-      class: `curve-node${selected ? ' selected' : ''}`, 'data-index': index,
+      class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
     svg.append(node);
@@ -617,6 +624,7 @@ function showMessage(message, error = false) {
 
 function setBusy(busy) {
   uiBusy = busy;
+  $('config-form').classList.toggle('busy', busy);
   document.querySelectorAll('button').forEach((button) => { button.disabled = busy; });
   CURVE_KINDS.forEach(updateCurveControls);
 }
@@ -716,6 +724,7 @@ function setupCurveEditor(kind) {
   const editor = curveEditors[kind];
   const curveChart = $(editor.chartID);
   curveChart.addEventListener('pointerdown', (event) => {
+    if (uiBusy) return;
     const node = event.target.closest?.('.curve-node');
     if (!node) return;
     editor.selectedIndex = Number(node.dataset.index);
@@ -762,7 +771,7 @@ function setupCurveEditor(kind) {
     event.preventDefault();
     setCurvePoint(kind, editor.selectedIndex, temperature, pwm);
     renderFanChart(kind);
-    requestAnimationFrame(() => curveChart.querySelector(`.curve-node[data-index="${editor.selectedIndex}"]`)?.focus());
+    requestAnimationFrame(() => curveChart.querySelector(`.curve-node-control[data-index="${editor.selectedIndex}"]`)?.focus());
   });
   $(editor.addID).addEventListener('click', () => addCurvePoint(kind));
   $(editor.removeID).addEventListener('click', () => removeSelectedCurvePoint(kind));
