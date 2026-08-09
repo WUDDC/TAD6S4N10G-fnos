@@ -238,6 +238,21 @@ function renderDiagnostics(status, fanStatus) {
   renderDiagnosticChips('fan-control', chips);
 }
 
+function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
+  const issues = [];
+  if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
+  if (status.last_error) issues.push(`模块：${status.last_error}`);
+  if (fanStatus.last_error) issues.push(`风扇：${fanStatus.last_error}`);
+  (storageStatus.slots || []).filter((slot) => slot.state === 'warning').forEach((slot) => {
+    const label = slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`;
+    issues.push(`${label}：${slot.warning || slot.health || '硬盘健康状态告警'}`);
+  });
+  if (gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error)) {
+    issues.push(`按钮控制：${gpioStatus.last_error || 'GPIO 硬件接口不可用'}`);
+  }
+  return [...new Set(issues)];
+}
+
 function setupGPIOActions() {
   document.querySelectorAll('.gpio-action').forEach((select) => {
     select.replaceChildren();
@@ -590,11 +605,13 @@ function render(status, keepInputs = false) {
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
     : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
-  const storageWarning = storageStatus.slots?.some((slot) => slot.state === 'warning');
-  const gpioError = gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error);
-  const healthy = status.supported && !status.last_error && !fanStatus.last_error && !storageWarning && !gpioError;
+  const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
+  const healthy = issues.length === 0;
   $('health').textContent = healthy ? '运行正常' : '需要检查';
   $('health').className = `badge ${healthy ? 'ok' : 'error'}`;
+  $('health-tooltip').textContent = healthy
+    ? '未发现需要处理的异常。'
+    : `需要检查以下项目：\n${issues.map((issue) => `• ${issue}`).join('\n')}`;
 
   const profile = status.profile || {};
   const maxPL1 = status.effective_max_pl1_w || profile.max_pl1_w || 0;

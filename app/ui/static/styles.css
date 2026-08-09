@@ -79,6 +79,52 @@ h2 { margin-bottom: 6px; color: #242832; font-size: 18px; }
 }
 .badge.ok { color: var(--success); border-color: #ccece1; background: #effaf6; }
 .badge.error { color: var(--danger); border-color: #f3d1cf; background: #fff4f3; }
+.health-summary { position: relative; justify-self: end; }
+.health-summary .badge { display: inline-block; cursor: help; }
+.health-summary .badge:focus-visible { outline: 2px solid rgba(63, 111, 245, .45); outline-offset: 2px; }
+.health-tooltip {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 10px);
+  right: 0;
+  width: min(360px, calc(100vw - 40px));
+  padding: 12px 14px;
+  border: 1px solid #dfe3ea;
+  border-radius: 10px;
+  color: #3a404c;
+  background: #fff;
+  box-shadow: 0 12px 34px rgba(38, 47, 64, .18);
+  font-size: 12px;
+  line-height: 1.65;
+  white-space: pre-line;
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(-4px);
+  transition: opacity .16s ease, transform .16s ease, visibility .16s;
+  pointer-events: none;
+}
+.health-tooltip::before {
+  content: "";
+  position: absolute;
+  right: 18px;
+  bottom: 100%;
+  border: 6px solid transparent;
+  border-bottom-color: #dfe3ea;
+}
+.health-tooltip::after {
+  content: "";
+  position: absolute;
+  right: 19px;
+  bottom: 100%;
+  border: 5px solid transparent;
+  border-bottom-color: #fff;
+}
+.health-summary:hover .health-tooltip,
+.health-summary:focus-within .health-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
 .app-layout {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);

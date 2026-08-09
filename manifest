@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.6.4
+version=0.6.5
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=首个标签改为全局配置；全局、风扇与按钮控制改为各页独立保存且只更新对应配置；统一使用 TAD6S4N模块名称和 fnOS 蓝色界面。
+changelog=“需要检查”状态增加悬浮详情；首个标签改为全局配置；全局、风扇与按钮控制各页独立保存且只更新对应配置；统一使用 TAD6S4N模块名称和 fnOS 蓝色界面。
