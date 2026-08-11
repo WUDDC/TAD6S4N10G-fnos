@@ -180,8 +180,9 @@ function renderStorageTemperatureCards(storage = {}) {
     temperature.textContent = Number(slot.temperature_c) > 0
       ? formatTemperature(slot.temperature_c) : '—';
     const status = document.createElement('small');
-    const activity = STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity;
-    status.textContent = [STORAGE_STATE_LABELS[state] || state, state === 'empty' ? '' : activity].filter(Boolean).join(' · ');
+    const activity = STORAGE_ACTIVITY_LABELS[slot.activity] || '';
+    const showActivity = state !== 'empty' && state !== 'unknown';
+    status.textContent = [STORAGE_STATE_LABELS[state] || state, showActivity ? activity : ''].filter(Boolean).join(' · ');
     card.append(label, temperature, status);
     cards.append(card);
   });
@@ -233,6 +234,50 @@ function renderStorageTable(storage = {}) {
     ? `更新于 ${new Date(storage.updated_at).toLocaleTimeString()}` : '等待刷新';
   $('storage-error').textContent = storage.last_error || '';
   $('storage-error').className = `inline-status${storage.last_error ? ' error' : ''}`;
+}
+
+function renderStorageVisual(storage = {}) {
+  const target = $('storage-visual');
+  target.replaceChildren();
+  const slots = new Map((storage.slots || []).map((slot) => [slot.id || `${slot.kind}-${slot.slot}`, slot]));
+  const groups = [
+    { kind: 'front', image: 'images/tad-chassis.svg', label: '前置 SATA', ids: [6, 5, 4, 3, 2, 1].map((slot) => `front-${slot}`) },
+    { kind: 'm2', image: 'images/tad-m2.svg', label: 'M.2', ids: ['m2-4', 'm2-2', 'm2-3', 'm2-1'] },
+  ];
+  groups.forEach((group) => {
+    const figure = document.createElement('figure');
+    figure.className = `storage-visual-group storage-visual-${group.kind}`;
+    const caption = document.createElement('figcaption');
+    caption.textContent = group.label;
+    const frame = document.createElement('div');
+    frame.className = 'storage-visual-frame';
+    const image = document.createElement('img');
+    image.src = baseUrl(group.image);
+    image.alt = `${group.label}示意图`;
+    frame.append(image);
+    group.ids.forEach((id) => {
+      const slot = slots.get(id) || { id, kind: group.kind, state: 'unknown', activity: 'unknown' };
+      const state = STORAGE_STATE_LABELS[slot.state] ? slot.state : 'unknown';
+      const activity = STORAGE_ACTIVITY_LABELS[slot.activity];
+      const marker = document.createElement('div');
+      marker.className = `storage-visual-slot storage-${state}`;
+      marker.dataset.slot = id;
+      const name = document.createElement('b');
+      name.textContent = String(slot.slot || id.split('-').pop());
+      const temperature = document.createElement('span');
+      temperature.textContent = Number(slot.temperature_c) > 0 ? formatTemperature(slot.temperature_c) : '温度—';
+      const status = document.createElement('small');
+      const statusParts = [STORAGE_STATE_LABELS[state]];
+      if (state !== 'empty' && state !== 'unknown' && activity) {
+        statusParts.push(`${activity}${slot.activity === 'sleeping' ? ' Zzz' : ''}`);
+      }
+      status.textContent = statusParts.join(' · ');
+      marker.append(name, temperature, status);
+      frame.append(marker);
+    });
+    figure.append(caption, frame);
+    target.append(figure);
+  });
 }
 
 function renderDiagnosticChips(targetID, items, emptyText = '—') {
@@ -999,6 +1044,7 @@ function render(status, keepInputs = false) {
   $('last-error').className = diagnosticError ? 'diagnostic-error' : 'diagnostic-ok';
   renderDiagnostics(status, fanStatus);
   renderStorageTemperatureCards(storageStatus);
+  renderStorageVisual(storageStatus);
   renderStorageTable(storageStatus);
   renderFanSlotTemperatures(storageStatus);
   renderFanHardwareWarning(fanStatus);

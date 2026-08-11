@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.8.0
+version=0.8.1
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=按键控制新增自定义 Bash 脚本管理、语法高亮和短按/长按绑定；标题新增手动 GitHub Release 更新检查；硬件异常提示改为每次打开界面都重新弹出。
+changelog=硬盘面板新增前置 SATA 6→1 与 M.2 4/2/3/1 图形盘位面板，动态显示温度、使用/插入/告警及繁忙/空闲/休眠状态，并保留详情表格。
