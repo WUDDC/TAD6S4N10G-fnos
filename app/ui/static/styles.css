@@ -26,40 +26,16 @@ body {
   background: var(--page);
 }
 .shell {
-  width: min(1440px, calc(100% - 24px));
-  min-height: calc(100vh - 24px);
-  margin: 12px auto;
+  width: 100%;
+  min-height: 100vh;
+  margin: 0;
   overflow: hidden;
-  border: 1px solid rgba(31, 39, 51, .06);
-  border-radius: 24px;
+  border: 0;
+  border-radius: 0;
   background: var(--surface);
-  box-shadow: 0 18px 60px rgba(43, 51, 68, .13);
+  box-shadow: none;
 }
-.app-header {
-  display: grid;
-  grid-template-columns: 42px minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  min-height: 68px;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--line);
-  background: rgba(255, 255, 255, .96);
-}
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 38px;
-  height: 38px;
-  border-radius: 11px;
-  color: #fff;
-  background: linear-gradient(145deg, #6791ff, #3568ef);
-  box-shadow: 0 8px 18px rgba(63, 111, 245, .24);
-  font-size: 17px;
-  font-weight: 800;
-}
-.title-row { display: flex; flex-wrap: wrap; gap: 7px 12px; align-items: baseline; min-width: 0; }
-h1, h2, h3, p { margin-top: 0; }
-h1 { margin: 0; color: #181b20; font-size: 20px; letter-spacing: -.02em; }
+h2, h3, p { margin-top: 0; }
 h2 { margin-bottom: 6px; color: #242832; font-size: 18px; }
 .app-version {
   color: var(--muted);
@@ -142,16 +118,30 @@ h2 { margin-bottom: 6px; color: #242832; font-size: 18px; }
 .app-layout {
   display: grid;
   grid-template-columns: 220px minmax(0, 1fr);
-  min-height: calc(100vh - 93px);
+  min-height: 100vh;
+}
+.app-sidebar {
+  min-width: 0;
+  padding: 18px 12px;
+  border-right: 1px solid #eceef2;
+  background: var(--sidebar);
 }
 .app-tabs {
   display: flex;
   flex-direction: column;
   gap: 7px;
-  padding: 18px 12px;
-  border-right: 1px solid #eceef2;
-  background: var(--sidebar);
 }
+.sidebar-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 22px;
+  padding: 16px 10px 4px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+}
+.sidebar-meta .health-summary { align-self: flex-start; }
+.sidebar-meta .health-tooltip { left: 0; right: auto; }
 .app-tabs button {
   display: flex;
   gap: 11px;
@@ -508,12 +498,14 @@ button.danger { margin-left: auto; color: var(--danger); border-color: #f0c9c6; 
 }
 @media (max-width: 680px) {
   .shell { width: 100%; min-height: 100vh; margin: 0; border: 0; border-radius: 0; }
-  .app-header { grid-template-columns: 38px minmax(0, 1fr); padding: 11px 14px; }
-  .app-header .badge { grid-column: 1 / -1; justify-self: start; }
   .app-layout { grid-template-columns: 1fr; }
-  .app-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); padding: 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .app-sidebar { padding: 8px; border-right: 0; border-bottom: 1px solid var(--line); }
+  .app-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .app-tabs button { justify-content: center; gap: 5px; padding: 9px 5px; text-align: center; font-size: 11px; }
   .app-tabs button > span { width: auto; font-size: 13px; }
+  .sidebar-meta { flex-direction: row; flex-wrap: wrap; align-items: center; margin-top: 8px; padding: 10px 4px 2px; }
+  .sidebar-meta .health-summary { margin-left: auto; }
+  .sidebar-meta .health-tooltip { left: auto; right: 0; }
   .tab-form { padding: 12px; }
   .metrics { gap: 8px; }
   .metrics article { min-height: 94px; padding: 14px; }

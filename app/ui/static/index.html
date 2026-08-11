@@ -8,28 +8,25 @@
 </head>
 <body>
   <main class="shell">
-    <header class="app-header">
-      <div class="brand-mark" aria-hidden="true">T</div>
-      <div class="title-row">
-        <h1>TAD6S4N模块</h1>
-        <span id="app-version" class="app-version">v—</span>
-        <button id="check-updates" type="button" class="project-link">GitHub · 检查更新</button>
-        <span id="update-status" class="update-status" role="status" aria-live="polite"></span>
-        <a id="update-release-link" class="update-release-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden></a>
-      </div>
-      <div class="health-summary">
-        <span id="health" class="badge pending" tabindex="0" aria-describedby="health-tooltip">读取中</span>
-        <div id="health-tooltip" class="health-tooltip" role="tooltip">正在读取模块状态…</div>
-      </div>
-    </header>
-
     <div class="app-layout">
-      <nav class="app-tabs" role="tablist" aria-label="插件功能">
-        <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">⚙</span>全局配置</button>
-        <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><span aria-hidden="true">◉</span>风扇控制</button>
-        <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><span aria-hidden="true">⌁</span>按键控制</button>
-        <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1"><span aria-hidden="true">▱</span>硬盘面板</button>
-      </nav>
+      <aside class="app-sidebar">
+        <nav class="app-tabs" role="tablist" aria-label="插件功能">
+          <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">⚙</span>全局配置</button>
+          <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><span aria-hidden="true">◉</span>风扇控制</button>
+          <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><span aria-hidden="true">⌁</span>按键控制</button>
+          <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1"><span aria-hidden="true">▱</span>硬盘面板</button>
+        </nav>
+        <section class="sidebar-meta" aria-label="插件信息">
+          <span id="app-version" class="app-version">v—</span>
+          <button id="check-updates" type="button" class="project-link">GitHub · 检查更新</button>
+          <span id="update-status" class="update-status" role="status" aria-live="polite"></span>
+          <a id="update-release-link" class="update-release-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden></a>
+          <div class="health-summary">
+            <span id="health" class="badge pending" tabindex="0" aria-describedby="health-tooltip">读取中</span>
+            <div id="health-tooltip" class="health-tooltip" role="tooltip">正在读取模块状态…</div>
+          </div>
+        </section>
+      </aside>
 
       <form id="config-form" class="tab-form">
       <section id="panel-temperature" class="tab-panel" role="tabpanel" aria-labelledby="tab-temperature">
