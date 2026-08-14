@@ -18,18 +18,40 @@ import (
 const stateVersion = 1
 
 type Profile struct {
-	ID         string `json:"id"`
-	Display    string `json:"display"`
-	DefaultPL1 int64  `json:"default_pl1_w"`
-	DefaultPL2 int64  `json:"default_pl2_w"`
-	MinPL1     int64  `json:"min_pl1_w"`
-	MaxPL1     int64  `json:"max_pl1_w"`
-	MaxPL2     int64  `json:"max_pl2_w"`
+	ID           string                 `json:"id"`
+	Display      string                 `json:"display"`
+	DefaultPL1   int64                  `json:"default_pl1_w"`
+	DefaultPL2   int64                  `json:"default_pl2_w"`
+	MinPL1       int64                  `json:"min_pl1_w"`
+	MaxPL1       int64                  `json:"max_pl1_w"`
+	MaxPL2       int64                  `json:"max_pl2_w"`
+	PowerPresets map[string]PowerPreset `json:"power_presets"`
+}
+
+type PowerPreset struct {
+	PL1W int64 `json:"pl1_w"`
+	PL2W int64 `json:"pl2_w"`
 }
 
 var profiles = []Profile{
-	{ID: "n305", Display: "Intel Core i3-N305", DefaultPL1: 15, DefaultPL2: 15, MinPL1: 6, MaxPL1: 20, MaxPL2: 35},
-	{ID: "n100", Display: "Intel Processor N100", DefaultPL1: 6, DefaultPL2: 15, MinPL1: 4, MaxPL1: 10, MaxPL2: 25},
+	{
+		ID: "n305", Display: "Intel Core i3-N305", DefaultPL1: 15, DefaultPL2: 15, MinPL1: 6, MaxPL1: 20, MaxPL2: 35,
+		PowerPresets: map[string]PowerPreset{
+			"saving": {PL1W: 9, PL2W: 15}, "standard": {PL1W: 15, PL2W: 15}, "performance": {PL1W: 20, PL2W: 35},
+		},
+	},
+	{
+		ID: "n100", Display: "Intel Processor N100", DefaultPL1: 6, DefaultPL2: 15, MinPL1: 4, MaxPL1: 10, MaxPL2: 25,
+		PowerPresets: map[string]PowerPreset{
+			"saving": {PL1W: 4, PL2W: 8}, "standard": {PL1W: 6, PL2W: 15}, "performance": {PL1W: 10, PL2W: 25},
+		},
+	},
+	{
+		ID: "n150", Display: "Intel Processor N150", DefaultPL1: 6, DefaultPL2: 15, MinPL1: 4, MaxPL1: 15, MaxPL2: 25,
+		PowerPresets: map[string]PowerPreset{
+			"saving": {PL1W: 4, PL2W: 8}, "standard": {PL1W: 6, PL2W: 15}, "performance": {PL1W: 15, PL2W: 25},
+		},
+	},
 }
 
 type Config struct {
@@ -104,6 +126,9 @@ type PackageStatus struct {
 
 type Status struct {
 	Version          string               `json:"version"`
+	DeviceName       string               `json:"device_name,omitempty"`
+	OSName           string               `json:"os_name,omitempty"`
+	OSVersion        string               `json:"os_version,omitempty"`
 	CPUModel         string               `json:"cpu_model"`
 	Profile          Profile              `json:"profile"`
 	Supported        bool                 `json:"supported"`
@@ -151,11 +176,14 @@ func DetectProfile(model string) (Profile, error) {
 	for _, token := range strings.FieldsFunc(normalized, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
 	}) {
-		if token == "n100" {
+		switch token {
+		case "n100":
 			return profiles[1], nil
+		case "n150":
+			return profiles[2], nil
 		}
 	}
-	return Profile{}, fmt.Errorf("unsupported CPU %q; only Intel N100 and i3-N305 are supported", strings.TrimSpace(model))
+	return Profile{}, fmt.Errorf("unsupported CPU %q; only Intel N100, N150 and i3-N305 are supported", strings.TrimSpace(model))
 }
 
 func DefaultConfig(profile Profile) Config {
@@ -180,6 +208,60 @@ func (m *Manager) CPUModel() (string, error) {
 		}
 	}
 	return "", errors.New("CPU model name was not found in /proc/cpuinfo")
+}
+
+func (m *Manager) deviceSystemInfo() (string, string, string) {
+	deviceName, _ := readTrim(m.rooted("/etc/hostname"))
+	if deviceName == "" && (m.Root == "" || m.Root == "/") {
+		deviceName, _ = os.Hostname()
+	}
+
+	osName, osVersion := "", ""
+	if data, err := os.ReadFile(m.rooted("/etc/os-release")); err == nil {
+		values := make(map[string]string)
+		for _, line := range strings.Split(string(data), "\n") {
+			key, value, ok := strings.Cut(line, "=")
+			if !ok {
+				continue
+			}
+			values[strings.TrimSpace(key)] = strings.Trim(strings.TrimSpace(value), "\"'")
+		}
+		osName = values["NAME"]
+		if osName == "" {
+			osName = values["PRETTY_NAME"]
+		}
+		osVersion = values["VERSION_ID"]
+		if osVersion == "" {
+			osVersion = values["VERSION"]
+		}
+	}
+	if data, err := os.ReadFile(m.rooted("/etc/issue")); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(strings.ToLower(line), "os version:") {
+				continue
+			}
+			value := strings.TrimSpace(strings.TrimPrefix(line, "OS version:"))
+			if strings.HasPrefix(strings.ToLower(value), "fnos") {
+				osName = "fnOS"
+				osVersion = strings.TrimPrefix(strings.TrimSpace(value[len("fnOS"):]), "v")
+			}
+			break
+		}
+	}
+	for _, path := range []string{"/etc/fnos-release", "/etc/fnos_version"} {
+		if value, err := readTrim(m.rooted(path)); err == nil && value != "" {
+			osName = "fnOS"
+			if key, parsed, ok := strings.Cut(value, "="); ok {
+				if strings.Contains(strings.ToLower(key), "version") {
+					value = strings.Trim(strings.TrimSpace(parsed), "\"'")
+				}
+			}
+			osVersion = value
+			break
+		}
+	}
+	return deviceName, osName, osVersion
 }
 
 func (m *Manager) LoadOrCreateConfig() (Config, error) {
@@ -643,6 +725,7 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status := Status{Version: m.Version, LastApply: m.lastApply, LastError: m.lastError}
+	status.DeviceName, status.OSName, status.OSVersion = m.deviceSystemInfo()
 	if m.fanLastError != "" {
 		status.LastError = combineError(status.LastError, errors.New(m.fanLastError))
 	}

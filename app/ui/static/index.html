@@ -11,10 +11,11 @@
     <div class="app-layout">
       <aside class="app-sidebar">
         <nav class="app-tabs" role="tablist" aria-label="插件功能">
-          <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><span aria-hidden="true">⚙</span>全局配置</button>
-          <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><span aria-hidden="true">◉</span>风扇控制</button>
-          <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><span aria-hidden="true">⌁</span>按键控制</button>
-          <button id="tab-storage" type="button" role="tab" aria-selected="false" aria-controls="panel-storage" tabindex="-1"><span aria-hidden="true">▱</span>硬盘面板</button>
+          <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><img src="images/panel/监控面板图标.svg" alt="">监控面板</button>
+          <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><img src="images/panel/风扇控制图标.svg" alt="">风扇控制</button>
+          <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
+          <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
+          <button id="tab-about" type="button" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><img src="images/panel/关于我们图标.svg" alt="">关于</button>
         </nav>
         <section class="sidebar-meta" aria-label="插件信息">
           <span id="app-version" class="app-version">v—</span>
@@ -30,50 +31,37 @@
 
       <form id="config-form" class="tab-form">
       <section id="panel-temperature" class="tab-panel" role="tabpanel" aria-labelledby="tab-temperature">
-        <section class="metrics" aria-label="运行状态">
-          <article><span>处理器</span><strong id="cpu-model">—</strong></article>
-          <article><span id="cpu-display-label">CPU 核心最高（RR 口径）</span><strong id="cpu-display-temperature">—</strong></article>
-          <article><span>Package 原始温度</span><strong id="package-temperature">—</strong></article>
-          <article><span>HDD/SATA 最高温度</span><strong id="hdd-max-temperature">—</strong></article>
-          <article><span>NVMe 最高温度</span><strong id="nvme-max-temperature">—</strong></article>
-          <article><span>当前 PL1</span><strong id="current-pl1">—</strong></article>
-          <article><span>当前 PL2</span><strong id="current-pl2">—</strong></article>
-          <article><span>机箱风扇</span><strong id="fan-rpm">—</strong></article>
+        <section class="device-overview" aria-label="设备状态">
+          <article class="device-identity">
+            <div><span>设备名称</span><strong id="device-name">—</strong><span>系统版本</span><b id="os-version">—</b></div>
+            <img src="images/panel/设备外观图.svg" alt="TAD6S4N 设备外观">
+          </article>
+          <article class="processor-overview">
+            <div><span>处理器</span><strong id="cpu-model">—</strong></div>
+            <div class="temperature-pair"><p><span id="cpu-display-label">CPU 核心最高</span><b id="cpu-display-temperature">—</b></p><p><span>Package 温度</span><b id="package-temperature">—</b></p></div>
+          </article>
+          <article class="fan-overview">
+            <span>机箱风扇</span>
+            <div id="fan-rpm-list" class="fan-rpm-list"><strong id="fan-rpm">—</strong></div>
+          </article>
         </section>
 
-        <section class="storage-temperature-strip" aria-labelledby="storage-temperature-heading">
-          <div class="strip-heading">
-            <h2 id="storage-temperature-heading">硬盘温度与槽位状态</h2>
-            <span>前置 SATA 6 → 1，NVMe 1 → 4</span>
-          </div>
-          <div id="storage-temperature-cards" class="storage-temperature-cards"></div>
-        </section>
-
-        <section class="panel power-panel">
+        <section class="panel storage-panel" aria-labelledby="storage-heading">
           <div class="panel-heading">
             <div>
-              <h2>功耗限制</h2>
-              <p>推荐值按处理器自动生成；PL1 控制持续功耗，PL2 控制短时峰值。</p>
+              <h2 id="storage-heading">硬盘面板</h2>
+              <p>实时显示盘位、温度、活动状态和健康信息。</p>
             </div>
-            <label class="toggle"><input id="enabled" type="checkbox"><span></span>启用限制</label>
+            <span id="storage-updated" class="table-meta">等待刷新</span>
           </div>
-          <div class="power-settings">
-            <label>
-              <span>PL1 持续功耗</span>
-              <div class="input-wrap"><input id="pl1" type="number" step="1" required><b>W</b></div>
-              <small id="pl1-range">—</small>
-            </label>
-            <label>
-              <span>PL2 短时功耗</span>
-              <div class="input-wrap"><input id="pl2" type="number" step="1" required><b>W</b></div>
-              <small id="pl2-range">—</small>
-            </label>
-            <label>
-              <span>自动校验间隔</span>
-              <div class="input-wrap"><input id="interval" type="number" min="5" max="300" step="1" required><b>秒</b></div>
-              <small>系统或休眠恢复覆盖限制后自动重应用</small>
-            </label>
+          <div id="storage-visual" class="storage-visual" aria-label="硬盘机箱槽位图"></div>
+          <div class="table-scroll">
+            <table class="status-table storage-table">
+              <thead><tr><th>仓位</th><th>状态</th><th>活动</th><th>设备</th><th>用途</th><th>健康</th><th>温度</th></tr></thead>
+              <tbody id="storage-body"></tbody>
+            </table>
           </div>
+          <p id="storage-error" class="inline-status"></p>
         </section>
 
         <section class="details">
@@ -90,12 +78,6 @@
           <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
           <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖已安装的 IT87 驱动，插件不会加载或强制识别硬件；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式。</p>
         </section>
-        <div class="actions app-actions">
-          <button id="save-global" type="button" class="primary">保存全局配置</button>
-          <button id="apply-now" type="button">立即重应用</button>
-          <button id="restore" type="button" class="danger">恢复安装前配置</button>
-        </div>
-        <p id="message-global" class="message" role="status" aria-live="polite"></p>
       </section>
 
       <section id="panel-fan" class="tab-panel" role="tabpanel" aria-labelledby="tab-fan" hidden>
@@ -116,11 +98,7 @@
           </div>
 
           <div class="fan-settings">
-            <label>
-              <span>控制风扇</span>
-              <select id="fan-device" required></select>
-              <small id="fan-device-status">正在检测 IT87 风扇</small>
-            </label>
+            <select id="fan-device" hidden aria-hidden="true"></select>
             <label>
               <span>最低转速</span>
               <div class="input-wrap"><input id="fan-min" type="number" min="30" max="100" step="1" required><b>%</b></div>
@@ -152,6 +130,7 @@
                 </div>
                 <strong id="curve-selected">—</strong>
               </div>
+              <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
               <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
             </section>
             <section class="curve-editor" aria-labelledby="disk-curve-heading">
@@ -167,6 +146,7 @@
                 </div>
                 <strong id="disk-curve-selected">—</strong>
               </div>
+              <fieldset class="curve-fan-selector"><legend>HDD/SATA 曲线控制的风扇</legend><div id="hdd-fan-options" class="curve-fan-options"></div></fieldset>
               <fieldset class="curve-slot-selector">
                 <legend>参与 HDD/SATA 温控的槽位</legend>
                 <p>取消勾选后，该槽位温度不再影响风扇；温度缓存约每 60 秒更新。</p>
@@ -187,6 +167,7 @@
                 </div>
                 <strong id="nvme-curve-selected">—</strong>
               </div>
+              <fieldset class="curve-fan-selector"><legend>NVMe 曲线控制的风扇</legend><div id="nvme-fan-options" class="curve-fan-options"></div></fieldset>
               <fieldset class="curve-slot-selector">
                 <legend>参与 NVMe/SSD 温控的槽位</legend>
                 <p>取消勾选后，该槽位温度不再影响风扇；全部取消则停用 NVMe 温控曲线。</p>
@@ -216,9 +197,9 @@
             <table class="status-table gpio-table">
               <thead><tr><th>按键</th><th>短按</th><th>长按 3 秒</th><th>长按 9 秒</th><th>长按 15 秒</th></tr></thead>
               <tbody>
-                <tr data-button="copy"><th data-label="按键">复制按键</th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                <tr data-button="network"><th data-label="按键">网络按键</th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
-                <tr data-button="rear_reset"><th data-label="按键">后置重置按键</th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                <tr data-button="copy"><th data-label="按键"><span class="button-name"><img src="images/panel/复制按键.svg" alt="">复制按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                <tr data-button="network"><th data-label="按键"><span class="button-name"><img src="images/panel/网络按键.svg" alt="">网络按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
+                <tr data-button="rear_reset"><th data-label="按键"><span class="button-name"><img src="images/panel/RESET按键.svg" alt="">后置重置按键</span></th><td data-label="短按"><select class="gpio-action" data-stage="short"></select></td><td data-label="长按 3 秒"><select class="gpio-action" data-stage="hold_3s"></select></td><td data-label="长按 9 秒"><select class="gpio-action" data-stage="hold_9s"></select></td><td data-label="长按 15 秒"><select class="gpio-action" data-stage="hold_15s"></select></td></tr>
               </tbody>
             </table>
           </div>
@@ -262,23 +243,43 @@
         <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
       </section>
 
-      <section id="panel-storage" class="tab-panel" role="tabpanel" aria-labelledby="tab-storage" hidden>
-        <section class="panel storage-panel" aria-labelledby="storage-heading">
+      <section id="panel-power" class="tab-panel" role="tabpanel" aria-labelledby="tab-power" hidden>
+        <section class="panel power-panel" aria-labelledby="power-heading">
           <div class="panel-heading">
             <div>
-              <h2 id="storage-heading">硬盘面板</h2>
-              <p>前置仓位按机箱正面从左到右 6 → 1 显示；M.2 按主板槽位 1 → 4 显示。</p>
+              <h2 id="power-heading">功耗模式</h2>
+              <p>根据处理器自动提供节能、标准和性能配置，也可切换到自定义功耗。</p>
             </div>
-            <span id="storage-updated" class="table-meta">等待刷新</span>
+            <label class="toggle"><input id="enabled" type="checkbox"><span></span>启用限制</label>
           </div>
-          <div id="storage-visual" class="storage-visual" aria-label="硬盘机箱槽位图"></div>
-          <div class="table-scroll">
-            <table class="status-table storage-table">
-              <thead><tr><th>仓位</th><th>状态</th><th>活动</th><th>设备</th><th>用途</th><th>健康</th><th>温度</th></tr></thead>
-              <tbody id="storage-body"></tbody>
-            </table>
+          <div id="power-modes" class="power-modes" role="radiogroup" aria-label="功耗模式">
+            <label><input type="radio" name="power-mode" value="saving"><span>节能</span></label>
+            <label><input type="radio" name="power-mode" value="standard"><span>标准</span></label>
+            <label><input type="radio" name="power-mode" value="performance"><span>性能</span></label>
+            <label><input type="radio" name="power-mode" value="custom"><span>自定义</span></label>
           </div>
-          <p id="storage-error" class="inline-status"></p>
+          <div class="power-current"><span>当前 PL1 <b id="current-pl1">—</b></span><span>当前 PL2 <b id="current-pl2">—</b></span></div>
+          <div id="power-custom-fields" class="power-settings">
+            <label><span>PL1 持续功耗</span><div class="input-wrap"><input id="pl1" type="number" step="1" required><b>W</b></div><small id="pl1-range">—</small></label>
+            <label><span>PL2 短时功耗</span><div class="input-wrap"><input id="pl2" type="number" step="1" required><b>W</b></div><small id="pl2-range">—</small></label>
+            <label><span>自动校验间隔</span><div class="input-wrap"><input id="interval" type="number" min="5" max="300" step="1" required><b>秒</b></div><small>系统或休眠恢复覆盖限制后自动重应用</small></label>
+          </div>
+          <p class="notice">预设值始终受当前处理器与 RAPL 硬件上限约束；性能模式不会越过插件识别的安全范围。</p>
+        </section>
+        <div class="actions app-actions"><button id="save-global" type="button" class="primary">保存功耗设置</button><button id="apply-now" type="button">立即重应用</button><button id="restore" type="button" class="danger">恢复安装前配置</button></div>
+        <p id="message-global" class="message" role="status" aria-live="polite"></p>
+      </section>
+
+      <section id="panel-about" class="tab-panel" role="tabpanel" aria-labelledby="tab-about" hidden>
+        <section class="panel about-panel">
+          <div class="about-heading"><img src="images/panel/设备外观图.svg" alt="TAD6S4N"><div><h2>TAD6S4N模块</h2><p>为 TANK TAD6S4N 机型定制，其它硬件目前未做完整适配。</p></div></div>
+          <div class="about-features">
+            <article><h3>监控面板</h3><p>显示主机名称、系统版本、CPU 型号温度、风扇转速，以及硬盘位置、温度、活动和健康状态。</p></article>
+            <article><h3>风扇控制</h3><p>通过 CPU、HDD 和 NVMe 三条温度曲线智能调度散热，并支持按风扇独立选择温度来源。</p></article>
+            <article><h3>按键映射</h3><p>适配前置复制、网络按键和后置 RESET 孔，每个按键支持四种触发时长与自定义 Bash 脚本。</p></article>
+            <article><h3>功耗设置</h3><p>提供节能、标准、性能和自定义功耗模式，直观限制 PL1 与 PL2 功耗墙。</p></article>
+          </div>
+          <p class="notice">风扇功能需要先安装 IT87 驱动。插件开发：<a href="https://mi-d.cn" target="_blank" rel="noopener noreferrer">mi-d.cn</a> · <a href="https://tank-g.taobao.com/" target="_blank" rel="noopener noreferrer">TANK</a></p>
         </section>
       </section>
 

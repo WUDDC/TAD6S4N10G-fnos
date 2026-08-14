@@ -23,7 +23,10 @@ type FanPoint struct {
 
 type FanConfig struct {
 	Enabled        bool       `json:"enabled"`
-	DeviceID       string     `json:"device_id"`
+	DeviceID       string     `json:"device_id,omitempty"`
+	CPUFanIDs      []string   `json:"cpu_fan_ids"`
+	HDDFanIDs      []string   `json:"hdd_fan_ids"`
+	NVMeFanIDs     []string   `json:"nvme_fan_ids"`
 	MinPWMPercent  int        `json:"min_pwm_percent"`
 	EmergencyTempC float64    `json:"emergency_temp_c"`
 	PollSeconds    int        `json:"poll_seconds"`
@@ -48,14 +51,15 @@ type FanDevice struct {
 }
 
 type FanStatus struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Channel    int    `json:"channel"`
-	RPM        int64  `json:"rpm"`
-	PWM        int64  `json:"pwm"`
-	PWMPercent int    `json:"pwm_percent"`
-	Mode       int64  `json:"mode"`
-	Selected   bool   `json:"selected"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Channel        int      `json:"channel"`
+	RPM            int64    `json:"rpm"`
+	PWM            int64    `json:"pwm"`
+	PWMPercent     int      `json:"pwm_percent"`
+	Mode           int64    `json:"mode"`
+	Selected       bool     `json:"selected"`
+	ControlSources []string `json:"control_sources,omitempty"`
 }
 
 type FanControlStatus struct {
@@ -134,9 +138,15 @@ func normalizeConfig(cfg *Config) bool {
 	if cfg.Fan.Curve == nil {
 		enabled := cfg.Fan.Enabled
 		deviceID := cfg.Fan.DeviceID
+		cpuFanIDs := append([]string(nil), cfg.Fan.CPUFanIDs...)
+		hddFanIDs := append([]string(nil), cfg.Fan.HDDFanIDs...)
+		nvmeFanIDs := append([]string(nil), cfg.Fan.NVMeFanIDs...)
 		cfg.Fan = DefaultFanConfig()
 		cfg.Fan.Enabled = enabled
 		cfg.Fan.DeviceID = deviceID
+		cfg.Fan.CPUFanIDs = cpuFanIDs
+		cfg.Fan.HDDFanIDs = hddFanIDs
+		cfg.Fan.NVMeFanIDs = nvmeFanIDs
 		changed = true
 	}
 	if cfg.Fan.HDDCurve == nil {
@@ -163,11 +173,56 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.Fan.DiskCurve = nil
 		changed = true
 	}
+	if normalizeFanSelections(&cfg.Fan) {
+		changed = true
+	}
 	if cfg.GPIO.Version == 0 {
 		cfg.GPIO = DefaultGPIOConfig()
 		changed = true
 	}
 	return changed
+}
+
+func normalizeFanSelections(cfg *FanConfig) bool {
+	changed := false
+	if cfg.DeviceID != "" && cfg.CPUFanIDs == nil && cfg.HDDFanIDs == nil && cfg.NVMeFanIDs == nil {
+		cfg.CPUFanIDs = []string{cfg.DeviceID}
+		cfg.HDDFanIDs = []string{cfg.DeviceID}
+		cfg.NVMeFanIDs = []string{cfg.DeviceID}
+		changed = true
+	}
+	for _, ids := range []*[]string{&cfg.CPUFanIDs, &cfg.HDDFanIDs, &cfg.NVMeFanIDs} {
+		normalized := uniqueNonEmpty(*ids)
+		if len(normalized) != len(*ids) {
+			changed = true
+		}
+		*ids = normalized
+	}
+	return changed
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
+}
+
+func selectedFanSources(cfg FanConfig) map[string][]string {
+	result := make(map[string][]string)
+	for source, ids := range map[string][]string{"cpu": cfg.CPUFanIDs, "hdd": cfg.HDDFanIDs, "nvme": cfg.NVMeFanIDs} {
+		for _, id := range ids {
+			result[id] = append(result[id], source)
+		}
+	}
+	return result
 }
 
 func (m *Manager) validateFanLocked(cfg FanConfig) error {
@@ -198,22 +253,28 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if !cfg.Enabled {
 		return nil
 	}
-	if cfg.DeviceID == "" {
-		return errors.New("fan device_id is required when fan control is enabled")
+	selected := selectedFanSources(cfg)
+	if len(selected) == 0 {
+		return errors.New("at least one fan must be selected when fan control is enabled")
 	}
 	fans, err := m.DiscoverFans()
 	if err != nil {
 		return err
 	}
+	available := make(map[string]FanDevice, len(fans))
 	for _, fan := range fans {
-		if fan.ID == cfg.DeviceID {
-			if fan.RPM <= 0 {
-				return fmt.Errorf("fan %s reports no valid RPM and cannot be controlled safely", fan.ID)
-			}
-			return nil
+		available[fan.ID] = fan
+	}
+	for id := range selected {
+		fan, ok := available[id]
+		if !ok {
+			return fmt.Errorf("configured fan %s was not found", id)
+		}
+		if fan.RPM <= 0 {
+			return fmt.Errorf("fan %s reports no valid RPM and cannot be controlled safely", fan.ID)
 		}
 	}
-	return fmt.Errorf("configured fan %s was not found", cfg.DeviceID)
+	return nil
 }
 
 func validateFanSlotIDs(name, kind string, ids []string) error {
@@ -366,39 +427,82 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	if err != nil {
 		return err
 	}
-	var selected *FanDevice
-	for i := range fans {
-		if fans[i].ID == cfg.DeviceID {
-			selected = &fans[i]
-			break
+	selected := selectedFanSources(cfg)
+	byID := make(map[string]FanDevice, len(fans))
+	for _, fan := range fans {
+		byID[fan.ID] = fan
+	}
+	for id := range selected {
+		fan, ok := byID[id]
+		if !ok {
+			return fmt.Errorf("configured fan %s was not found", id)
+		}
+		if err := m.captureOriginalFanLocked(fan); err != nil {
+			return err
 		}
 	}
-	if selected == nil {
-		return fmt.Errorf("configured fan %s was not found", cfg.DeviceID)
-	}
-	if err := m.captureOriginalFanLocked(*selected); err != nil {
-		return err
-	}
-	if selected.RPM <= 0 {
-		failSafeErr := setFanPWM(*selected, 100)
-		return errors.Join(fmt.Errorf("fan %s reports no valid RPM", selected.ID), failSafeErr)
-	}
-	temperature, tempErr := m.controlTemperature()
-	if tempErr != nil {
-		failSafeErr := setFanPWM(*selected, 100)
-		return errors.Join(fmt.Errorf("temperature sensor failed; fan forced to full speed: %w", tempErr), failSafeErr)
-	}
+
+	cpuTemperature, cpuErr := m.controlTemperature()
 	storage := m.StorageStatus()
 	hddTemperature, hddAvailable := maximumStorageTemperature(storage, "front", cfg.HDDSlotIDs)
 	nvmeTemperature, nvmeAvailable := maximumStorageTemperature(storage, "m2", cfg.NVMeSlotIDs)
-	_, _, _, target := fanTargets(cfg, temperature, hddTemperature, hddAvailable, nvmeTemperature, nvmeAvailable)
-	if err := setFanPWM(*selected, target); err != nil {
-		failSafeErr := setFanPWM(*selected, 100)
-		return errors.Join(fmt.Errorf("set fan %s to %d%%: %w", selected.ID, target, err), failSafeErr)
+	cpuTarget := 0
+	if cpuErr == nil {
+		cpuTarget = interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	}
+	hddTarget := 0
+	if hddAvailable {
+		hddTarget = interpolatePWMPercent(cfg.HDDCurve, hddTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	}
+	nvmeTarget := 0
+	if nvmeAvailable {
+		nvmeTarget = interpolatePWMPercent(cfg.NVMeCurve, nvmeTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+	}
+	emergency := (len(cfg.CPUFanIDs) > 0 && cpuErr == nil && cpuTemperature >= cfg.EmergencyTempC) ||
+		(len(cfg.HDDFanIDs) > 0 && hddAvailable && hddTemperature >= cfg.EmergencyTempC) ||
+		(len(cfg.NVMeFanIDs) > 0 && nvmeAvailable && nvmeTemperature >= cfg.EmergencyTempC)
+
+	lastTarget := 0
+	var errs []error
+	for id, sources := range selected {
+		fan := byID[id]
+		if fan.RPM <= 0 {
+			errs = append(errs, fmt.Errorf("fan %s reports no valid RPM", id), setFanPWM(fan, 100))
+			continue
+		}
+		target := 0
+		if emergency {
+			target = 100
+		} else {
+			for _, source := range sources {
+				switch source {
+				case "cpu":
+					target = max(target, cpuTarget)
+				case "hdd":
+					target = max(target, hddTarget)
+				case "nvme":
+					target = max(target, nvmeTarget)
+				}
+			}
+		}
+		if target == 0 {
+			target = 100
+			errs = append(errs, fmt.Errorf("no selected temperature source is available for fan %s; forced to full speed", id))
+		}
+		if err := setFanPWM(fan, target); err != nil {
+			errs = append(errs, fmt.Errorf("set fan %s to %d%%: %w", id, target, err), setFanPWM(fan, 100))
+			continue
+		}
+		lastTarget = max(lastTarget, target)
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
 	}
 	m.fanLastApply = time.Now()
-	m.fanLastTarget = target
-	m.fanLastTemp = temperature
+	m.fanLastTarget = lastTarget
+	if cpuErr == nil {
+		m.fanLastTemp = cpuTemperature
+	}
 	return nil
 }
 
@@ -671,19 +775,21 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 		result.LastError = combineError(result.LastError, err)
 		return result
 	}
+	selected := selectedFanSources(cfg)
 	for _, fan := range fans {
 		if fan.RPM > 0 {
 			result.Available = true
 		}
 		result.Fans = append(result.Fans, FanStatus{
-			ID:         fan.ID,
-			Name:       fan.Name,
-			Channel:    fan.Channel,
-			RPM:        fan.RPM,
-			PWM:        fan.PWM,
-			PWMPercent: pwmToPercent(fan.PWM),
-			Mode:       fan.Mode,
-			Selected:   fan.ID == cfg.DeviceID,
+			ID:             fan.ID,
+			Name:           fan.Name,
+			Channel:        fan.Channel,
+			RPM:            fan.RPM,
+			PWM:            fan.PWM,
+			PWMPercent:     pwmToPercent(fan.PWM),
+			Mode:           fan.Mode,
+			Selected:       len(selected[fan.ID]) > 0,
+			ControlSources: append([]string(nil), selected[fan.ID]...),
 		})
 	}
 	if temperature, err := m.controlTemperature(); err == nil {
