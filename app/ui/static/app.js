@@ -218,6 +218,11 @@ function initializeStorageVisual() {
   STORAGE_VISUAL_GROUPS.forEach((group) => {
     const figure = document.createElement('figure');
     figure.className = `storage-visual-group storage-visual-${group.kind}`;
+    if (group.kind === 'm2') {
+      const caption = document.createElement('figcaption');
+      caption.textContent = '内置 M.2 插槽';
+      figure.append(caption);
+    }
     const frame = document.createElement('div');
     frame.className = 'storage-visual-frame';
     const base = document.createElement('img');
@@ -1060,15 +1065,17 @@ function renderFanRPMs(fanStatus = {}) {
   if (existing.map((item) => item.dataset.fanId).join('|') !== fans.map((fan) => fan.id).join('|')) {
     target.replaceChildren();
     fans.forEach((fan) => {
-      const item = document.createElement('strong');
+      const item = document.createElement('p');
       item.dataset.fanId = fan.id;
+      item.append(document.createElement('span'), document.createElement('strong'));
       target.append(item);
     });
     if (!fans.length) target.innerHTML = '<strong id="fan-rpm">不可用</strong>';
   }
   fans.forEach((fan) => {
     const item = target.querySelector(`[data-fan-id="${fan.id}"]`);
-    item.textContent = `FAN${fan.channel}  ${fan.rpm} RPM`;
+    item.querySelector('span').textContent = `FAN${fan.channel}`;
+    item.querySelector('strong').textContent = `${fan.rpm} RPM`;
   });
 }
 
