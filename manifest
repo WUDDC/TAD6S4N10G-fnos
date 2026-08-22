@@ -1,7 +1,7 @@
 appname=tad-module
-version=0.9.1
+version=0.10.0
 display_name=TAD6S4N模块
-desc=面向 TAD6S4N10G 的温度、功耗、CPU/HDD/NVMe 三曲线风扇、硬盘面板与 GPIO 按键管理模块。
+desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
 platform=x86
 arch=x86_64
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=重构 fnOS 原生风格界面；恢复独立 GitHub、检查更新和条件更新按钮；曲线自适应面板宽度，并提高硬盘面板对设计图的还原度。
+changelog=新增脱敏调试报告接口与调试页面，可生成、复制、下载报告并跳转 GitHub Issue；修复健康提示框的横向布局与鼠标锚定交互。

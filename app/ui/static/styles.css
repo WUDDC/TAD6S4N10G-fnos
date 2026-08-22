@@ -107,6 +107,16 @@ button, input, select, textarea { font: inherit; }
   opacity: .72;
 }
 
+.debug-tab-icon {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  width: 16px;
+  height: 16px;
+  color: currentColor;
+  font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 .app-tabs button[aria-selected="true"] {
   color: var(--primary);
   background: #fff;
@@ -205,12 +215,14 @@ input:focus-visible,
 .health-summary .badge { cursor: help; }
 
 .health-tooltip {
-  position: absolute;
-  z-index: 30;
-  right: 0;
-  bottom: calc(100% + 8px);
-  left: 0;
-  width: auto;
+  position: fixed;
+  z-index: 110;
+  right: auto;
+  bottom: 16px;
+  left: 160px;
+  width: min(360px, calc(100vw - 176px));
+  max-height: calc(100vh - 32px);
+  overflow: auto;
   padding: 10px 12px;
   border: 1px solid #e2e5ea;
   border-radius: 8px;
@@ -220,11 +232,13 @@ input:focus-visible,
   font-size: 12px;
   line-height: 1.6;
   white-space: pre-line;
+  overflow-wrap: anywhere;
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
 }
 
+.health-tooltip.visible,
 .health-summary:hover .health-tooltip,
 .health-summary:focus-within .health-tooltip {
   opacity: 1;
@@ -1110,6 +1124,26 @@ small {
 .about-panel a { color: var(--primary); text-decoration: none; }
 .about-panel a:hover { text-decoration: underline; text-underline-offset: 3px; }
 
+.debug-actions { margin-bottom: 10px; }
+.debug-report-meta { min-height: 17px; margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.debug-report {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  min-height: 360px;
+  padding: 12px 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  resize: vertical;
+  outline: 0;
+  color: #303641;
+  background: #f8f9fb;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  white-space: pre;
+  overflow: auto;
+}
+.debug-report:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52, 120, 246, .12); }
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -1279,6 +1313,14 @@ button.danger {
     overflow: hidden;
   }
   .sidebar-meta .health-summary { margin-left: auto; }
+  .health-tooltip {
+    top: 156px;
+    right: 12px;
+    bottom: auto;
+    left: 12px;
+    width: auto;
+    max-height: calc(100vh - 168px);
+  }
   .tab-form { padding: 10px; }
   .overview-grid,
   .device-stats,
@@ -1299,4 +1341,7 @@ button.danger {
   .startup-warning-actions { justify-content: flex-end; width: 100%; }
   button.danger { margin-left: 0; }
   .about-heading { flex-direction: column; align-items: flex-start; }
+  .debug-actions { flex-direction: row; align-items: stretch; }
+  .debug-actions button { flex: 1 1 calc(50% - 8px); min-width: 0; }
+  .debug-report { min-height: 280px; }
 }

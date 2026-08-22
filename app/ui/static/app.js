@@ -77,6 +77,7 @@ let gpioScripts = [];
 let gpioEditingScriptID = '';
 let storageVisualReady = false;
 let fanSelectorSignature = null;
+let debugReportText = '';
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -740,6 +741,46 @@ function setupTabs() {
   });
 }
 
+function setupHealthTooltip() {
+  const summary = document.querySelector('.health-summary');
+  const badge = $('health');
+  const tooltip = $('health-tooltip');
+  const show = () => tooltip.classList.add('visible');
+  const hide = () => tooltip.classList.remove('visible');
+  const place = (clientX, clientY) => {
+    const gap = 14;
+    const margin = 8;
+    const rect = tooltip.getBoundingClientRect();
+    let left = clientX + gap;
+    if (left + rect.width > window.innerWidth - margin) left = clientX - rect.width - gap;
+    const top = Math.min(
+      Math.max(margin, clientY - rect.height / 2),
+      Math.max(margin, window.innerHeight - rect.height - margin),
+    );
+    tooltip.style.right = 'auto';
+    tooltip.style.bottom = 'auto';
+    tooltip.style.left = `${Math.max(margin, left)}px`;
+    tooltip.style.top = `${top}px`;
+  };
+  summary.addEventListener('mouseenter', (event) => {
+    show();
+    place(event.clientX, event.clientY);
+  });
+  summary.addEventListener('mousemove', (event) => {
+    show();
+    place(event.clientX, event.clientY);
+  });
+  summary.addEventListener('mouseleave', hide);
+  summary.addEventListener('focusin', () => {
+    show();
+    const rect = badge.getBoundingClientRect();
+    place(rect.right, rect.top + rect.height / 2);
+  });
+  summary.addEventListener('focusout', (event) => {
+    if (!summary.contains(event.relatedTarget)) hide();
+  });
+}
+
 function updateGPIOEnabledState() {
   const enabled = $('gpio-enabled').checked;
   document.querySelectorAll('.gpio-action').forEach((select) => { select.disabled = !enabled; });
@@ -1154,9 +1195,11 @@ function render(status, keepInputs = false) {
   const healthy = issues.length === 0;
   $('health').textContent = healthy ? '运行正常' : '需要检查';
   $('health').className = `badge ${healthy ? 'ok' : 'error'}`;
-  $('health-tooltip').textContent = healthy
+  const healthMessage = healthy
     ? '未发现需要处理的异常。'
     : `需要检查以下项目：\n${issues.map((issue) => `• ${issue}`).join('\n')}`;
+  $('health-tooltip').textContent = healthMessage;
+  $('health').title = healthMessage;
 
   const profile = status.profile || {};
   const maxPL1 = status.effective_max_pl1_w || profile.max_pl1_w || 0;
@@ -1186,10 +1229,110 @@ function showMessage(message, error = false, targetID = 'message-global') {
   target.className = `message${error ? ' error' : ''}`;
 }
 
+function setDebugStatus(message, error = false) {
+  const target = $('debug-status');
+  target.textContent = message;
+  target.className = `message${error ? ' error' : ''}`;
+}
+
+function formatDebugReport(payload) {
+  const generatedAt = new Date().toISOString();
+  let serialized;
+  try {
+    serialized = JSON.stringify(payload, null, 2);
+  } catch (error) {
+    throw new Error(`报告格式化失败：${error.message}`);
+  }
+  return `# TAD6S4N10G 调试报告\n\n生成时间：${generatedAt}\n\n以下内容由 GET api/debug/report 返回，用于协助定位模块问题。请在公开发布前检查是否包含敏感信息。\n\n## 接口报告\n\n\`\`\`json\n${serialized}\n\`\`\``;
+}
+
+function updateDebugReportActions(enabled) {
+  ['debug-copy-report', 'debug-download-report', 'debug-open-issue'].forEach((id) => { $(id).disabled = !enabled; });
+}
+
+async function generateDebugReport() {
+  const button = $('debug-generate-report');
+  button.disabled = true;
+  setDebugStatus('正在生成调试报告…');
+  try {
+    const payload = await request('api/debug/report');
+    const text = formatDebugReport(payload);
+    debugReportText = text;
+    $('debug-report').value = text;
+    $('debug-report-meta').textContent = `已生成 · ${text.length.toLocaleString()} 字符 · ${new Date().toLocaleString()}`;
+    updateDebugReportActions(true);
+    setDebugStatus('调试报告已生成，可复制、下载或打开 GitHub Issue。');
+  } catch (error) {
+    setDebugStatus(`生成失败：${error.message}`, true);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function copyDebugReport() {
+  if (!debugReportText) return;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(debugReportText);
+      setDebugStatus('报告已复制到剪贴板。');
+      return;
+    }
+    throw new Error('Clipboard API 不可用');
+  } catch (error) {
+    const helper = document.createElement('textarea');
+    helper.value = debugReportText;
+    helper.setAttribute('readonly', '');
+    helper.style.position = 'fixed';
+    helper.style.opacity = '0';
+    document.body.append(helper);
+    helper.select();
+    let copied = false;
+    try { copied = document.execCommand('copy'); } catch (copyError) { copied = false; }
+    helper.remove();
+    if (copied) {
+      setDebugStatus('报告已复制到剪贴板。');
+      return;
+    }
+    $('debug-report').focus();
+    $('debug-report').select();
+    setDebugStatus('自动复制失败，报告已选中，请按 Ctrl+C 手动复制。', true);
+  }
+}
+
+function downloadDebugReport() {
+  if (!debugReportText) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const blob = new Blob([debugReportText], { type: 'text/plain;charset=utf-8' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = `tad-module-debug-report-${stamp}.txt`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(link.href);
+  setDebugStatus('报告下载已开始。');
+}
+
+function openDebugIssue() {
+  if (!debugReportText) return;
+  const base = 'https://github.com/luodaoyi/TAD6S4N10G-fnos/issues/new';
+  const title = 'TAD6S4N10G 模块问题反馈';
+  const body = `请描述问题现象、复现步骤和预期结果。\n\n调试报告：\n\n${debugReportText}`;
+  const issueURL = `${base}?${new URLSearchParams({ title, body }).toString()}`;
+  if (issueURL.length > 1900) {
+    window.open(base, '_blank', 'noopener,noreferrer');
+    setDebugStatus('报告内容过长，已打开基础 Issue 页面；请先复制报告再粘贴。', true);
+    return;
+  }
+  window.open(issueURL, '_blank', 'noopener,noreferrer');
+  setDebugStatus('已打开 GitHub Issue 草稿，请检查内容后手动提交。');
+}
+
 function setBusy(busy) {
   uiBusy = busy;
   $('config-form').classList.toggle('busy', busy);
   document.querySelectorAll('button').forEach((button) => { button.disabled = busy; });
+  if (!busy) updateDebugReportActions(Boolean(debugReportText));
   CURVE_KINDS.forEach(updateCurveControls);
 }
 
@@ -1406,12 +1549,17 @@ $('config-form').addEventListener('invalid', (event) => {
   if (tabID) activateTab(tabID);
 }, true);
 setupTabs();
+setupHealthTooltip();
 setupFanSlotSelectors();
 setupGPIOActions();
 document.querySelectorAll('input[name="power-mode"]').forEach((input) => {
   input.addEventListener('change', () => updatePowerMode(input.value, true));
 });
 $('check-updates').addEventListener('click', checkForUpdates);
+$('debug-generate-report').addEventListener('click', generateDebugReport);
+$('debug-copy-report').addEventListener('click', copyDebugReport);
+$('debug-download-report').addEventListener('click', downloadDebugReport);
+$('debug-open-issue').addEventListener('click', openDebugIssue);
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);

@@ -43,6 +43,7 @@ type StorageSlot struct {
 	Health       string  `json:"health,omitempty"`
 	TemperatureC float64 `json:"temperature_c,omitempty"`
 	Warning      string  `json:"warning,omitempty"`
+	SMARTError   string  `json:"-"`
 }
 
 type StorageStatus struct {
@@ -212,6 +213,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		result, err := readSMART(smartctl, slot.Device, slot.Kind == "front", forceSMART)
 		if err != nil {
 			slot.Health = "未读取"
+			slot.SMARTError = err.Error()
 			continue
 		}
 		slot.TemperatureC = result.TemperatureC

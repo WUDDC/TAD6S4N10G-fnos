@@ -79,6 +79,7 @@ func (s *Server) ListenAndServe() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/debug/report", s.handleDebugReport)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/api/config/fan", s.handleFanConfig)

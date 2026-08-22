@@ -15,6 +15,7 @@
           <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><img src="images/panel/风扇控制图标.svg" alt="">风扇控制</button>
           <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
           <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
+          <button id="tab-debug" type="button" role="tab" aria-selected="false" aria-controls="panel-debug" tabindex="-1"><span class="debug-tab-icon" aria-hidden="true">&lt;/&gt;</span>调试</button>
           <button id="tab-about" type="button" role="tab" aria-selected="false" aria-controls="panel-about" tabindex="-1"><img src="images/panel/关于我们图标.svg" alt="">关于</button>
         </nav>
         <section class="sidebar-meta" aria-label="插件信息">
@@ -286,6 +287,26 @@
             <button id="restore" type="button" class="danger">恢复安装前配置</button>
           </div>
           <p id="message-global" class="message" role="status" aria-live="polite"></p>
+        </section>
+
+        <section id="panel-debug" class="tab-panel" role="tabpanel" aria-labelledby="tab-debug" hidden>
+          <section class="card debug-panel" aria-labelledby="debug-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="debug-heading">调试报告</h2>
+                <p>生成可供排查问题使用的模块诊断报告。报告仅来自调试接口，不包含当前页面状态序列化。</p>
+              </div>
+            </div>
+            <div class="actions debug-actions">
+              <button id="debug-generate-report" type="button" class="primary">生成调试报告</button>
+              <button id="debug-copy-report" type="button" disabled>复制报告</button>
+              <button id="debug-download-report" type="button" disabled>下载报告</button>
+              <button id="debug-open-issue" type="button" disabled>打开 GitHub Issue</button>
+            </div>
+            <p id="debug-report-meta" class="debug-report-meta">尚未生成报告</p>
+            <textarea id="debug-report" class="debug-report" readonly spellcheck="false" aria-label="调试报告内容" placeholder="点击“生成调试报告”获取报告"></textarea>
+            <p id="debug-status" class="message" role="status" aria-live="polite">可以生成一份新的调试报告。</p>
+          </section>
         </section>
 
         <section id="panel-about" class="tab-panel" role="tabpanel" aria-labelledby="tab-about" hidden>
