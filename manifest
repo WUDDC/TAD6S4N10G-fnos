@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.0
+version=0.10.1
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=新增脱敏调试报告接口与调试页面，可生成、复制、下载报告并跳转 GitHub Issue；修复健康提示框的横向布局与鼠标锚定交互。
+changelog=识别 smartctl -n standby 在 STANDBY/SLEEP 时写入 messages 的休眠盘电源模式，避免把待机/休眠 SATA 盘误判为未知状态；readSMART 仍按退出码 2 消费 JSON。
