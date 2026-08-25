@@ -3,7 +3,9 @@ package powerguard
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestStorageSlotMappingMatchesTAD6S4N10G(t *testing.T) {
@@ -119,30 +121,103 @@ func TestParseSMARTIgnoresUnrelatedMessages(t *testing.T) {
 	}
 }
 
-func TestReadBlockActivityUsesInflightIO(t *testing.T) {
+func writeBlockStat(t *testing.T, path, line string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func resetBlockIOStates() {
+	blockIOStates = sync.Map{}
+}
+
+func TestReadBlockActivityClassifiesWorkingAndStuckIO(t *testing.T) {
+	resetBlockIOStates()
 	root := t.TempDir()
 	statPath := filepath.Join(root, "sys", "class", "block", "sda", "stat")
 	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	manager := &Manager{Root: root}
-	if err := os.WriteFile(statPath, []byte("1 0 8 2 3 0 9 4 1 0 0\n"), 0o644); err != nil {
+
+	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 1 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityWorking {
+		t.Fatalf("first in-flight sample: got %q, want working", got)
+	}
+
+	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 0 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityIdle {
+		t.Fatalf("no progress and no in-flight: got %q, want idle", got)
+	}
+
+	writeBlockStat(t, statPath, "2 0 8 12 3 0 9 14 0 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityWorking {
+		t.Fatalf("completed I/O with normal await: got %q, want working", got)
+	}
+
+	writeBlockStat(t, statPath, "2 0 8 12 3 0 9 14 2 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityWorking {
+		t.Fatalf("first stalled sample: got %q, want working", got)
+	}
+	writeBlockStat(t, statPath, "2 0 8 12 3 0 9 14 2 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityBusy {
+		t.Fatalf("second stalled sample: got %q, want busy", got)
+	}
+
+	writeBlockStat(t, statPath, "3 0 8 2012 3 0 9 14 0 0 0\n")
+	if got, _ := manager.readBlockActivity("sda", "front"); got != StorageActivityBusy {
+		t.Fatalf("HDD await 2000ms: got %q, want busy", got)
+	}
+}
+
+func TestReadBlockActivityNVMeAwaitThreshold(t *testing.T) {
+	resetBlockIOStates()
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "nvme0n1", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.readBlockActivity("sda"); got != StorageActivityBusy {
-		t.Fatalf("got %q, want busy", got)
+	manager := &Manager{Root: root}
+	writeBlockStat(t, statPath, "1 0 8 1 0 0 0 0 0 0 0\n")
+	if got, _ := manager.readBlockActivity("nvme0n1", "m2"); got != StorageActivityIdle {
+		t.Fatalf("first idle sample: got %q, want idle", got)
 	}
-	if err := os.WriteFile(statPath, []byte("1 0 8 2 3 0 9 4 0 0 0\n"), 0o644); err != nil {
+	writeBlockStat(t, statPath, "2 0 8 21 0 0 0 0 0 0 0\n")
+	if got, _ := manager.readBlockActivity("nvme0n1", "m2"); got != StorageActivityWorking {
+		t.Fatalf("NVMe await 20ms: got %q, want working", got)
+	}
+	writeBlockStat(t, statPath, "3 0 8 221 0 0 0 0 0 0 0\n")
+	if got, _ := manager.readBlockActivity("nvme0n1", "m2"); got != StorageActivityBusy {
+		t.Fatalf("NVMe await 200ms: got %q, want busy", got)
+	}
+}
+
+func TestReadBlockActivityUtilizationMatchesDiskstatsUtil(t *testing.T) {
+	resetBlockIOStates()
+	root := t.TempDir()
+	statPath := filepath.Join(root, "sys", "class", "block", "sda", "stat")
+	if err := os.MkdirAll(filepath.Dir(statPath), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.readBlockActivity("sda"); got != StorageActivityIdle {
-		t.Fatalf("got %q, want idle", got)
+	manager := &Manager{Root: root}
+	writeBlockStat(t, statPath, "1 0 8 2 3 0 9 4 0 100 0\n")
+	if _, util := manager.readBlockActivity("sda", "front"); util != nil {
+		t.Fatalf("first sample should not have utilization, got %v", *util)
 	}
-	if err := os.WriteFile(statPath, []byte("2 0 8 2 3 0 9 4 0 0 0\n"), 0o644); err != nil {
-		t.Fatal(err)
+	sample, ok := loadBlockIO("sda")
+	if !ok {
+		t.Fatal("missing first sample")
 	}
-	if got := manager.readBlockActivity("sda"); got != StorageActivityBusy {
-		t.Fatalf("got %q after I/O counter changed, want busy", got)
+	sample.SampledAt = sample.SampledAt.Add(-time.Second)
+	storeBlockIO("sda", sample)
+	writeBlockStat(t, statPath, "2 0 8 12 4 0 9 14 0 830 0\n")
+	_, util := manager.readBlockActivity("sda", "front")
+	if util == nil {
+		t.Fatal("expected utilization")
+	}
+	if *util < 72 || *util > 74 {
+		t.Fatalf("utilization = %.1f, want about 73", *util)
 	}
 }
 

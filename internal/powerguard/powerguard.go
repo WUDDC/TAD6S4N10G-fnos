@@ -163,7 +163,6 @@ type Manager struct {
 	storageMu     sync.RWMutex
 	storageScanMu sync.Mutex
 	storageStatus StorageStatus
-	storageIO     map[string]blockIOSample
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
 }

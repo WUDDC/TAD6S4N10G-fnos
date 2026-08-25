@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,27 +24,33 @@ const (
 	StorageUnknown = "unknown"
 
 	StorageActivityBusy     = "busy"
+	StorageActivityWorking  = "working"
 	StorageActivityIdle     = "idle"
 	StorageActivitySleeping = "sleeping"
 	StorageActivityUnknown  = "unknown"
+
+	storageIOStallSamples  = 2
+	storageHDDBusyAwaitMS  = 1000
+	storageNVMeBusyAwaitMS = 100
 )
 
 type StorageSlot struct {
-	ID           string  `json:"id"`
-	Kind         string  `json:"kind"`
-	Slot         int     `json:"slot"`
-	State        string  `json:"state"`
-	Activity     string  `json:"activity,omitempty"`
-	BusPath      string  `json:"bus_path"`
-	Device       string  `json:"device,omitempty"`
-	Model        string  `json:"model,omitempty"`
-	Serial       string  `json:"serial,omitempty"`
-	SizeBytes    int64   `json:"size_bytes,omitempty"`
-	Purpose      string  `json:"purpose,omitempty"`
-	Health       string  `json:"health,omitempty"`
-	TemperatureC float64 `json:"temperature_c,omitempty"`
-	Warning      string  `json:"warning,omitempty"`
-	SMARTError   string  `json:"-"`
+	ID           string   `json:"id"`
+	Kind         string   `json:"kind"`
+	Slot         int      `json:"slot"`
+	State        string   `json:"state"`
+	Activity     string   `json:"activity,omitempty"`
+	Utilization  *float64 `json:"utilization_percent,omitempty"`
+	BusPath      string   `json:"bus_path"`
+	Device       string   `json:"device,omitempty"`
+	Model        string   `json:"model,omitempty"`
+	Serial       string   `json:"serial,omitempty"`
+	SizeBytes    int64    `json:"size_bytes,omitempty"`
+	Purpose      string   `json:"purpose,omitempty"`
+	Health       string   `json:"health,omitempty"`
+	TemperatureC float64  `json:"temperature_c,omitempty"`
+	Warning      string   `json:"warning,omitempty"`
+	SMARTError   string   `json:"-"`
 }
 
 type StorageStatus struct {
@@ -107,10 +114,19 @@ type smartResult struct {
 }
 
 type blockIOSample struct {
-	Reads    uint64
-	Writes   uint64
-	InFlight uint64
+	Reads      uint64
+	Writes     uint64
+	ReadTicks  uint64
+	WriteTicks uint64
+	IOTicks    uint64
+	InFlight   uint64
+	StallCount int
+	SampledAt  time.Time
+	Util       float64
+	HasUtil    bool
 }
+
+var blockIOStates sync.Map
 
 func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 	m.storageScanMu.Lock()
@@ -123,9 +139,10 @@ func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 }
 
 func (m *Manager) StorageStatus() StorageStatus {
+	m.RefreshStorageActivity()
 	m.storageMu.RLock()
+	defer m.storageMu.RUnlock()
 	status := cloneStorageStatus(m.storageStatus)
-	m.storageMu.RUnlock()
 	if len(status.Slots) != 0 {
 		return status
 	}
@@ -137,6 +154,18 @@ func (m *Manager) StorageStatus() StorageStatus {
 		})
 	}
 	return status
+}
+
+func (m *Manager) RefreshStorageActivity() {
+	m.storageMu.Lock()
+	defer m.storageMu.Unlock()
+	for index := range m.storageStatus.Slots {
+		slot := &m.storageStatus.Slots[index]
+		if slot.Device == "" || slot.State == StorageEmpty || slot.Activity == StorageActivitySleeping {
+			continue
+		}
+		slot.Activity, slot.Utilization = m.readBlockActivity(filepath.Base(slot.Device), slot.Kind)
+	}
 }
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
@@ -192,7 +221,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 			slot.State = StorageUsed
 		}
 		slot.Purpose = strings.Join(info.Purposes, "、")
-		slot.Activity = m.readBlockActivity(kname)
+		slot.Activity, slot.Utilization = m.readBlockActivity(kname, spec.Kind)
 		if warning := m.mdWarning(info.Purposes); warning != "" {
 			slot.State = StorageWarning
 			slot.Warning = warning
@@ -219,6 +248,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		slot.TemperatureC = result.TemperatureC
 		if powerModeIsSleeping(result.PowerMode) {
 			slot.Activity = StorageActivitySleeping
+			slot.Utilization = nil
 		}
 		slot.Health = "正常"
 		var warnings []string
@@ -361,31 +391,102 @@ func (m *Manager) readBlockInfoFromSysfs(kname string) blockInfo {
 	return info
 }
 
-func (m *Manager) readBlockActivity(kname string) string {
+func storageBusyAwaitMS(kind string) uint64 {
+	if kind == "m2" {
+		return storageNVMeBusyAwaitMS
+	}
+	return storageHDDBusyAwaitMS
+}
+
+func storageUtilization(previous, sample blockIOSample) *float64 {
+	elapsedMS := sample.SampledAt.Sub(previous.SampledAt).Milliseconds()
+	if elapsedMS <= 0 || sample.IOTicks < previous.IOTicks {
+		return nil
+	}
+	util := float64(sample.IOTicks-previous.IOTicks) / float64(elapsedMS) * 100
+	if util < 0 {
+		util = 0
+	}
+	if util > 100 {
+		util = 100
+	}
+	return &util
+}
+
+func loadBlockIO(kname string) (blockIOSample, bool) {
+	value, ok := blockIOStates.Load(kname)
+	if !ok {
+		return blockIOSample{}, false
+	}
+	sample, ok := value.(blockIOSample)
+	return sample, ok
+}
+
+func storeBlockIO(kname string, sample blockIOSample) {
+	blockIOStates.Store(kname, sample)
+}
+
+func utilizationPointer(sample blockIOSample) *float64 {
+	if !sample.HasUtil {
+		return nil
+	}
+	value := sample.Util
+	return &value
+}
+
+func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
 	data, err := os.ReadFile(filepath.Join(m.rooted("/sys/class/block"), kname, "stat"))
 	if err != nil {
-		return StorageActivityUnknown
+		return StorageActivityUnknown, nil
 	}
 	fields := strings.Fields(string(data))
-	if len(fields) < 9 {
-		return StorageActivityUnknown
+	if len(fields) < 10 {
+		return StorageActivityUnknown, nil
 	}
 	reads, readErr := strconv.ParseUint(fields[0], 10, 64)
 	writes, writeErr := strconv.ParseUint(fields[4], 10, 64)
+	readTicks, readTickErr := strconv.ParseUint(fields[3], 10, 64)
+	writeTicks, writeTickErr := strconv.ParseUint(fields[7], 10, 64)
 	inFlight, flightErr := strconv.ParseUint(fields[8], 10, 64)
-	if readErr != nil || writeErr != nil || flightErr != nil {
-		return StorageActivityUnknown
+	ioTicks, ioTickErr := strconv.ParseUint(fields[9], 10, 64)
+	if readErr != nil || writeErr != nil || readTickErr != nil || writeTickErr != nil || flightErr != nil || ioTickErr != nil {
+		return StorageActivityUnknown, nil
 	}
-	sample := blockIOSample{Reads: reads, Writes: writes, InFlight: inFlight}
-	if m.storageIO == nil {
-		m.storageIO = make(map[string]blockIOSample)
+	sample := blockIOSample{
+		Reads: reads, Writes: writes, ReadTicks: readTicks, WriteTicks: writeTicks,
+		IOTicks: ioTicks, InFlight: inFlight, SampledAt: time.Now(),
 	}
-	previous, hadPrevious := m.storageIO[kname]
-	m.storageIO[kname] = sample
-	if sample.InFlight > 0 || (hadPrevious && (sample.Reads != previous.Reads || sample.Writes != previous.Writes)) {
-		return StorageActivityBusy
+	previous, hadPrevious := loadBlockIO(kname)
+	if !hadPrevious {
+		storeBlockIO(kname, sample)
+		if sample.InFlight > 0 {
+			return StorageActivityWorking, nil
+		}
+		return StorageActivityIdle, nil
 	}
-	return StorageActivityIdle
+	if util := storageUtilization(previous, sample); util != nil {
+		sample.Util = *util
+		sample.HasUtil = true
+	} else {
+		sample.Util = previous.Util
+		sample.HasUtil = previous.HasUtil
+	}
+	completed := (sample.Reads + sample.Writes) - (previous.Reads + previous.Writes)
+	deltaTicks := (sample.ReadTicks + sample.WriteTicks) - (previous.ReadTicks + previous.WriteTicks)
+	progressed := completed > 0
+	if sample.InFlight > 0 && !progressed {
+		sample.StallCount = previous.StallCount + 1
+	}
+	slow := progressed && deltaTicks/completed >= storageBusyAwaitMS(kind)
+	storeBlockIO(kname, sample)
+	out := utilizationPointer(sample)
+	if slow || sample.StallCount >= storageIOStallSamples {
+		return StorageActivityBusy, out
+	}
+	if progressed || sample.InFlight > 0 {
+		return StorageActivityWorking, out
+	}
+	return StorageActivityIdle, out
 }
 
 func powerModeIsSleeping(mode string) bool {

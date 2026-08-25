@@ -24,7 +24,7 @@ const STORAGE_STATE_LABELS = {
   empty: '空置', present: '已插入', used: '已使用', warning: '告警', unknown: '未知',
 };
 const STORAGE_ACTIVITY_LABELS = {
-  busy: '繁忙', idle: '空闲', sleeping: '休眠', unknown: '未知',
+  busy: '繁忙', working: '工作', idle: '空闲', sleeping: '休眠', unknown: '未知',
 };
 const STORAGE_HOT_C = { front: 55, m2: 70 };
 const CURVE_MIN_POINTS = 2;
@@ -161,6 +161,11 @@ function formatTemperature(value, available = true) {
   return available && Number.isFinite(number) ? `${number.toFixed(1)} °C` : '不可用';
 }
 
+function formatUtilization(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? `${Math.round(number)}%` : '';
+}
+
 function isStorageHot(slot = {}) {
   const temperature = Number(slot.temperature_c);
   if (!Number.isFinite(temperature) || temperature <= 0) return false;
@@ -227,7 +232,6 @@ function setupAppModal() {
 }
 
 function storageActivityTone(activity) {
-  if (activity === 'busy') return 'busy';
   if (activity === 'sleeping') return 'sleep';
   if (activity === 'idle') return 'idle';
   return 'muted';
@@ -301,10 +305,12 @@ function renderStorageTable(storage = {}) {
     const model = slot.model || '—';
     const meta = [slot.device, formatSize(slot.size_bytes), slot.serial].filter(Boolean).join(' · ') || '—';
     const extra = [activityLabel, purposeLabel].filter((value) => value && value !== '—').join(' · ') || '—';
+    const utilization = formatUtilization(slot.utilization_percent);
     const cells = [
       ['th', '仓位', 'storage-col-slot', label],
       ['td', '状态', 'storage-col-state', stateLabel],
       ['td', '活动', 'storage-col-activity', activityLabel],
+      ['td', '繁忙度', 'storage-col-util', utilization || '—'],
       ['td', '设备', 'storage-col-device', null],
       ['td', '用途', 'storage-col-purpose', purposeLabel],
       ['td', '健康', 'storage-col-health', healthLabel],
@@ -334,6 +340,8 @@ function renderStorageTable(storage = {}) {
         }
       } else if (!empty && className === 'storage-col-activity') {
         cell.append(storageChip(activityLabel, storageActivityTone(slot.activity)));
+      } else if (!empty && className === 'storage-col-util') {
+        cell.append(storageChip(utilization || '—', 'muted'));
       } else if (!empty && className === 'storage-col-health') {
         cell.append(storageChip(healthLabel, storageHealthTone(slot), healthDetail ? {
           title: `${label} 健康详情`,
@@ -356,7 +364,7 @@ function renderStorageTable(storage = {}) {
   if (!slots.length) {
     const row = document.createElement('tr');
     const cell = document.createElement('td');
-    cell.colSpan = 7;
+    cell.colSpan = 8;
     cell.dataset.label = '状态';
     cell.textContent = '尚未获得仓位信息';
     row.append(cell);
@@ -458,16 +466,14 @@ function renderStorageVisual(storage = {}) {
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
       const compact = window.matchMedia('(max-width: 599px)').matches;
       const hasTemperature = Number(slot.temperature_c) > 0;
-      if (tone === 'empty') {
+      if (tone === 'empty' || !hasTemperature) {
         temperature.textContent = '';
-      } else if (hasTemperature) {
-        temperature.textContent = compact
-          ? (group.kind === 'front'
-            ? `${Math.round(Number(slot.temperature_c))}\n°C`
-            : `${Math.round(Number(slot.temperature_c))}°C`)
-          : formatTemperature(slot.temperature_c);
+      } else if (compact && group.kind === 'front') {
+        temperature.textContent = `${Math.round(Number(slot.temperature_c))}\n°C`;
+      } else if (compact) {
+        temperature.textContent = `${Math.round(Number(slot.temperature_c))}°C`;
       } else {
-        temperature.textContent = compact ? '' : '— °C';
+        temperature.textContent = formatTemperature(slot.temperature_c);
       }
       const statusLabel = tone === 'empty'
         ? '空置'
@@ -477,8 +483,8 @@ function renderStorageVisual(storage = {}) {
             ? '高温'
             : (slot.state === 'present'
               ? '未使用'
-              : (STORAGE_ACTIVITY_LABELS[slot.activity] || '健康'))));
-      status.textContent = compact ? '' : statusLabel;
+              : (STORAGE_ACTIVITY_LABELS[slot.activity] || ''))));
+      if (status) status.textContent = (compact || group.kind === 'm2') ? '' : statusLabel;
     });
   });
 }

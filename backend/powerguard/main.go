@@ -173,6 +173,7 @@ func serve(args []string) error {
 	go reapplyLoop(ctx, manager, logger)
 	go fanLoop(ctx, manager, logger)
 	go storageLoop(ctx, manager, logger)
+	go storageActivityLoop(ctx, manager)
 	go gpioLoop(ctx, manager, logger)
 
 	select {
@@ -221,6 +222,19 @@ func fanLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logge
 			if err := manager.ApplyFanCurrent(); err != nil {
 				logger.Printf("fan control failed: %v", err)
 			}
+		}
+	}
+}
+
+func storageActivityLoop(ctx context.Context, manager *powerguard.Manager) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			manager.RefreshStorageActivity()
 		}
 	}
 }
