@@ -29,9 +29,8 @@ const (
 	StorageActivitySleeping = "sleeping"
 	StorageActivityUnknown  = "unknown"
 
-	storageIOStallSamples  = 2
-	storageHDDBusyAwaitMS  = 1000
-	storageNVMeBusyAwaitMS = 100
+	storageIdleUtilMax    = 0.0
+	storageWorkingUtilMax = 70.0
 )
 
 type StorageSlot struct {
@@ -391,11 +390,14 @@ func (m *Manager) readBlockInfoFromSysfs(kname string) blockInfo {
 	return info
 }
 
-func storageBusyAwaitMS(kind string) uint64 {
-	if kind == "m2" {
-		return storageNVMeBusyAwaitMS
+func activityFromUtilization(util float64) string {
+	if util > storageWorkingUtilMax {
+		return StorageActivityBusy
 	}
-	return storageHDDBusyAwaitMS
+	if util > storageIdleUtilMax {
+		return StorageActivityWorking
+	}
+	return StorageActivityIdle
 }
 
 func storageUtilization(previous, sample blockIOSample) *float64 {
@@ -457,11 +459,9 @@ func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
 		IOTicks: ioTicks, InFlight: inFlight, SampledAt: time.Now(),
 	}
 	previous, hadPrevious := loadBlockIO(kname)
+	_ = kind
 	if !hadPrevious {
 		storeBlockIO(kname, sample)
-		if sample.InFlight > 0 {
-			return StorageActivityWorking, nil
-		}
 		return StorageActivityIdle, nil
 	}
 	if util := storageUtilization(previous, sample); util != nil {
@@ -471,22 +471,17 @@ func (m *Manager) readBlockActivity(kname, kind string) (string, *float64) {
 		sample.Util = previous.Util
 		sample.HasUtil = previous.HasUtil
 	}
-	completed := (sample.Reads + sample.Writes) - (previous.Reads + previous.Writes)
-	deltaTicks := (sample.ReadTicks + sample.WriteTicks) - (previous.ReadTicks + previous.WriteTicks)
-	progressed := completed > 0
-	if sample.InFlight > 0 && !progressed {
-		sample.StallCount = previous.StallCount + 1
-	}
-	slow := progressed && deltaTicks/completed >= storageBusyAwaitMS(kind)
 	storeBlockIO(kname, sample)
+	if !sample.HasUtil {
+		return StorageActivityIdle, nil
+	}
+	state := activityFromUtilization(sample.Util)
 	out := utilizationPointer(sample)
-	if slow || sample.StallCount >= storageIOStallSamples {
-		return StorageActivityBusy, out
+	if state == StorageActivityIdle {
+		zero := 0.0
+		return state, &zero
 	}
-	if progressed || sample.InFlight > 0 {
-		return StorageActivityWorking, out
-	}
-	return StorageActivityIdle, out
+	return state, out
 }
 
 func powerModeIsSleeping(mode string) bool {

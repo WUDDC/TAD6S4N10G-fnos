@@ -484,7 +484,15 @@ function renderStorageVisual(storage = {}) {
             : (slot.state === 'present'
               ? '未使用'
               : (STORAGE_ACTIVITY_LABELS[slot.activity] || ''))));
-      if (status) status.textContent = (compact || group.kind === 'm2') ? '' : statusLabel;
+      if (status) {
+        if (group.kind === 'm2') {
+          status.textContent = tone === 'empty'
+            ? '空置'
+            : (STORAGE_ACTIVITY_LABELS[slot.activity] || '');
+        } else {
+          status.textContent = compact ? '' : statusLabel;
+        }
+      }
     });
   });
 }

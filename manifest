@@ -1,5 +1,5 @@
 appname=tad-module
-version=0.10.5
+version=0.10.6
 display_name=TAD6S4N模块
 desc=面向 TAD6S4N10G 的温度、功耗、三曲线风扇、硬盘面板、GPIO 按键与脱敏调试报告模块。
 source=thirdparty
@@ -13,4 +13,4 @@ desktop_uidir=ui
 desktop_applaunchname=tad-module.Application
 checkport=false
 disable_authorization_path=false
-changelog=硬盘活动改为空闲/工作/繁忙，繁忙仅表示卡 IO；表格增加与飞牛同源的繁忙度；修正 SATA/M.2 贴图对齐、空置字色和健康告警弹窗。
+changelog=活动按繁忙度划分：0% 空闲、1–70% 工作、超过 70% 繁忙；M.2 槽改为盘号居左、状态与温度居右。
