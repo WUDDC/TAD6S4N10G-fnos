@@ -1,97 +1,163 @@
 package main
 
 import (
+	"bytes"
+	_ "embed"
 	"flag"
+	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
+	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 )
+
+//go:embed source.png
+var sourcePNG []byte
 
 func main() {
 	out := flag.String("out", ".", "output directory")
 	flag.Parse()
+	src, err := decodeSource()
+	if err != nil {
+		panic(err)
+	}
 	if err := os.MkdirAll(*out, 0o755); err != nil {
 		panic(err)
 	}
 	for _, size := range []int{64, 256} {
-		img := drawIcon(size)
-		path := filepath.Join(*out, "icon_"+itoa(size)+".png")
-		file, err := os.Create(path)
-		if err != nil {
-			panic(err)
-		}
-		if err := png.Encode(file, img); err != nil {
-			file.Close()
-			panic(err)
-		}
-		if err := file.Close(); err != nil {
+		path := filepath.Join(*out, "icon_"+strconv.Itoa(size)+".png")
+		if err := writePNG(path, resizeNRGBA(src, size, size)); err != nil {
 			panic(err)
 		}
 	}
 }
 
-func drawIcon(size int) image.Image {
-	img := image.NewRGBA(image.Rect(0, 0, size, size))
-	transparent := color.RGBA{0, 0, 0, 0}
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			img.Set(x, y, transparent)
-		}
+func decodeSource() (*image.NRGBA, error) {
+	img, err := png.Decode(bytes.NewReader(sourcePNG))
+	if err != nil {
+		return nil, fmt.Errorf("decode source icon: %w", err)
 	}
-	s := float64(size)
-	center := func(x, y float64) (float64, float64) { return x * s, y * s }
-	cx, cy := center(.5, .5)
-	outer := color.RGBA{23, 202, 142, 255}
-	inner := color.RGBA{7, 26, 21, 255}
-	bolt := color.RGBA{210, 255, 235, 255}
-	for y := 0; y < size; y++ {
-		for x := 0; x < size; x++ {
-			dx, dy := float64(x)+.5-cx, float64(y)+.5-cy
-			r := s * .44
-			if dx*dx+dy*dy <= r*r {
-				img.Set(x, y, outer)
-			}
-			r2 := s * .35
-			if dx*dx+dy*dy <= r2*r2 {
-				img.Set(x, y, inner)
-			}
-		}
-	}
-	shield := [][2]float64{{.50, .20}, {.73, .29}, {.70, .58}, {.50, .79}, {.30, .58}, {.27, .29}}
-	fillPolygon(img, shield, outer)
-	lightning := [][2]float64{{.53, .29}, {.39, .52}, {.49, .52}, {.44, .70}, {.63, .44}, {.52, .44}}
-	fillPolygon(img, lightning, bolt)
-	return img
+	return toNRGBA(img), nil
 }
 
-func fillPolygon(img *image.RGBA, points [][2]float64, c color.Color) {
-	b := img.Bounds()
-	w, h := float64(b.Dx()), float64(b.Dy())
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			px, py := (float64(x)+.5)/w, (float64(y)+.5)/h
-			inside := false
-			j := len(points) - 1
-			for i := 0; i < len(points); i++ {
-				xi, yi := points[i][0], points[i][1]
-				xj, yj := points[j][0], points[j][1]
-				if (yi > py) != (yj > py) && px < (xj-xi)*(py-yi)/(yj-yi)+xi {
-					inside = !inside
-				}
-				j = i
-			}
-			if inside {
-				img.Set(x, y, c)
-			}
+func toNRGBA(src image.Image) *image.NRGBA {
+	if nrgba, ok := src.(*image.NRGBA); ok && nrgba.Rect.Min == image.Pt(0, 0) {
+		return nrgba
+	}
+	bounds := src.Bounds()
+	dst := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(dst, dst.Bounds(), src, bounds.Min, draw.Src)
+	return dst
+}
+
+func writePNG(path string, img image.Image) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := png.Encode(file, img); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func resizeNRGBA(src *image.NRGBA, width, height int) *image.NRGBA {
+	dst := image.NewNRGBA(image.Rect(0, 0, width, height))
+	sw, sh := src.Bounds().Dx(), src.Bounds().Dy()
+	if sw == width && sh == height {
+		copy(dst.Pix, src.Pix)
+		return dst
+	}
+	for y := 0; y < height; y++ {
+		sy := (float64(y)+0.5)*float64(sh)/float64(height) - 0.5
+		for x := 0; x < width; x++ {
+			sx := (float64(x)+0.5)*float64(sw)/float64(width) - 0.5
+			dst.SetNRGBA(x, y, sampleBilinear(src, sx, sy))
 		}
+	}
+	return dst
+}
+
+type premulRGBA struct{ r, g, b, a float64 }
+
+func sampleBilinear(src *image.NRGBA, x, y float64) color.NRGBA {
+	width, height := src.Bounds().Dx(), src.Bounds().Dy()
+	x0 := math.Floor(x)
+	y0 := math.Floor(y)
+	ix0 := clampInt(int(x0), 0, width-1)
+	iy0 := clampInt(int(y0), 0, height-1)
+	ix1 := clampInt(int(x0)+1, 0, width-1)
+	iy1 := clampInt(int(y0)+1, 0, height-1)
+	fx := clampUnit(x - x0)
+	fy := clampUnit(y - y0)
+	top := lerp(premul(src.NRGBAAt(ix0, iy0)), premul(src.NRGBAAt(ix1, iy0)), fx)
+	bottom := lerp(premul(src.NRGBAAt(ix0, iy1)), premul(src.NRGBAAt(ix1, iy1)), fx)
+	return unpremul(lerp(top, bottom, fy))
+}
+
+func premul(c color.NRGBA) premulRGBA {
+	a := float64(c.A) / 255
+	return premulRGBA{
+		r: float64(c.R) / 255 * a,
+		g: float64(c.G) / 255 * a,
+		b: float64(c.B) / 255 * a,
+		a: a,
 	}
 }
 
-func itoa(value int) string {
-	if value == 64 {
-		return "64"
+func lerp(a, b premulRGBA, t float64) premulRGBA {
+	return premulRGBA{
+		r: a.r + (b.r-a.r)*t,
+		g: a.g + (b.g-a.g)*t,
+		b: a.b + (b.b-a.b)*t,
+		a: a.a + (b.a-a.a)*t,
 	}
-	return "256"
+}
+
+func unpremul(c premulRGBA) color.NRGBA {
+	if c.a <= 0 {
+		return color.NRGBA{}
+	}
+	inv := 1 / c.a
+	return color.NRGBA{
+		R: clampU8(c.r * inv * 255),
+		G: clampU8(c.g * inv * 255),
+		B: clampU8(c.b * inv * 255),
+		A: clampU8(c.a * 255),
+	}
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func clampUnit(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 1 {
+		return 1
+	}
+	return value
+}
+
+func clampU8(value float64) uint8 {
+	if value < 0 {
+		return 0
+	}
+	if value > 255 {
+		return 255
+	}
+	return uint8(math.Round(value))
 }
