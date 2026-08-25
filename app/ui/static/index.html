@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TAD6S4N模块</title>
-  <link rel="stylesheet" href="styles.css?v=0.10.3">
+  <link rel="stylesheet" href="styles.css?v=0.10.4">
 </head>
 <body>
   <main class="shell">
@@ -313,6 +313,11 @@
                 <h2>TAD6S4N模块</h2>
                 <p>为 TANK TAD6S4N 机型定制，其它硬件目前未做完整适配。</p>
                 <p class="about-version-line">当前版本 <strong id="about-version">v—</strong></p>
+                <div class="about-health-line">
+                  <span>运行状态</span>
+                  <span id="about-health" class="badge pending">读取中</span>
+                </div>
+                <p id="about-health-detail" class="about-health-detail">正在读取模块状态…</p>
               </div>
             </div>
             <div class="about-features">
@@ -339,6 +344,14 @@
       </form>
     </div>
   </main>
-  <script src="app.js?v=0.10.3" defer></script>
+  <div id="app-modal" class="app-modal" hidden>
+    <div class="app-modal-backdrop" data-modal-close></div>
+    <div class="app-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="app-modal-title">
+      <h3 id="app-modal-title">详细信息</h3>
+      <p id="app-modal-body"></p>
+      <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
+    </div>
+  </div>
+  <script src="app.js?v=0.10.4" defer></script>
 </body>
 </html>

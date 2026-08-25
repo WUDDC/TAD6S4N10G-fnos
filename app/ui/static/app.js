@@ -26,9 +26,10 @@ const STORAGE_STATE_LABELS = {
 const STORAGE_ACTIVITY_LABELS = {
   busy: '繁忙', idle: '空闲', sleeping: '休眠', unknown: '未知',
 };
+const STORAGE_HOT_C = { front: 55, m2: 70 };
 const CURVE_MIN_POINTS = 2;
 const CURVE_MAX_POINTS = 8;
-const CHART = { left: 52, right: 616, top: 20, bottom: 222 };
+const CHART = { left: 48, right: 600, top: 28, bottom: 218 };
 const CURVE_KINDS = ['cpu', 'hdd', 'nvme'];
 const FAN_SLOT_GROUPS = {
   hdd: {
@@ -48,11 +49,21 @@ const FAN_CURVE_GROUPS = {
 const STORAGE_VISUAL_GROUPS = [
   {
     kind: 'front', base: 'images/panel/6SATA面板底图.svg', ids: [6, 5, 4, 3, 2, 1].map((slot) => `front-${slot}`),
-    assets: { gray: 'images/panel/SATA灰-休眠未使用.svg', red: 'images/panel/SATA红-报警.svg', green: 'images/panel/SATA绿-正常健康.svg' },
+    assets: {
+      gray: 'images/panel/SATA灰-休眠未使用.svg',
+      blue: 'images/panel/SATA蓝-休眠.svg',
+      red: 'images/panel/SATA红-报警.svg',
+      green: 'images/panel/SATA绿-正常健康.svg',
+    },
   },
   {
     kind: 'm2', base: 'images/panel/4M2面板底图.svg', ids: ['m2-4', 'm2-2', 'm2-3', 'm2-1'], flip: new Set(['m2-2', 'm2-1']),
-    assets: { gray: 'images/panel/M2灰-休眠未使用.svg', red: 'images/panel/M2红-报警.svg', green: 'images/panel/M2绿-正常健康.svg' },
+    assets: {
+      gray: 'images/panel/M2灰-休眠未使用.svg',
+      blue: 'images/panel/M2蓝-休眠.svg',
+      red: 'images/panel/M2红-报警.svg',
+      green: 'images/panel/M2绿-正常健康.svg',
+    },
   },
 ];
 const curveEditors = {
@@ -150,6 +161,109 @@ function formatTemperature(value, available = true) {
   return available && Number.isFinite(number) ? `${number.toFixed(1)} °C` : '不可用';
 }
 
+function isStorageHot(slot = {}) {
+  const temperature = Number(slot.temperature_c);
+  if (!Number.isFinite(temperature) || temperature <= 0) return false;
+  const threshold = STORAGE_HOT_C[slot.kind] || STORAGE_HOT_C.front;
+  return temperature >= threshold;
+}
+
+function storageChip(text, tone = 'muted', options = {}) {
+  const chip = document.createElement(options.detail ? 'button' : 'span');
+  if (options.detail) chip.type = 'button';
+  chip.className = `storage-chip tone-${tone}${options.detail ? ' is-action' : ''}`;
+  chip.textContent = text;
+  if (options.detail) {
+    chip.setAttribute('aria-haspopup', 'dialog');
+    chip.title = '点击查看详情';
+    chip.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openAppModal(options.title || '详细信息', options.detail);
+    });
+  }
+  return chip;
+}
+
+function storageHealthLabel(slot = {}) {
+  if (slot.warning) return '告警';
+  return slot.health || '—';
+}
+
+function storageHealthDetail(slot = {}) {
+  return String(slot.warning || '').trim();
+}
+
+function openAppModal(title, body) {
+  const modal = $('app-modal');
+  if (!modal) return;
+  $('app-modal-title').textContent = title;
+  $('app-modal-body').textContent = body;
+  modal.hidden = false;
+  document.body.classList.add('modal-open');
+  modal.dataset.lastFocus = '';
+  openAppModal.lastFocus = document.activeElement;
+  $('app-modal-close')?.focus();
+}
+
+function closeAppModal() {
+  const modal = $('app-modal');
+  if (!modal || modal.hidden) return;
+  modal.hidden = true;
+  document.body.classList.remove('modal-open');
+  const lastFocus = openAppModal.lastFocus;
+  if (lastFocus && typeof lastFocus.focus === 'function') lastFocus.focus();
+}
+
+function setupAppModal() {
+  const modal = $('app-modal');
+  if (!modal) return;
+  modal.addEventListener('click', (event) => {
+    if (event.target.closest('[data-modal-close]')) closeAppModal();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') closeAppModal();
+  });
+}
+
+function storageActivityTone(activity) {
+  if (activity === 'busy') return 'busy';
+  if (activity === 'sleeping') return 'sleep';
+  if (activity === 'idle') return 'idle';
+  return 'muted';
+}
+
+function storageHealthTone(slot = {}) {
+  if (slot.state === 'warning' || slot.warning) return 'danger';
+  if (slot.health && slot.health !== '—' && slot.health !== '未读取') return 'ok';
+  return 'muted';
+}
+
+function storageTempTone(slot = {}) {
+  return isStorageHot(slot) ? 'danger' : 'temp';
+}
+
+function connectedFans(fanStatus = {}, limit = 0) {
+  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) > 0);
+  return limit > 0 ? fans.slice(0, limit) : fans;
+}
+
+function fanLabel(fan, fans = []) {
+  return fans.length === 1 ? 'FAN' : `FAN${fan.channel}`;
+}
+
+function renderHealthBadge(label, tone, detail) {
+  const badgeClass = `badge ${tone}`;
+  ['health', 'about-health'].forEach((id) => {
+    const badge = $(id);
+    if (!badge) return;
+    badge.textContent = label;
+    badge.className = badgeClass;
+  });
+  if ($('health-tooltip')) $('health-tooltip').textContent = detail;
+  if ($('about-health-detail')) $('about-health-detail').textContent = detail;
+}
+
 function formatSize(bytes) {
   let value = Number(bytes);
   if (!Number.isFinite(value) || value <= 0) return '';
@@ -176,12 +290,13 @@ function renderStorageTable(storage = {}) {
   slots.forEach((slot) => {
     const row = document.createElement('tr');
     const empty = slot.state === 'empty';
-    row.className = `storage-${slot.state || 'unknown'}`;
+    row.className = `storage-${slot.state || 'unknown'}${isStorageHot(slot) ? ' storage-hot' : ''}`;
     const label = slot.kind === 'front' ? `前置 ${slot.slot}` : `M.2 ${slot.slot}`;
     const stateLabel = STORAGE_STATE_LABELS[slot.state] || slot.state || '未知';
     const activityLabel = empty ? '—' : (STORAGE_ACTIVITY_LABELS[slot.activity] || slot.activity || '未知');
     const purposeLabel = slot.purpose || (empty ? '空仓位' : '—');
-    const healthLabel = slot.warning || slot.health || '—';
+    const healthLabel = storageHealthLabel(slot);
+    const healthDetail = storageHealthDetail(slot);
     const temperature = formatTemperature(slot.temperature_c, Number(slot.temperature_c) > 0);
     const model = slot.model || '—';
     const meta = [slot.device, formatSize(slot.size_bytes), slot.serial].filter(Boolean).join(' · ') || '—';
@@ -217,6 +332,15 @@ function renderStorageTable(storage = {}) {
           wrap.append(title, detail, more);
           cell.append(wrap);
         }
+      } else if (!empty && className === 'storage-col-activity') {
+        cell.append(storageChip(activityLabel, storageActivityTone(slot.activity)));
+      } else if (!empty && className === 'storage-col-health') {
+        cell.append(storageChip(healthLabel, storageHealthTone(slot), healthDetail ? {
+          title: `${label} 健康详情`,
+          detail: healthDetail,
+        } : {}));
+      } else if (!empty && className === 'storage-col-temp') {
+        cell.append(storageChip(temperature, storageTempTone(slot)));
       } else {
         cell.textContent = value;
       }
@@ -225,7 +349,7 @@ function renderStorageTable(storage = {}) {
     const cardHead = document.createElement('td');
     cardHead.className = 'storage-card-head';
     cardHead.dataset.label = '仓位';
-    cardHead.textContent = empty ? `${label} · ${stateLabel}` : `${label} · ${stateLabel} · ${temperature}`;
+    cardHead.textContent = `${label} · ${stateLabel}`;
     row.append(cardHead);
     body.append(row);
   });
@@ -250,11 +374,6 @@ function initializeStorageVisual() {
   STORAGE_VISUAL_GROUPS.forEach((group) => {
     const figure = document.createElement('figure');
     figure.className = `storage-visual-group storage-visual-${group.kind}`;
-    if (group.kind === 'm2') {
-      const caption = document.createElement('figcaption');
-      caption.textContent = '内置 M.2 插槽';
-      figure.append(caption);
-    }
     const frame = document.createElement('div');
     frame.className = 'storage-visual-frame';
     const base = document.createElement('img');
@@ -262,6 +381,12 @@ function initializeStorageVisual() {
     base.src = baseUrl(group.base);
     base.alt = group.kind === 'front' ? '六盘位机箱示意图' : '四个 M.2 槽位示意图';
     frame.append(base);
+    if (group.kind === 'm2') {
+      const caption = document.createElement('div');
+      caption.className = 'storage-visual-caption';
+      caption.textContent = '内置 M.2 插槽';
+      frame.append(caption);
+    }
     group.ids.forEach((id) => {
       const marker = document.createElement('div');
       marker.className = 'storage-visual-slot is-empty';
@@ -281,6 +406,11 @@ function initializeStorageVisual() {
     });
     figure.append(frame);
     target.append(figure);
+    frame.addEventListener('click', (event) => {
+      const marker = event.target.closest('.storage-visual-slot');
+      if (!marker?.dataset.detail) return;
+      openAppModal(marker.dataset.title || '健康详情', marker.dataset.detail);
+    });
     Object.values(group.assets).forEach((path) => { const image = new Image(); image.src = baseUrl(path); });
   });
   storageVisualReady = true;
@@ -288,8 +418,9 @@ function initializeStorageVisual() {
 
 function storageVisualTone(slot = {}) {
   if (slot.state === 'empty') return 'empty';
-  if (slot.state === 'warning' || slot.activity === 'busy') return 'red';
-  if (slot.state === 'present' || slot.activity === 'sleeping' || slot.state === 'unknown') return 'gray';
+  if (slot.state === 'warning' || isStorageHot(slot)) return 'red';
+  if (slot.activity === 'sleeping') return 'blue';
+  if (slot.state === 'present' || slot.state === 'unknown') return 'gray';
   return 'green';
 }
 
@@ -301,12 +432,21 @@ function renderStorageVisual(storage = {}) {
       const slot = slots.get(id) || { id, kind: group.kind, state: 'unknown', activity: 'unknown' };
       const marker = document.querySelector(`.storage-visual-slot[data-slot="${id}"]`);
       const tone = storageVisualTone(slot);
-      marker.className = `storage-visual-slot tone-${tone}${slot.state === 'empty' ? ' is-empty' : ''}`;
+      const healthDetail = storageHealthDetail(slot);
+      marker.className = `storage-visual-slot tone-${tone}${slot.state === 'empty' ? ' is-empty' : ''}${healthDetail ? ' is-action' : ''}`;
+      if (healthDetail) {
+        const slotLabel = slot.kind === 'front' ? `前置 ${slot.slot}` : `M.2 ${slot.slot}`;
+        marker.dataset.detail = healthDetail;
+        marker.dataset.title = `${slotLabel} 健康详情`;
+      } else {
+        delete marker.dataset.detail;
+        delete marker.dataset.title;
+      }
       const overlay = marker.querySelector('.storage-slot-overlay');
       if (tone === 'empty') {
         overlay.hidden = true;
       } else {
-        const source = baseUrl(group.assets[tone]);
+        const source = baseUrl(group.assets[tone] || group.assets.gray);
         if (overlay.dataset.source !== source) {
           overlay.src = source;
           overlay.dataset.source = source;
@@ -327,13 +467,18 @@ function renderStorageVisual(storage = {}) {
             : `${Math.round(Number(slot.temperature_c))}°C`)
           : formatTemperature(slot.temperature_c);
       } else {
-        temperature.textContent = compact ? '—' : '— °C';
+        temperature.textContent = compact ? '' : '— °C';
       }
-      status.textContent = compact
-        ? ''
-        : (tone === 'empty'
-          ? '空置'
-          : (slot.state === 'warning' ? '告警' : (slot.state === 'present' ? '未使用' : (STORAGE_ACTIVITY_LABELS[slot.activity] || '健康'))));
+      const statusLabel = tone === 'empty'
+        ? '空置'
+        : (slot.state === 'warning'
+          ? '告警'
+          : (isStorageHot(slot)
+            ? '高温'
+            : (slot.state === 'present'
+              ? '未使用'
+              : (STORAGE_ACTIVITY_LABELS[slot.activity] || '健康'))));
+      status.textContent = compact ? '' : statusLabel;
     });
   });
 }
@@ -444,6 +589,11 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   slots.filter((slot) => slot.state === 'warning').forEach((slot) => {
     const label = slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`;
     issues.push(`${label}：${slot.warning || slot.health || '硬盘健康状态告警'}`);
+  });
+  slots.filter((slot) => isStorageHot(slot)).forEach((slot) => {
+    const label = slot.kind === 'front' ? `SATA ${slot.slot}` : `NVMe ${slot.slot}`;
+    const threshold = STORAGE_HOT_C[slot.kind] || STORAGE_HOT_C.front;
+    issues.push(`${label}：温度 ${formatTemperature(slot.temperature_c)}，达到高温阈值 ${threshold}°C`);
   });
   if (gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error)) {
     issues.push(`按钮控制：${gpioStatus.last_error || 'GPIO 硬件接口不可用'}`);
@@ -1003,30 +1153,37 @@ function renderFanChart(kind = 'cpu') {
   };
   const actualTemp = Number(actualTemperatures[kind]);
   if (Number.isFinite(actualTemp) && actualTemp > 0) {
+    const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
+    const currentX = clamp(x(actualTemp), 72, 568);
     svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, stroke: '#e89b24', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: x(actualTemp), y: 14, fill: '#b96f00', 'font-size': 12, 'text-anchor': 'middle' }, `当前 ${actualTemp.toFixed(1)}°C`));
+    svg.append(svgElement('text', { x: currentX, y: 16, fill: '#b96f00', 'font-size': 12, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
+    const nodeX = x(point.temp_c);
+    const nodeY = y(point.pwm_percent);
     const hitTarget = svgElement('circle', {
-      cx: x(point.temp_c), cy: y(point.pwm_percent), r: 20,
+      cx: nodeX, cy: nodeY, r: 20,
       fill: 'transparent', stroke: 'transparent', 'pointer-events': 'all',
       class: 'curve-node curve-node-hit', 'data-index': index,
       'aria-hidden': true, focusable: false,
     });
     svg.append(hitTarget);
     const node = svgElement('circle', {
-      cx: x(point.temp_c), cy: y(point.pwm_percent), r: selected ? 9 : 7,
+      cx: nodeX, cy: nodeY, r: selected ? 9 : 7,
       fill: selected ? editor.color : '#ffffff', stroke: editor.color, 'stroke-width': 3,
       class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
     svg.append(node);
-    const labelY = y(point.pwm_percent) < 44 ? y(point.pwm_percent) + 25 : y(point.pwm_percent) - 14;
+    const label = `${point.temp_c}° · ${point.pwm_percent}%`;
+    const labelWidth = Math.max(72, label.length * 6.4);
+    const labelX = clamp(nodeX, 8 + labelWidth / 2, 632 - labelWidth / 2);
+    const labelY = nodeY < 50 ? nodeY + 26 : nodeY - 16;
     svg.append(svgElement('text', {
-      x: x(point.temp_c), y: labelY, fill: selected ? editor.color : '#596273',
+      x: labelX, y: labelY, fill: selected ? editor.color : '#596273',
       'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
-    }, `${point.temp_c}° · ${point.pwm_percent}%`));
+    }, label));
   });
   updateCurveControls(kind);
 }
@@ -1056,7 +1213,7 @@ function updateCurveFromPointer(kind, event) {
 
 function populateFanDevices(status, keepInputs) {
   const select = $('fan-device');
-  const fans = (status.fan_control?.fans || []).filter((fan) => Number(fan.rpm) > 0);
+  const fans = connectedFans(status.fan_control);
   const config = status.config?.fan || {};
   const signature = fans.map((fan) => fan.id).join('|');
   const rebuild = signature !== fanSelectorSignature;
@@ -1073,7 +1230,7 @@ function populateFanDevices(status, keepInputs) {
         input.type = 'checkbox';
         input.value = fan.id;
         const name = document.createElement('b');
-        name.textContent = `FAN${fan.channel}`;
+        name.textContent = fanLabel(fan, fans);
         const rpm = document.createElement('small');
         label.append(input, name, rpm);
         container.append(label);
@@ -1084,7 +1241,7 @@ function populateFanDevices(status, keepInputs) {
     fans.forEach((fan) => {
       const option = document.createElement('option');
       option.value = fan.id;
-      option.textContent = `FAN${fan.channel}`;
+      option.textContent = fanLabel(fan, fans);
       select.append(option);
     });
   }
@@ -1132,7 +1289,7 @@ function fillFanInputs(fan = {}) {
 
 function renderFanRPMs(fanStatus = {}) {
   const target = $('fan-rpm-list');
-  const fans = (fanStatus.fans || []).filter((fan) => Number(fan.rpm) >= 0).slice(0, 4);
+  const fans = connectedFans(fanStatus, 4);
   const existing = [...target.querySelectorAll('[data-fan-id]')];
   if (existing.map((item) => item.dataset.fanId).join('|') !== fans.map((fan) => fan.id).join('|')) {
     target.replaceChildren();
@@ -1146,7 +1303,7 @@ function renderFanRPMs(fanStatus = {}) {
   }
   fans.forEach((fan) => {
     const item = target.querySelector(`[data-fan-id="${fan.id}"]`);
-    item.querySelector('span').textContent = `FAN${fan.channel}`;
+    item.querySelector('span').textContent = fanLabel(fan, fans);
     item.querySelector('strong').textContent = `${fan.rpm} RPM`;
   });
 }
@@ -1201,7 +1358,7 @@ function render(status, keepInputs = false) {
   $('cpu-model').textContent = status.cpu_model || '未识别';
   $('cpu-display-label').textContent = cpuTemperature.display_source === 'package_fallback'
     ? 'CPU 温度（Package 回退）'
-    : 'CPU 核心最高（RR 口径）';
+    : 'CPU 核心最高';
   $('cpu-display-temperature').textContent = formatTemperature(cpuTemperature.display_c, cpuTemperature.available);
   $('package-temperature').textContent = formatTemperature(cpuTemperature.package_max_c, Number(cpuTemperature.package_sensors) > 0);
   $('current-pl1').textContent = pkg.has_pl1 ? `${pkg.pl1_w} W` : '不可用';
@@ -1226,12 +1383,10 @@ function render(status, keepInputs = false) {
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
   const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
   const healthy = issues.length === 0;
-  $('health').textContent = healthy ? '运行正常' : '需要检查';
-  $('health').className = `badge ${healthy ? 'ok' : 'error'}`;
   const healthMessage = healthy
     ? '未发现需要处理的异常。'
     : `需要检查以下项目：\n${issues.map((issue) => `• ${issue}`).join('\n')}`;
-  $('health-tooltip').textContent = healthMessage;
+  renderHealthBadge(healthy ? '运行正常' : '需要检查', healthy ? 'ok' : 'error', healthMessage);
 
   const profile = status.profile || {};
   const maxPL1 = status.effective_max_pl1_w || profile.max_pl1_w || 0;
@@ -1363,7 +1518,10 @@ function openDebugIssue() {
 function setBusy(busy) {
   uiBusy = busy;
   $('config-form').classList.toggle('busy', busy);
-  document.querySelectorAll('button').forEach((button) => { button.disabled = busy; });
+  document.querySelectorAll('button').forEach((button) => {
+    if (button.closest('.app-modal')) return;
+    button.disabled = busy;
+  });
   if (!busy) updateDebugReportActions(Boolean(debugReportText));
   CURVE_KINDS.forEach(updateCurveControls);
 }
@@ -1374,9 +1532,7 @@ async function refresh(keepInputs = false) {
     render(status, keepInputs);
   } catch (error) {
     showMessage(`读取状态失败：${error.message}`, true);
-    $('health').textContent = '连接失败';
-    $('health').className = 'badge error';
-    $('health-tooltip').textContent = `无法读取模块状态：${error.message}`;
+    renderHealthBadge('连接失败', 'error', `无法读取模块状态：${error.message}`);
   }
 }
 
@@ -1582,6 +1738,7 @@ $('config-form').addEventListener('invalid', (event) => {
 }, true);
 setupTabs();
 setupHealthTooltip();
+setupAppModal();
 setupFanSlotSelectors();
 setupGPIOActions();
 document.querySelectorAll('input[name="power-mode"]').forEach((input) => {
