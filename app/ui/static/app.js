@@ -71,8 +71,6 @@ const curveEditors = {
 };
 let currentStatus = null;
 let uiBusy = false;
-let startupCheckComplete = false;
-let startupDialogPreviousFocus = null;
 let gpioScripts = [];
 let gpioEditingScriptID = '';
 let storageVisualReady = false;
@@ -428,39 +426,6 @@ function renderFanHardwareWarning(fanStatus = {}) {
   }
 }
 
-function startupHealthReady(storageStatus = {}) {
-  return Boolean(storageStatus.updated_at)
-    || !String(storageStatus.last_error || '').includes('尚未完成首次刷新');
-}
-
-function closeStartupWarning() {
-  $('startup-warning-modal').hidden = true;
-  startupDialogPreviousFocus?.focus?.();
-  startupDialogPreviousFocus = null;
-}
-
-function maybeShowStartupWarning(status) {
-  if (startupCheckComplete) return;
-  const fanStatus = status.fan_control || {};
-  const storageStatus = status.storage || {};
-  const gpioStatus = status.gpio || {};
-  if (!startupHealthReady(storageStatus)) return;
-  startupCheckComplete = true;
-  const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
-  if (!issues.length) return;
-  const list = $('startup-warning-list');
-  list.replaceChildren();
-  issues.forEach((issue) => {
-    const item = document.createElement('li');
-    item.textContent = issue;
-    list.append(item);
-  });
-  $('startup-warning-driver-link').hidden = fanStatus.driver_detected !== false;
-  startupDialogPreviousFocus = document.activeElement;
-  $('startup-warning-modal').hidden = false;
-  requestAnimationFrame(() => $('startup-warning-close').focus());
-}
-
 function setupFanSlotSelectors() {
   Object.values(FAN_SLOT_GROUPS).forEach((group) => {
     const container = $(group.containerID);
@@ -745,6 +710,7 @@ function setupHealthTooltip() {
   const summary = document.querySelector('.health-summary');
   const badge = $('health');
   const tooltip = $('health-tooltip');
+  const finePointer = () => window.matchMedia('(hover: hover) and (pointer: fine)').matches;
   const show = () => tooltip.classList.add('visible');
   const hide = () => tooltip.classList.remove('visible');
   const place = (clientX, clientY) => {
@@ -762,6 +728,10 @@ function setupHealthTooltip() {
     tooltip.style.left = `${Math.max(margin, left)}px`;
     tooltip.style.top = `${top}px`;
   };
+  const placeNearBadge = () => {
+    const rect = badge.getBoundingClientRect();
+    place(rect.right, rect.top + rect.height / 2);
+  };
   summary.addEventListener('mouseenter', (event) => {
     show();
     place(event.clientX, event.clientY);
@@ -773,11 +743,26 @@ function setupHealthTooltip() {
   summary.addEventListener('mouseleave', hide);
   summary.addEventListener('focusin', () => {
     show();
-    const rect = badge.getBoundingClientRect();
-    place(rect.right, rect.top + rect.height / 2);
+    placeNearBadge();
   });
   summary.addEventListener('focusout', (event) => {
     if (!summary.contains(event.relatedTarget)) hide();
+  });
+  summary.addEventListener('click', (event) => {
+    if (finePointer()) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (tooltip.classList.contains('visible')) hide();
+    else {
+      show();
+      placeNearBadge();
+    }
+  });
+  document.addEventListener('click', (event) => {
+    if (!summary.contains(event.target)) hide();
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hide();
   });
 }
 
@@ -1162,7 +1147,9 @@ function render(status, keepInputs = false) {
   const fanStatus = status.fan_control || {};
   const storageStatus = status.storage || {};
   const gpioStatus = status.gpio || {};
-  $('app-version').textContent = status.version ? `v${status.version}` : 'v—';
+  const versionText = status.version ? `v${status.version}` : 'v—';
+  $('app-version').textContent = versionText;
+  $('about-version').textContent = versionText;
   $('device-name').textContent = status.device_name || 'TAD6S4N';
   $('os-version').textContent = [status.os_name, status.os_version].filter(Boolean).join(' ') || 'fnOS';
   $('cpu-model').textContent = status.cpu_model || '未识别';
@@ -1199,7 +1186,6 @@ function render(status, keepInputs = false) {
     ? '未发现需要处理的异常。'
     : `需要检查以下项目：\n${issues.map((issue) => `• ${issue}`).join('\n')}`;
   $('health-tooltip').textContent = healthMessage;
-  $('health').title = healthMessage;
 
   const profile = status.profile || {};
   const maxPL1 = status.effective_max_pl1_w || profile.max_pl1_w || 0;
@@ -1340,11 +1326,11 @@ async function refresh(keepInputs = false) {
   try {
     const status = await request('api/status');
     render(status, keepInputs);
-    maybeShowStartupWarning(status);
   } catch (error) {
     showMessage(`读取状态失败：${error.message}`, true);
     $('health').textContent = '连接失败';
     $('health').className = 'badge error';
+    $('health-tooltip').textContent = `无法读取模块状态：${error.message}`;
   }
 }
 
@@ -1576,13 +1562,6 @@ $('gpio-script-body').addEventListener('keydown', (event) => {
 });
 document.querySelectorAll('.gpio-action').forEach((select) => {
   select.addEventListener('change', renderGPIOScriptList);
-});
-$('startup-warning-close').addEventListener('click', closeStartupWarning);
-$('startup-warning-modal').addEventListener('click', (event) => {
-  if (event.target === $('startup-warning-modal')) closeStartupWarning();
-});
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !$('startup-warning-modal').hidden) closeStartupWarning();
 });
 CURVE_KINDS.forEach(renderFanChart);
 refresh();

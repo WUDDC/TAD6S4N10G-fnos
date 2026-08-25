@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TAD6S4N模块</title>
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=0.10.2">
 </head>
 <body>
   <main class="shell">
@@ -20,10 +20,6 @@
         </nav>
         <section class="sidebar-meta" aria-label="插件信息">
           <span id="app-version" class="app-version">v—</span>
-          <a class="sidebar-action github-project-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
-          <button id="check-updates" type="button" class="sidebar-action update-check-button">检查更新</button>
-          <span id="update-status" class="update-status" role="status" aria-live="polite">点击检查是否有新版本</span>
-          <a id="update-release-link" class="sidebar-action update-release-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden>前往更新</a>
           <div class="health-summary">
             <span id="health" class="badge pending" tabindex="0" aria-describedby="health-tooltip">读取中</span>
             <div id="health-tooltip" class="health-tooltip" role="tooltip">正在读取模块状态…</div>
@@ -316,6 +312,7 @@
               <div>
                 <h2>TAD6S4N模块</h2>
                 <p>为 TANK TAD6S4N 机型定制，其它硬件目前未做完整适配。</p>
+                <p class="about-version-line">当前版本 <strong id="about-version">v—</strong></p>
               </div>
             </div>
             <div class="about-features">
@@ -324,29 +321,24 @@
               <article><h3>按键映射</h3><p>适配前置复制、网络按键和后置 RESET 孔，每个按键支持四种触发时长与自定义 Bash 脚本。</p></article>
               <article><h3>功耗设置</h3><p>提供节能、标准、性能和自定义功耗模式，直观限制 PL1 与 PL2 功耗墙。</p></article>
             </div>
+            <section class="about-project" aria-label="项目与更新">
+              <div>
+                <h3>项目与更新</h3>
+                <p>可前往 GitHub 查看源码，或手动检查是否有新版本。进入插件时不会自动联网检查。</p>
+              </div>
+              <div class="about-actions">
+                <a class="about-action" href="https://github.com/luodaoyi/TAD6S4N10G-fnos" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
+                <button id="check-updates" type="button" class="primary">检查更新</button>
+                <a id="update-release-link" class="about-action about-update-link" href="https://github.com/luodaoyi/TAD6S4N10G-fnos/releases" target="_blank" rel="noopener noreferrer" hidden>前往更新</a>
+              </div>
+              <p id="update-status" class="update-status" role="status" aria-live="polite">点击检查是否有新版本</p>
+            </section>
             <p class="notice">风扇功能需要先安装 IT87 驱动。插件开发：<a href="https://mi-d.cn" target="_blank" rel="noopener noreferrer">mi-d.cn</a> · <a href="https://tank-g.taobao.com/" target="_blank" rel="noopener noreferrer">TANK</a></p>
           </section>
         </section>
       </form>
     </div>
   </main>
-  <div id="startup-warning-modal" class="startup-warning-backdrop" hidden>
-    <section class="startup-warning-dialog" role="dialog" aria-modal="true" aria-labelledby="startup-warning-title" aria-describedby="startup-warning-intro">
-      <div class="startup-warning-heading">
-        <span class="warning-icon" aria-hidden="true">!</span>
-        <div>
-          <h2 id="startup-warning-title">启动检查发现异常</h2>
-          <p id="startup-warning-intro">以下硬件或温度来源需要检查：</p>
-        </div>
-      </div>
-      <ul id="startup-warning-list"></ul>
-      <p class="startup-warning-note">提示只说明插件当前没有读到对应接口，不代表一定是硬件损坏；请按具体项目检查驱动、接线或存储映射。</p>
-      <div class="startup-warning-actions">
-        <a id="startup-warning-driver-link" class="button-link" href="https://github.com/IamAyang233/fnos-it87-kmod" target="_blank" rel="noopener noreferrer" hidden>安装 IT87 驱动</a>
-        <button id="startup-warning-close" type="button" class="primary">我知道了</button>
-      </div>
-    </section>
-  </div>
-  <script src="app.js" defer></script>
+  <script src="app.js?v=0.10.2" defer></script>
 </body>
 </html>
