@@ -4,7 +4,7 @@
 
 ## 为什么用 Go / 单二进制
 - 作者明确要求：**禁止 Python 做 TUI，用 Go/Rust 原生，交付单文件可执行**，不依赖本机 Python/pip/解释器。
-- 所以 `tank` 用 Go 写（stdlib + 终端 raw/ANSI），`CGO_ENABLED=0` 静态链接，**目标机免 Go、免 Python、免 curl、免编译**。
+- 所以 `tank` 用 Go 写（stdlib + 终端 raw/ANSI），`CGO_ENABLED=0` 静态链接，目标机不需要 Go、Python 或编译器；若安装目录没有预置二进制，则需要 `curl` 自动下载。
 - 作者后端 `tad-module` 同样预编译成静态单二进制，直接运行。
 
 ## 原理
@@ -19,15 +19,12 @@ tank（Go 单二进制）读取 /api/status，渲染终端面板
 ## 目录结构（debian-tui/）
 ```
 debian-tui/
-├── go编译单文件/           ← 交付给用户的 4 个文件（免编译）+ README.txt
-│   ├── tank                Go 静态单二进制（TUI，V260905-2）
-│   ├── tad-module          Go 静态单二进制（作者后端）
+├── go编译单文件/           ← 交付说明和安装脚本；二进制由 CI/Release 或 .fpk 提供
 │   ├── tank.service        systemd 配置（启动 tad-module）
-│   ├── install-tui-lanrenbao.sh   一键安装（拷贝+写配置+起服务）
+│   ├── install-tui-lanrenbao.sh   一键安装（本地二进制或 curl 下载）
 │   └── README.txt          组成 + 安装 + 使用
-├── tank.go                 tank 的 Go 源码（V260905-2）
+├── tank.go                 tank 的 Go 源码
 ├── lanrenbao/ui/           浏览器版前端静态资源（可选，供 Web UI）
-├── tankfan                 Python 版风扇工具（本次不做；它87驱动另需第三方模块）
 └── tui-readme.md           本说明
 ```
 
@@ -38,7 +35,7 @@ sudo ./install-tui-lanrenbao.sh
 ```
 脚本自动：复制 `tad-module` 到 `/usr/local/libexec/tank/`、写 `/etc/tank/config.json`（监控模式 enabled=false，不改功耗/风扇/GPIO）、复制 `tank` 到 `/usr/local/bin/tank`、落地并启动 `tank.service`。
 
-无需 Go/Python/curl/编译器，root 即可。
+本地预置 `tank` 和 `tad-module` 时无需下载；缺少二进制时，安装脚本会使用 `curl` 拉取后端 `.fpk`，而 `tank` 需要通过 `TANK_RELEASE_TANK` 指定下载地址。无论哪种方式，目标机都不需要 Go、Python 或编译器。
 
 ## 使用
 ```bash
