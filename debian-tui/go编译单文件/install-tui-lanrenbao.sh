@@ -7,7 +7,8 @@
 # CI build. Place them next to this script (./tank, ./tad-module) or provide
 # URLs below to download. Target machine needs only root (plus curl if downloading).
 #
-# The backend runs read-only, as a dedicated unprivileged user (NOT root).
+# The upstream backend requires root and owns all hardware access. The default
+# configuration is monitoring-only, but root is still required at startup.
 # Usage:  sudo ./install-tui-lanrenbao.sh
 # Env:    TANK_LIB / TANK_ETC / TANK_VAR   TANK_RELEASE_TANK / TANK_RELEASE_BACKEND
 set -euo pipefail
@@ -21,7 +22,6 @@ RUN=/run/tank
 LOG=/var/log/tank
 BIN="$LIB/tad-module"
 UI="$LIB/ui"
-SRV_USER=tank
 
 # Optional: download the binaries if not present locally.
 #   TANK_RELEASE_TANK    URL to a tank binary (e.g. a CI Release asset)
@@ -61,12 +61,6 @@ if [ ! -f "$HERE/tank" ]; then
   else
     die "缺少 $HERE/tank：请设置 TANK_RELEASE_TANK 指向已编译的 tank 二进制"
   fi
-fi
-
-# --- dedicated unprivileged user -------------------------------------------
-if ! id "$SRV_USER" >/dev/null 2>&1; then
-  log "创建专用只读用户 $SRV_USER"
-  useradd --system --no-create-home --shell /usr/sbin/nologin "$SRV_USER" 2>/dev/null || true
 fi
 
 # Let the invoking (SSH) user read the module socket (owned root:www-data), so
@@ -123,7 +117,7 @@ if [ ! -f "$ETC/config.json" ]; then
 }
 JSON
   chmod 0640 "$ETC/config.json"
-  chown "$SRV_USER:$SRV_USER" "$ETC/config.json"
+  chown root:root "$ETC/config.json"
 else
   log "保留已有 $ETC/config.json（不覆盖）"
 fi
@@ -132,7 +126,7 @@ log "安装 tank TUI 前端"
 [ -f "$HERE/tank" ] || die "缺少 $HERE/tank：请设置 TANK_RELEASE_TANK 或手动放入 tank 二进制"
 install -m 0755 "$HERE/tank" /usr/local/bin/tank
 
-log "安装 systemd 服务（专用只读用户，非 root）"
+log "安装 systemd 服务（root 后端）"
 [ -f "$HERE/tank.service" ] && install -m 0644 "$HERE/tank.service" /etc/systemd/system/tank.service \
   || die "未找到 tank.service"
 systemctl daemon-reload
@@ -140,7 +134,7 @@ systemctl enable --now tank.service
 
 sleep 1
 if systemctl is-active --quiet tank.service; then
-  log "tank.service 已运行（用户: $SRV_USER）"
+  log "tank.service 已运行（后端用户: root）"
   warn "如需风扇控制，请加载第三方 it87 驱动（内核自带 it87 不识别本板）"
 else
   warn "tank.service 未启动，请查看: journalctl -u tank.service -e"
@@ -154,5 +148,5 @@ cat <<'DONE'
   tank --once         输出一次文字快照
   journalctl -u tank.service -f
 
-说明：后端以只读用户 tank 常驻（非 root）；监控模式只读，不改功耗/风扇/GPIO。
+说明：后端必须以 root 常驻（官方 tad-module 的硬性要求）；默认监控模式只读，不主动改功耗/风扇/GPIO。
 DONE

@@ -14,7 +14,8 @@
 tank（Go 单二进制）读取 /api/status，渲染终端面板
 ```
 - 后端把 CPU/coretemp、RAPL 功耗、风扇、硬盘槽位、GPIO 全部聚合进 `/api/status`。
-- tank 只做"读接口 + 画面板"，不碰底层 CPU/风扇/功耗写入。
+- `tank` 只做"读接口 + 画面板"，不碰底层 CPU/风扇/功耗写入。
+- 后端必须以 root 运行：官方 `tad-module serve()` 启动时强制检查 root，并负责 `/sys`、`/dev`、SMART、RAPL、hwmon/PWM、GPIO 以及服务停止时的状态恢复。监控配置关闭写入功能，不等于后端可以降权运行。
 
 ## 目录结构（debian-tui/）
 ```
@@ -33,13 +34,14 @@ debian-tui/
 cd .../debian-tui/go编译单文件
 sudo ./install-tui-lanrenbao.sh
 ```
-脚本自动：复制 `tad-module` 到 `/usr/local/libexec/tank/`、写 `/etc/tank/config.json`（监控模式 enabled=false，不改功耗/风扇/GPIO）、复制 `tank` 到 `/usr/local/bin/tank`、落地并启动 `tank.service`。
+脚本自动：复制 `tad-module` 到 `/usr/local/libexec/tank/`、写 `/etc/tank/config.json`（监控模式 enabled=false，不主动应用功耗/风扇/GPIO）、复制 `tank` 到 `/usr/local/bin/tank`、落地并启动以 root 运行的 `tank.service`。后端必须使用 root，这是官方后端 `serve()` 的启动要求；安装脚本本身也必须由 root 执行。
 
-本地预置 `tank` 和 `tad-module` 时无需下载；缺少二进制时，安装脚本会使用 `curl` 拉取后端 `.fpk`，而 `tank` 需要通过 `TANK_RELEASE_TANK` 指定下载地址。无论哪种方式，目标机都不需要 Go、Python 或编译器。
+本地预置 `tank` 和 `tad-module` 时无需下载；缺少二进制时，安装脚本会使用 `curl` 拉取后端 `.fpk`，而 `tank` 需要通过 `TANK_RELEASE_TANK` 指定下载地址。无论哪种方式，目标机都不需要 Go、Python 或编译器；后端仍必须以 root 运行。
 
 ## 使用
 ```bash
-tank              # 欢迎屏：回车=实时刷新(3秒)；输入2=打印一次快照(适合手机小窗)
+tank              # 读取 root 后端提供的实时状态；普通用户需属于 www-data 组
+sudo tank         # root 管理员可直接运行
 tank --once       # 打印一次面板（同输入2）
 systemctl status tank
 journalctl -u tank.service -f
@@ -54,5 +56,5 @@ journalctl -u tank.service -f
 
 ## 注意
 - **风扇**：作者 README 要求第三方 `fnos-it87-kmod`（内核自带 it87 不识别本板）。当前交付**不含**风扇控制；未装驱动前 tank 显示 `Fan: N/A` 属正常。
-- **监控模式**：后端 `enabled=false` 启动，只读展示，不修改功耗/风扇/GPIO。
+- **监控模式**：后端 `enabled=false` 启动，默认不主动修改功耗/风扇/GPIO；后端仍必须以 root 常驻，因为官方 `serve()` 无条件要求 root。
 - **架构**：目前是 x86_64（amd64）静态二进制；arm/arm64 需另编对应架构。

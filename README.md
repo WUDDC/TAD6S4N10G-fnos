@@ -16,7 +16,13 @@
 
 ## Debian 原生 TUI
 
-`debian-tui/` 提供普通 Debian 环境下的终端面板适配。它复用主线 `tad-module`，通过 Unix Socket 读取 `/api/status`，不直接执行 `smartctl`，也不修改功耗、风扇或 GPIO；硬盘温度、SMART 健康和休眠状态由主线后端统一检测与缓存。使用说明见 [`debian-tui/tui-readme.md`](debian-tui/tui-readme.md)。
+`debian-tui/` 提供普通 Debian 环境下的终端面板适配。它复用主线 `tad-module`，通过 Unix Socket 读取 `/api/status`，不直接执行 `smartctl`；`tank` 只负责读取缓存状态并渲染终端，不直接读写硬件。硬盘温度、SMART 健康和休眠状态由主线后端统一检测与缓存。使用说明见 [`debian-tui/tui-readme.md`](debian-tui/tui-readme.md)。
+
+### Debian 后端必须使用 root
+
+Debian TUI 的 `tad-module` 后端必须以 root 启动，这是官方 `serve()` 的硬性要求，不是可选的 systemd 配置。后端启动时会强制检查 root，并统一管理 `/sys`、`/dev`、RAPL、coretemp、hwmon/PWM、GPIO 和 SMART 等硬件接口；服务生命周期还包含启动时应用状态、后台重应用/风扇/硬盘/GPIO 轮询，以及停止时恢复原始状态。以普通用户启动会在创建 `/api/status` Socket 之前直接退出并报告 `root privileges are required`。
+
+安装脚本默认写入 `enabled=false`、风扇和 GPIO 关闭的监控配置，这只表示默认不会主动应用功耗、风扇或 GPIO 设置，不能取消后端的 root 启动要求。`tank` 本身是面向管理员的只读终端工具；root 用户可直接运行，获授权的普通 SSH 用户也可以通过 `www-data` Socket 组读取状态，但后端服务始终以 root 运行。
 
 ## 默认策略
 
