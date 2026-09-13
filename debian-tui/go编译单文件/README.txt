@@ -40,4 +40,4 @@ TAD6S4N —— Debian 原生 tank 面板
     tank 只读取 /api/status，不直接访问硬盘。
   - 风扇（it87）需第三方 fnos-it87-kmod；未装前显示 N/A。
 
-【版本】  后端 tad-module v0.10.16（官方） | 前端 tank V260906-03
+【版本】  后端 tad-module v0.10.16（官方） | 前端 tank V260913-10
