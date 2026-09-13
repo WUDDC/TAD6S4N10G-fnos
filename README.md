@@ -12,7 +12,11 @@
 
 从 [GitHub Releases](https://github.com/luodaoyi/TAD6S4N10G-fnos/releases) 下载最新的 `tad-module.fpk` 和 `tad-module.fpk.sha256`，校验 SHA256 后，在飞牛应用中心选择手动安装。
 
-仓库的 GitHub Actions 会在每次提交时完成测试和打包；推送与 `manifest` 版本一致的 `v*` 标签时，会自动创建 Release 并附加插件包。
+仓库的 GitHub Actions 会在针对 `main` 的 Pull Request、推送到 `main` 或推送 `v*` 标签时执行测试和打包；推送与 `manifest` 版本一致的 `v*` 标签时，会自动创建 Release 并附加插件包。
+
+## Debian 原生 TUI
+
+`debian-tui/` 提供普通 Debian 环境下的终端面板适配。它复用主线 `tad-module`，通过 Unix Socket 读取 `/api/status`，不直接执行 `smartctl`，也不修改功耗、风扇或 GPIO；硬盘温度、SMART 健康和休眠状态由主线后端统一检测与缓存。使用说明见 [`debian-tui/tui-readme.md`](debian-tui/tui-readme.md)。
 
 ## 默认策略
 
