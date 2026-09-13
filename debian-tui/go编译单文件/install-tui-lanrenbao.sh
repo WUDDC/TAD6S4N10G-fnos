@@ -43,7 +43,7 @@ if [ ! -f "$HERE/tad-module" ]; then
     curl -fL --silent --show-error -o "$tmp/backend.fpk" "$TANK_RELEASE_BACKEND"
     tar -xzf "$tmp/backend.fpk" -C "$tmp" app.tgz 2>/dev/null || true
     tar -xzf "$tmp/app.tgz" -C "$tmp" 2>/dev/null || true
-    [ -f "$tmp/app/bin/tad-module" ] && cp "$tmp/app/bin/tad-module" "$HERE/tad-module" || die "无法从 .fpk 提取 tad-module"
+    [ -f "$tmp/bin/tad-module" ] && cp "$tmp/bin/tad-module" "$HERE/tad-module" || die "无法从 .fpk 提取 tad-module"
     chmod 0755 "$HERE/tad-module"
     rm -rf "$tmp"
   else
