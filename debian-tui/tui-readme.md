@@ -53,7 +53,7 @@ journalctl -u tank.service -f
 - 前置 3.5" 硬盘仓（6 格，█有盘 □无盘，定宽温度）
 - 内置 M.2 NVMe（2×2，同格式）
 - 明细表（槽位/设备/状态/温度/容量型号）
-- 硬盘温度：tank 直接调 `smartctl`（不带 `-n standby`）读取，避开作者 smartctl 解析在 7.5 版的 bug；目标机建议装 `smartmontools`。
+- 硬盘温度、SMART 健康与休眠状态：由作者后端统一调用 smartctl 并缓存，tank 只读取 `/api/status`，不直接访问硬盘。
 
 ## 注意
 - **风扇**：作者 README 要求第三方 `fnos-it87-kmod`（内核自带 it87 不识别本板）。当前交付**不含**风扇控制；未装驱动前 tank 显示 `Fan: N/A` 属正常。

@@ -1,13 +1,12 @@
 // tank - TAD6S4N hardware monitor TUI (native Go, single static binary).
 //
 // Reads the module's /api/status over its Unix socket and renders a terminal
-// panel. HDD temperature is queried directly from smartctl WITH the "-n
-// standby" flag, so sleeping/standby drives are NOT woken (they simply show no
-// reading). The author's SMART parser is currently broken for smartctl 7.5's
-// object-form "power_mode", so we read smartctl ourselves.
+// panel. Hardware detection and SMART temperature caching are handled by the
+// backend; tank only reads the cached status and renders it.
 //
 // Go native (stdlib only), no python/curses. Build:
-//   CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o tank .
+//
+//	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o tank .
 package main
 
 import (
@@ -18,10 +17,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -32,18 +29,9 @@ const defSocket = "/run/tank/tad-module.sock"
 var (
 	socket     = getenv("TANK_SOCKET", defSocket)
 	refreshSec = atoi(getenv("TANK_REFRESH", "3"), 3)
-	hddCache   sync.Map
 )
 
-// hddTemp is a cached SMART temperature with the time it was read, so the
-// live panel does not keep showing a stale value forever.
-type hddTemp struct {
-	temp float64
-	at   time.Time
-}
-
 // ---- /api/status subset ----------------------------------------------------
-
 type status struct {
 	DeviceName string        `json:"device_name"`
 	OSName     string        `json:"os_name"`
@@ -64,12 +52,12 @@ type pkgInfo struct {
 	PL2W int64 `json:"pl2_w"`
 }
 type fanControl struct {
-	DriverDetected bool     `json:"driver_detected"`
-	Active         bool     `json:"active"`
-	Temperature    float64  `json:"temperature_c"`
-	HDDTemperature float64  `json:"hdd_temperature_c"`
-	NVMeTemperature float64 `json:"nvme_temperature_c"`
-	Fans           []fanDev `json:"fans"`
+	DriverDetected  bool     `json:"driver_detected"`
+	Active          bool     `json:"active"`
+	Temperature     float64  `json:"temperature_c"`
+	HDDTemperature  float64  `json:"hdd_temperature_c"`
+	NVMeTemperature float64  `json:"nvme_temperature_c"`
+	Fans            []fanDev `json:"fans"`
 }
 type fanDev struct {
 	ID         string `json:"id"`
@@ -130,30 +118,6 @@ func fetchStatus() (*status, error) {
 		return nil, err
 	}
 	return &st, nil
-}
-
-func readHDDTemp(dev string) (float64, bool) {
-	if v, ok := hddCache.Load("hdd:" + dev); ok {
-		if e, ok := v.(hddTemp); ok && e.temp > 0 && time.Since(e.at) < time.Duration(refreshSec)*time.Second {
-			return e.temp, true
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "smartctl", "-j", "-n", "standby", "-A", dev).Output()
-	if err != nil {
-		return 0, false
-	}
-	var doc struct {
-		Temperature struct {
-			Current float64 `json:"current"`
-		} `json:"temperature"`
-	}
-	if json.Unmarshal(out, &doc) != nil || doc.Temperature.Current <= 0 {
-		return 0, false
-	}
-	hddCache.Store("hdd:"+dev, hddTemp{temp: doc.Temperature.Current, at: time.Now()})
-	return doc.Temperature.Current, true
 }
 
 // ---- terminal io (stdlib, linux) -------------------------------------------
@@ -219,10 +183,18 @@ func termSize() (int, int) {
 // ---- rendering -------------------------------------------------------------
 
 const (
-	rst = "\033[0m"; bold = "\033[1m"; dim = "\033[2m"
-	red = "\033[31m"; green = "\033[32m"; yellow = "\033[33m"
-	cyan = "\033[36m"; white = "\033[97m"
-	hide = "\033[?25l"; show = "\033[?25h"; home = "\033[H"; clr = "\033[2J"
+	rst    = "\033[0m"
+	bold   = "\033[1m"
+	dim    = "\033[2m"
+	red    = "\033[31m"
+	green  = "\033[32m"
+	yellow = "\033[33m"
+	cyan   = "\033[36m"
+	white  = "\033[97m"
+	hide   = "\033[?25l"
+	show   = "\033[?25h"
+	home   = "\033[H"
+	clr    = "\033[2J"
 )
 
 func tempStr(c float64) string {
@@ -421,6 +393,7 @@ func drawBox(rows [][]boxCell, width int) []string {
 	out = append(out, bottom)
 	return out
 }
+
 // panelLines builds the full monitor panel as plain text lines (last line is
 // the status hint). Used by both the live renderer and the one-shot print.
 func panelLines(st *status) []string {
@@ -443,15 +416,9 @@ func panelLines(st *status) []string {
 		}
 	}
 	add("[ 前置 3.5\" 硬盘槽位 ]")
-	// enable HDD temps then build 6 cells (display 6..1 left-to-right)
 	frontCells := []boxCell{}
 	for i := len(front) - 1; i >= 0; i-- {
 		s := front[i]
-		if s.Device != "" {
-			if t, ok := readHDDTemp(s.Device); ok {
-				s.Temperature = t
-			}
-		}
 		temp := tempStr(s.Temperature)
 		if s.Temperature <= 0 {
 			temp = "00.0°C" // 空仓/休眠：仍用定宽温度占位，保证对齐
@@ -470,7 +437,6 @@ func panelLines(st *status) []string {
 	add("[ 内置 M.2 NVMe 槽位 ]")
 	bySlot := map[int]slot{}
 	for _, s := range m2 {
-		s.Temperature = s.Temperature // keep API temp for M.2
 		bySlot[s.Slot] = s
 	}
 	cell := func(num int) boxCell {
@@ -495,11 +461,6 @@ func panelLines(st *status) []string {
 	// detail table
 	add(pad("槽位", 9) + pad("设备", 10) + pad("状态", 6) + pad("温度", 8) + "容量 / 型号")
 	for _, s := range st.Storage.Slots {
-		if s.Kind == "front" && s.Device != "" {
-			if t, ok := readHDDTemp(s.Device); ok {
-				s.Temperature = t
-			}
-		}
 		model := fmt.Sprintf("%s - %s", humanSize(s.SizeBytes), s.Model)
 		line := (pad(slotLabel(s), 9) + pad(trimBase(s.Device), 10) + pad(stateWord(s.State), 6) +
 			pad(tempStr(s.Temperature), 8) + model)

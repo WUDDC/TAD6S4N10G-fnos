@@ -11,7 +11,7 @@ TAD6S4N —— Debian 原生 tank 面板
 
 【二进制从哪来】
   tad-module  作者官方后端：从官方 Release/.fpk 提取（脚本自动下载
-              https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.15/tad-module.fpk）
+              https://github.com/luodaoyi/TAD6S4N10G-fnos/releases/download/v0.10.16/tad-module.fpk）
   tank        本仓库 CI 编译（.github/workflows/tank-build.yml），首次 Release 挂出前，
               默认 TANK_RELEASE_TANK 为空——请先手动从 CI artifact 或本地编译得到 tank，
               放到本目录 ./tank；或设置 TANK_RELEASE_TANK=<tank 二进制 URL>。
@@ -31,7 +31,7 @@ TAD6S4N —— Debian 原生 tank 面板
 
 【说明】
   - 后端监控模式（enabled=false）只读，不改功耗/风扇/GPIO；后端以非 root 常驻。
-  - 硬盘温度由 tank 调 smartctl -n standby 读取（不唤醒待机盘）。
+  - 硬盘温度、SMART 健康与休眠状态由作者后端统一调用 smartctl 并缓存，tank 只读取 /api/status，不直接访问硬盘。
   - 风扇（it87）需第三方 fnos-it87-kmod；未装前显示 N/A。
 
-【版本】  后端 tad-module v0.10.15（官方） | 前端 tank V260906-03
+【版本】  后端 tad-module v0.10.16（官方） | 前端 tank V260906-03
