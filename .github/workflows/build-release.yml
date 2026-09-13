@@ -74,12 +74,22 @@ jobs:
             tad-module.fpk.sha256
           if-no-files-found: error
 
+      # GITHUB_TOKEN-created releases do not chain workflow_run/release
+      # listeners, so attach tank here atomically instead of relying on
+      # tank-build.yml's release:created trigger.
+      - name: Build tank (linux/amd64, static)
+        if: github.ref_type == 'tag'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+            go build -trimpath -ldflags "-s -w" -o tank-linux-amd64 ./debian-tui/tank.go
+          test -s tank-linux-amd64
+
       - name: Publish GitHub Release
         if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
-            tad-module.fpk tad-module.fpk.sha256 \
+            tad-module.fpk tad-module.fpk.sha256 tank-linux-amd64 \
             --title "TAD6S4N模块 ${GITHUB_REF_NAME}" \
             --generate-notes
