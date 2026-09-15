@@ -1170,6 +1170,7 @@ function updateCurveChartTextScale(svg) {
 function renderFanChart(kind = 'cpu') {
   const editor = curveEditors[kind];
   const svg = $(editor.chartID);
+  svg.classList.add(`curve-chart-${kind}`);
   const curve = curveFromInputs(kind);
   if (curve.some((point) => !Number.isFinite(point.temp_c) || !Number.isFinite(point.pwm_percent))) return;
   const { left, right, top, bottom } = CHART;
@@ -1180,12 +1181,12 @@ function renderFanChart(kind = 'cpu') {
   svg.replaceChildren();
 
   [20, 40, 60, 80, 100].forEach((temp) => {
-    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, style: 'stroke: var(--chart-grid)' }));
-    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
+    svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, class: 'chart-grid-line' }));
+    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
   });
   [30, 50, 70, 100].forEach((speed) => {
-    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), style: 'stroke: var(--chart-grid)' }));
-    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, style: 'fill: var(--muted)', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), class: 'chart-grid-line' }));
+    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
@@ -1201,8 +1202,8 @@ function renderFanChart(kind = 'cpu') {
     const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
     const currentLabelWidth = Math.max(72 / chartScale, currentLabel.length * textSize * 0.6);
     const currentX = clamp(x(actualTemp), currentLabelWidth / 2 + 4 / chartScale, CURVE_VIEWBOX.width - currentLabelWidth / 2 - 4 / chartScale);
-    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, style: 'stroke: var(--warning)', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
-    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, style: 'fill: var(--warning)', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
+    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, class: 'chart-now-line', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
+    svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, class: 'chart-now-label', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
     const selected = index === editor.selectedIndex;
@@ -1217,7 +1218,7 @@ function renderFanChart(kind = 'cpu') {
     svg.append(hitTarget);
     const node = svgElement('circle', {
       cx: nodeX, cy: nodeY, r: selected ? 9 : 7,
-      style: `fill: ${selected ? editor.color : 'var(--surface)'};`, stroke: editor.color, 'stroke-width': 3,
+      stroke: editor.color, 'stroke-width': 3,
       class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
@@ -1227,8 +1228,8 @@ function renderFanChart(kind = 'cpu') {
     const labelX = clamp(nodeX, 8 / chartScale + labelWidth / 2, CURVE_VIEWBOX.width - 8 / chartScale - labelWidth / 2);
     const labelY = nodeY < 50 / chartScale ? nodeY + 26 / chartScale : nodeY - 16 / chartScale;
     svg.append(svgElement('text', {
-      x: labelX, y: labelY, style: `fill: ${selected ? editor.color : 'var(--text-body)'};`,
-      'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: 'curve-node-label',
+      x: labelX, y: labelY,
+      'font-size': 12, 'font-weight': selected ? 800 : 600, 'text-anchor': 'middle', class: `curve-node-label${selected ? ' selected' : ''}`,
     }, label));
   });
   updateCurveChartTextScale(svg);

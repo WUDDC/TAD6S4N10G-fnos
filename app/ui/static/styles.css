@@ -19,6 +19,7 @@
   --text-body: #2f3642;
   --text-secondary: #3a404c;
   --chart-grid: rgba(72, 82, 102, .12);
+  --chart-axis: #8a919c;
   --sidebar-hover: rgba(255, 255, 255, .55);
   --radius: 10px;
   --radius-sm: 6px;
@@ -48,7 +49,8 @@
   --surface-muted: #262931;
   --text-body: #cfd3d9;
   --text-secondary: #b4bac3;
-  --chart-grid: rgba(255, 255, 255, .1);
+  --chart-grid: rgba(255, 255, 255, .25);
+  --chart-axis: #c5cbd4;
   --sidebar-hover: rgba(255, 255, 255, .08);
 }
 
@@ -1011,6 +1013,21 @@ body.modal-open { overflow: hidden; }
 .curve-node { cursor: grab; }
 .curve-node-hit { fill: transparent; stroke: transparent; pointer-events: all; }
 .curve-node-label { pointer-events: none; paint-order: stroke; stroke: #fff; stroke-width: 4px; stroke-linejoin: round; }
+
+/* 图表元素配色全部走类 + 变量：fnOS 桌面的 CSP 禁止 style 属性内联样式，
+   JS 设置的 style="..." 会被静默丢弃（表现为网格线消失、文字变黑） */
+.chart-grid-line { stroke: var(--chart-grid); }
+.chart-axis-text { fill: var(--chart-axis); }
+.chart-now-line { stroke: var(--warning); }
+.chart-now-label { fill: var(--warning); }
+.curve-node-control { fill: var(--surface); }
+.curve-node-label { fill: var(--text-body); }
+.curve-chart-cpu .curve-node-control.selected,
+.curve-chart-cpu .curve-node-label.selected { fill: #3f6ff5; }
+.curve-chart-hdd .curve-node-control.selected,
+.curve-chart-hdd .curve-node-label.selected { fill: #18a779; }
+.curve-chart-nvme .curve-node-control.selected,
+.curve-chart-nvme .curve-node-label.selected { fill: #a25bd7; }
 
 .curve-toolbar {
   display: flex;
