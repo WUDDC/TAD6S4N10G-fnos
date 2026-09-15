@@ -5,6 +5,18 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VERSION="$(sed -n 's/^version=//p' "${PROJECT_ROOT}/manifest" | head -1 | tr -d '"')"
 FNPACK="${FNPACK:-fnpack}"
 
+# 打包时把 index.html 的静态资源版本号对齐 manifest，避免浏览器沿用旧缓存的 CSS/JS
+INDEX_HTML="${PROJECT_ROOT}/app/ui/static/index.html"
+INDEX_HTML_BACKUP="$(mktemp)"
+restore_index_html() {
+  if [[ -n "${INDEX_HTML_BACKUP:-}" && -f "${INDEX_HTML_BACKUP}" ]]; then
+    mv -f "${INDEX_HTML_BACKUP}" "${INDEX_HTML}"
+  fi
+}
+trap restore_index_html EXIT
+cp "${INDEX_HTML}" "${INDEX_HTML_BACKUP}"
+sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${VERSION}/g; s/app\.js?v=[^\"]*/app.js?v=${VERSION}/g" "${INDEX_HTML}"
+
 mkdir -p "${PROJECT_ROOT}/app/bin" "${PROJECT_ROOT}/app/ui/images" "${PROJECT_ROOT}/.cache/go-build" "${PROJECT_ROOT}/.cache/go-tmp"
 
 cd "${PROJECT_ROOT}"
