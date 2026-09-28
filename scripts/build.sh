@@ -15,7 +15,13 @@ restore_index_html() {
 }
 trap restore_index_html EXIT
 cp "${INDEX_HTML}" "${INDEX_HTML_BACKUP}"
-sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${VERSION}/g; s/app\.js?v=[^\"]*/app.js?v=${VERSION}/g" "${INDEX_HTML}"
+# 测试包（0.0.1）每次构建附加时间戳：同一版本号反复出包时强制浏览器拉新，
+# 正式版保持干净的 ?v=<manifest 版本>
+CACHE_VERSION="${VERSION}"
+if [[ "${VERSION}" =~ ^0\.0\.[0-9]+$ ]]; then
+  CACHE_VERSION="${VERSION}-$(date -u +%Y%m%d%H%M%S)"
+fi
+sed -i "s/styles\.css?v=[^\"]*/styles.css?v=${CACHE_VERSION}/g; s/app\.js?v=[^\"]*/app.js?v=${CACHE_VERSION}/g" "${INDEX_HTML}"
 
 mkdir -p "${PROJECT_ROOT}/app/bin" "${PROJECT_ROOT}/app/ui/images" "${PROJECT_ROOT}/.cache/go-build" "${PROJECT_ROOT}/.cache/go-tmp"
 

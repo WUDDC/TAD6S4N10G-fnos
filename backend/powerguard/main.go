@@ -171,8 +171,19 @@ func serve(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	done := make(chan error, 1)
+	// 历史存储初始化失败只降级历史功能（/api/history 返回空），绝不影响
+	// 风扇控制等主功能——守护进程必须照常运行。
+	history, historyErr := powerguard.NewHistoryStore(filepath.Join(filepath.Dir(*state), "history.db"))
+	if historyErr != nil {
+		logger.Printf("history store disabled: %v", historyErr)
+		history = nil
+	}
+	if history != nil {
+		defer history.Close()
+		go powerguard.HistoryLoop(ctx, manager, logger, history)
+	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history}
 		done <- server.ListenAndServe()
 	}()
 	go reapplyLoop(ctx, manager, logger)
