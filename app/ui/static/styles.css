@@ -1029,6 +1029,160 @@ body.modal-open { overflow: hidden; }
 .curve-chart-nvme .curve-node-control.selected,
 .curve-chart-nvme .curve-node-label.selected { fill: #a25bd7; }
 
+/* ---- 历史图表 ---- */
+.history-chart { cursor: default; touch-action: auto; }
+.history-crosshair-line { stroke: var(--muted); stroke-dasharray: 4 4; }
+.history-tooltip {
+  position: fixed;
+  z-index: 120;
+  min-width: 150px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-secondary);
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(31, 35, 41, .16);
+  font-size: 12px;
+  line-height: 1.7;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity .12s ease;
+}
+.history-tooltip.visible { opacity: 1; visibility: visible; }
+.history-tip-row { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.history-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  margin: 10px 0 2px;
+  font-size: 12px;
+  color: var(--label);
+}
+.history-legend-item { position: relative; display: inline-flex; align-items: center; gap: 6px; cursor: pointer; user-select: none; }
+.history-legend-item input[type="checkbox"] {
+  accent-color: var(--primary);
+  margin: 0 2px 0 0;
+  cursor: pointer;
+  width: 14px;
+  height: 14px;
+}
+.history-popover-arrow {
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+.history-popover-arrow:hover { color: var(--primary); }
+.history-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 130;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 170px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(31, 35, 41, .16);
+  font-size: 12px;
+  cursor: default;
+}
+.history-popover-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 2px;
+  border-radius: 4px;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.history-popover-row:hover { background: var(--surface-muted); color: var(--text); }
+.history-popover-empty { color: var(--muted); padding: 3px 2px; }
+
+/* ---- 调试页：历史数据导出菜单 ---- */
+.history-export-wrap { position: relative; display: inline-block; }
+.history-export-menu[hidden] { display: none; }
+.history-export-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 130;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 8px 24px rgba(31, 35, 41, .16);
+}
+.history-export-menu button {
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.history-export-menu button:hover { background: var(--surface-muted); color: var(--primary); }
+
+/* ---- 调试页：传感器显示名 ---- */
+.sensor-names-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
+.sensor-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: center; }
+.sensor-name-key {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sensor-name-input {
+  padding: 5px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.sensor-name-input:focus { border-color: var(--primary); outline: none; }
+@media (max-width: 599px) {
+  .sensor-name-row { grid-template-columns: 1fr; gap: 4px; }
+}
+.history-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.history-range { display: inline-flex; gap: 6px; }
+.history-range-btn {
+  padding: 4px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.history-range-btn:hover { border-color: var(--primary); color: var(--primary); }
+.history-range-btn.active {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-weight: 650;
+}
+
 .curve-toolbar {
   display: flex;
   justify-content: space-between;

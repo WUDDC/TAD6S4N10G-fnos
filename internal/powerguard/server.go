@@ -23,6 +23,7 @@ type Server struct {
 	BasePath    string
 	SocketGroup string
 	Logger      *log.Logger
+	History     *HistoryStore
 }
 
 const configRequestMaxBytes = 3 << 20
@@ -79,11 +80,15 @@ func (s *Server) ListenAndServe() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
+	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/history/export/sql", s.handleHistoryExportSQL)
+	mux.HandleFunc("/api/history/export/csv", s.handleHistoryExportCSV)
 	mux.HandleFunc("/api/debug/report", s.handleDebugReport)
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/api/config/fan", s.handleFanConfig)
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
+	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -109,6 +114,82 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if s.History == nil {
+		writeJSON(w, http.StatusOK, historyFile{Version: historyFileVersion})
+		return
+	}
+	rangeHours := parseFloatQuery(r, "range", 24)
+	samples, interval, err := s.History.Aggregated(r.Context(), rangeHours, historyMaxPoints, time.Now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读取历史数据失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, historyFile{Version: historyFileVersion, IntervalSeconds: interval, Samples: samples})
+}
+
+// handleHistoryExportSQL 下载 history.db 的一致性快照（VACUUM INTO，含 WAL 数据）。
+func (s *Server) handleHistoryExportSQL(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if s.History == nil {
+		writeError(w, http.StatusServiceUnavailable, "历史数据存储不可用")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="tad-module-history.db"`)
+	if err := s.History.ExportSQLite(r.Context(), w); err != nil {
+		s.Logger.Printf("history sql export failed: %v", err)
+	}
+}
+
+// handleHistoryExportCSV 把全部历史采样导出为宽表 CSV（UTF-8 带 BOM）。
+func (s *Server) handleHistoryExportCSV(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if s.History == nil {
+		writeError(w, http.StatusServiceUnavailable, "历史数据存储不可用")
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tad-module-history.csv"`)
+	if err := s.History.WriteCSV(r.Context(), w); err != nil {
+		s.Logger.Printf("history csv export failed: %v", err)
+	}
+}
+
+func parseIntQuery(r *http.Request, name string, fallback int) int {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
+}
+
+func parseFloatQuery(r *http.Request, name string, fallback float64) float64 {
+	raw := r.URL.Query().Get(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
@@ -161,6 +242,27 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Manager.SaveFanConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Names map[string]string `json:"names"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if payload.Names == nil {
+		payload.Names = map[string]string{}
+	}
+	if err := s.Manager.SaveSensorNames(payload.Names); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

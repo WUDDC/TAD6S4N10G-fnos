@@ -904,6 +904,8 @@ function activateTab(tabID, focus = false) {
     if (active && focus) tab.focus();
   });
   if (tabID === 'tab-fan') requestAnimationFrame(() => CURVE_KINDS.forEach(renderFanChart));
+  if (tabID === 'tab-history') requestAnimationFrame(() => { fetchHistory(); renderHistoryChart(); });
+  if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
 }
 
 function setupTabs() {
@@ -1236,6 +1238,700 @@ function renderFanChart(kind = 'cpu') {
   updateCurveControls(kind);
 }
 
+/* ---- 历史图表：后台每分钟采样（GET api/history?range=小时数），服务端按峰值聚合 ---- */
+
+// 父类分组：勾选父类 = 整组曲线显隐；▾ 弹窗勾选组内子类（CPU/SATA/NVMe 弹窗
+// 内含“取最高”聚合项）。
+const HISTORY_GROUPS = [
+  { key: 'cpu', label: 'CPU', color: '#3f6ff5', aggregateLabel: '取最高（核心最高）' },
+  { key: 'sata', label: 'SATA', color: '#18a779', aggregateLabel: 'SATA 取最高' },
+  { key: 'nvme', label: 'NVMe', color: '#a25bd7', aggregateLabel: 'NVMe 取最高' },
+  { key: 'gpu', label: 'GPU', color: '#e05252' },
+  { key: 'nic', label: '网卡', color: '#e6a53c' },
+  { key: 'other', label: '其它', color: '#2aa8a8' },
+  { key: 'fan', label: '风扇', color: '#d8922a' },
+];
+const HISTORY_DEFAULT_HOURS = 24;
+const HISTORY_FETCH_TTL = 45000;
+// 子类色从父类色派生：同色相、明度阶梯 ±8%、小幅交替色相偏移，
+// 保证同组曲线同色系且可区分。
+function historyHexToHsl(hex) {
+  const value = hex.replace('#', '');
+  const r = parseInt(value.slice(0, 2), 16) / 255;
+  const g = parseInt(value.slice(2, 4), 16) / 255;
+  const b = parseInt(value.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b);
+  const min = Math.min(r, g, b);
+  const l = (max + min) / 2;
+  if (max === min) return { h: 0, s: 0, l };
+  const d = max - min;
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h;
+  if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+  else if (max === g) h = ((b - r) / d + 2) / 6;
+  else h = ((r - g) / d + 4) / 6;
+  return { h: h * 360, s, l };
+}
+
+function historyChildShade(baseHex, index) {
+  const { h, s, l } = historyHexToHsl(baseHex);
+  const step = Math.ceil((index + 1) / 2) * 0.08; // 0.08, 0.16, 0.24 …
+  const lighten = index % 2 === 0;
+  const lightness = Math.min(0.85, Math.max(0.15, l + (lighten ? step : -step)));
+  const hue = (h + (lighten ? 1 : -1) * Math.min(Math.ceil((index + 1) / 2), 3) * 5 + 360) % 360;
+  return `hsl(${Math.round(hue)}, ${Math.round(Math.max(0.25, s) * 100)}%, ${Math.round(lightness * 100)}%)`;
+}
+const HISTORY_FAN_MAX_PERCENT = 100;
+
+let historyCache = null;
+let historyFetchedAt = 0;
+let historyRangeHours = HISTORY_DEFAULT_HOURS;
+let historyRangedSamples = [];   // 当前范围采样（与图上折线一致）
+let historyYBoundsState = { lo: 20, hi: 90 }; // 渲染时缓存，供十字线取点
+let historyLastCursorEvent = null; // 最后悬停位置，自动刷新重绘后恢复十字线
+let historyOpenPopoverKey = null; // 当前展开的父类弹窗
+let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
+
+let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关，缺省全开
+let historyChildSelection = loadHistoryChildSelection(); // 组内勾选，null=全部显示
+
+function loadHistorySeriesEnabled() {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem('tad-history-series') || '{}');
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch (error) { return {}; }
+}
+
+function saveHistorySeriesEnabled() {
+  try { window.localStorage.setItem('tad-history-series', JSON.stringify(historySeriesEnabled)); }
+  catch (error) { /* 忽略写入失败 */ }
+}
+
+function loadHistoryChildSelection() {
+  try {
+    const raw = JSON.parse(window.localStorage.getItem('tad-history-children') || '{}');
+    const state = raw && typeof raw === 'object' ? raw : {};
+    // 迁移旧的单盘勾选（sata/nvme 组）
+    if (!state.sata && !state.nvme) {
+      const legacy = JSON.parse(window.localStorage.getItem('tad-history-disks') || 'null');
+      if (Array.isArray(legacy)) {
+        state.sata = legacy.filter((id) => id.startsWith('front-'));
+        state.nvme = legacy.filter((id) => id.startsWith('m2-'));
+      }
+    }
+    return state;
+  } catch (error) { return {}; }
+}
+
+function saveHistoryChildSelection() {
+  try {
+    const plain = {};
+    for (const [key, value] of Object.entries(historyChildSelection)) {
+      plain[key] = value === null ? null : [...value];
+    }
+    window.localStorage.setItem('tad-history-children', JSON.stringify(plain));
+  } catch (error) { /* 忽略写入失败 */ }
+}
+
+function historyChildSelectionFor(groupKey) {
+  const selection = historyChildSelection[groupKey];
+  if (selection === null || selection === undefined) return null; // null = 全部显示（跟随数据）
+  return selection instanceof Set ? selection : new Set(selection); // 统一为 Set，调用方用 has()
+}
+
+function setHistoryChildSelection(groupKey, selection) {
+  historyChildSelection[groupKey] = selection;
+  saveHistoryChildSelection();
+}
+
+// 风扇 ID 缩写：it8613:it87.2608:fan3 → fan3
+function historyFanLabel(fanID) {
+  return String(fanID || '').slice(String(fanID).lastIndexOf(':') + 1);
+}
+
+// 保留最近 rangeHours 小时内的采样（ts 为 unix 秒）。
+function historyFilterRange(samples, rangeHours, nowTs) {
+  const cutoff = nowTs - rangeHours * 3600;
+  return samples.filter((sample) => sample.ts >= cutoff);
+}
+
+// 兜底抽稀（正常情况下服务端已聚合到 ≤480 点）：超出上限按固定步长取样
+// 并始终保留最后一个点。
+function historyThinOut(samples, maxPoints = 480) {
+  if (samples.length <= maxPoints) return samples.slice();
+  const stride = Math.ceil(samples.length / maxPoints);
+  const out = [];
+  for (let i = 0; i < samples.length; i += stride) out.push(samples[i]);
+  const last = samples[samples.length - 1];
+  if (out[out.length - 1].ts !== last.ts) out.push(last);
+  return out;
+}
+
+// 数据断口（插件停运/重启）：相邻点间隔超过 2.5 倍采样周期时断开折线。
+// 必须在抽稀前按原始间隔判断，抽稀会人为拉大点距。
+function historySplitSegments(samples, intervalSeconds) {
+  const segments = [];
+  let current = [];
+  for (let i = 0; i < samples.length; i++) {
+    if (current.length && samples[i].ts - current[current.length - 1].ts > intervalSeconds * 2.5) {
+      segments.push(current);
+      current = [];
+    }
+    current.push(samples[i]);
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+// 生成覆盖 [lo, hi] 的好看刻度（步长取 1/2/5 × 10^n）。
+function historyNiceTicks(lo, hi, targetCount = 5) {
+  if (!(hi > lo)) return [];
+  const rawStep = (hi - lo) / Math.max(1, targetCount);
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rawStep)));
+  let step = magnitude;
+  for (const multiplier of [1, 2, 5, 10]) {
+    if (magnitude * multiplier >= rawStep) { step = magnitude * multiplier; break; }
+  }
+  const ticks = [];
+  for (let value = Math.ceil(lo / step) * step; value <= hi + 1e-9; value += step) {
+    ticks.push(Math.round(value * 1e6) / 1e6);
+  }
+  return ticks;
+}
+
+// 温度轴范围：无数据用兜底区间；有数据时下界再放 5 度并按 5 度取整
+// （最低 35 度 → 从 30 开始），上界留 2 度余量。
+function historyYBounds(values, fallbackLo, fallbackHi) {
+  const defined = values.filter((value) => Number.isFinite(value) && value > 0);
+  if (!defined.length) return { lo: fallbackLo, hi: fallbackHi };
+  const min = Math.min(...defined);
+  const max = Math.max(...defined);
+  const lo = Math.max(0, Math.floor((min - 5) / 5) * 5);
+  let hi = Math.ceil((max + 2) / 5) * 5;
+  if (hi - lo < 10) hi = lo + 10;
+  return { lo, hi };
+}
+
+// 时间轴刻度：各档位固定步长（30 分钟→1 分钟、1 小时→10 分钟、6 小时→1 小时、
+// 24 小时→2 小时、7 天→6 小时、30 天→1 天），未知范围退回自动算法。
+const HISTORY_TICK_STEP_SECONDS = { 0.5: 60, 1: 600, 6: 3600, 24: 7200, 168: 21600, 720: 86400 };
+function historyTimeTicks(startSec, endSec, rangeHours) {
+  if (!(endSec > startSec)) return [];
+  let step = HISTORY_TICK_STEP_SECONDS[rangeHours];
+  if (!step) {
+    const steps = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 14400, 21600, 43200, 86400, 172800, 259200, 432000];
+    step = steps[steps.length - 1];
+    for (const candidate of steps) {
+      if ((endSec - startSec) / candidate <= 7) { step = candidate; break; }
+    }
+  }
+  const ticks = [];
+  for (let ts = Math.ceil(startSec / step) * step; ts <= endSec; ts += step) ticks.push(ts);
+  return ticks;
+}
+
+function historyFormatClock(ts) {
+  const date = new Date(ts * 1000);
+  return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+}
+
+// 刻度步长 ≥ 1 天时显示日期（如 9/15），否则显示时分。
+function historyTickLabel(ts, stepSeconds) {
+  if (stepSeconds >= 86400) {
+    const date = new Date(ts * 1000);
+    return `${date.getMonth() + 1}/${date.getDate()}`;
+  }
+  return historyFormatClock(ts);
+}
+
+// 单系列转点集：value 缺失（0/NaN，休眠或空置）的点直接剔除。
+function historySeriesPoints(samples, pick) {
+  return samples.filter((sample) => {
+    const value = pick(sample);
+    return Number.isFinite(value) && value > 0;
+  }).map((sample) => ({ ts: sample.ts, value: pick(sample) }));
+}
+
+// ---- 分组子类 ----
+// 返回每个父类当前数据下的子类 ID 列表（含特殊聚合项 __agg__）。
+
+function historyDiskIDs(samples) {
+  const ids = [];
+  samples.forEach((sample) => (sample.disks || []).forEach((disk) => {
+    if (disk.id && !ids.includes(disk.id)) ids.push(disk.id);
+  }));
+  return ids.sort();
+}
+
+// 有过 rpm>0 或 pwm>0 的才算有效风扇（没接风扇的空通道全 0，排除）。
+function historyFanIDs(samples) {
+  const fanIDs = [];
+  const hasSignal = {};
+  samples.forEach((sample) => (sample.fans || []).forEach((fan) => {
+    if (!fan.id) return;
+    if (!fanIDs.includes(fan.id)) fanIDs.push(fan.id);
+    if (fan.rpm > 0 || fan.pwm_percent > 0) hasSignal[fan.id] = true;
+  }));
+  return fanIDs.filter((id) => hasSignal[id]);
+}
+
+function historySensorsOfGroup(samples, group) {
+  const ids = [];
+  samples.forEach((sample) => (sample.sensors || []).forEach((sensor) => {
+    if (sensor.group === group && sensor.key && !ids.includes(sensor.key)) ids.push(sensor.key);
+  }));
+  return ids.sort();
+}
+
+function historyGroupChildIDs(groupKey, samples) {
+  switch (groupKey) {
+    case 'cpu': return ['__agg__', ...historySensorsOfGroup(samples, 'cpu')];
+    case 'sata': return ['__agg__', ...historyDiskIDs(samples).filter((id) => id.startsWith('front-'))];
+    case 'nvme': return ['__agg__', ...historyDiskIDs(samples).filter((id) => id.startsWith('m2-'))];
+    case 'gpu': return historySensorsOfGroup(samples, 'gpu');
+    case 'nic': return historySensorsOfGroup(samples, 'nic');
+    case 'other': return historySensorsOfGroup(samples, 'other');
+    case 'fan': return historyFanIDs(samples);
+    default: return [];
+  }
+}
+
+// 子类取值：__agg__ → 组聚合值；其余 → 按各自数据源取值（缺失剔除）。
+function historyChildValue(groupKey, childID, sample) {
+  if (childID === '__agg__') {
+    if (groupKey === 'cpu') return sample.cpu_c;
+    if (groupKey === 'sata') return sample.hdd_c;
+    if (groupKey === 'nvme') return sample.nvme_c;
+    return NaN;
+  }
+  if (groupKey === 'cpu' || groupKey === 'gpu' || groupKey === 'nic' || groupKey === 'other') {
+    const sensor = (sample.sensors || []).find((item) => item.group === groupKey && item.key === childID);
+    return sensor ? sensor.c : NaN;
+  }
+  if (groupKey === 'sata' || groupKey === 'nvme') {
+    const disk = (sample.disks || []).find((item) => item.id === childID);
+    return disk ? disk.c : NaN;
+  }
+  if (groupKey === 'fan') {
+    const fan = (sample.fans || []).find((item) => item.id === childID);
+    return fan ? fan.pwm_percent : NaN;
+  }
+  return NaN;
+}
+
+function historyChildLabel(groupKey, childID) {
+  if (childID === '__agg__') {
+    const group = HISTORY_GROUPS.find((item) => item.key === groupKey);
+    return group?.aggregateLabel || '取最高';
+  }
+  if (groupKey === 'cpu' || groupKey === 'gpu' || groupKey === 'nic' || groupKey === 'other') {
+    const custom = sensorDisplayName(childID);
+    if (custom) return custom;
+    return groupKey === 'cpu' ? childID : String(childID).split(':').pop() + `（${String(childID).split(':')[0] || groupKey}）`;
+  }
+  if (groupKey === 'sata' || groupKey === 'nvme') return historySlotLabel(childID);
+  if (groupKey === 'fan') return historyFanLabel(childID);
+  return childID;
+}
+
+// 传感器显示名：用户在调试页设置（存后端配置），未设置时退回默认短名。
+function sensorDisplayName(sensorKey) {
+  const custom = currentStatus?.config?.sensor_names?.[sensorKey];
+  return custom && custom.trim() ? custom.trim() : null;
+}
+
+// 槽位短名：front-2 → 前置2，m2-1 → M.2 1
+function historySlotLabel(slotID) {
+  const match = /^(front|m2)-([1-9])$/.exec(slotID || '');
+  if (!match) return slotID;
+  return match[1] === 'front' ? `前置${match[2]}` : `M.2 ${match[2]}`;
+}
+
+function historyChildColor(groupKey, childID, allIDs) {
+  const group = HISTORY_GROUPS.find((item) => item.key === groupKey);
+  const base = group ? group.color : '#3f6ff5';
+  if (childID === '__agg__') return base;
+  return historyChildShade(base, allIDs.indexOf(childID));
+}
+
+// 组曲线：父类开关 + 子类勾选共同决定可见性；聚合项视为一个普通子类。
+function historyGroupSeries(groupKey, samples, intervalSeconds) {
+  const childIDs = historyGroupChildIDs(groupKey, samples);
+  const selection = historyChildSelectionFor(groupKey);
+  const visible = (childID) => selection === null || selection.has(childID);
+  return childIDs
+    .filter((childID) => visible(childID))
+    .map((childID) => {
+      const points = historySeriesPoints(samples, (sample) => historyChildValue(groupKey, childID, sample));
+      return {
+        id: `${groupKey}:${childID}`,
+        color: historyChildColor(groupKey, childID, childIDs),
+        segments: historySplitSegments(points, intervalSeconds).map((segment) => historyThinOut(segment)),
+      };
+    });
+}
+
+// 单图双轴：左轴温度（动态范围），右轴风扇 0-100%。
+function renderHistoryChart() {
+  const svg = $('history-chart');
+  if (!svg) return;
+  const status = $('history-status');
+  const data = historyCache;
+  const samples = data?.samples || [];
+  if (!samples.length) {
+    svg.replaceChildren();
+    renderHistoryLegend();
+    if (status) status.textContent = '正在采样，曲线会随时间慢慢生成。';
+    return;
+  }
+  const intervalSeconds = Math.max(1, Number(data.interval_seconds) || 60);
+  const nowTs = Math.floor(Date.now() / 1000);
+  const startSec = nowTs - historyRangeHours * 3600;
+  const ranged = historyFilterRange(samples, historyRangeHours, nowTs);
+  historyRangedSamples = ranged;
+
+  // 逐父类构建曲线；温度类（CPU/SATA/NVMe/网卡/其它）走左轴，风扇走右轴
+  const tempLines = [];
+  const fanLines = [];
+  HISTORY_GROUPS.forEach((group) => {
+    if (historySeriesEnabled[group.key] === false) return;
+    const lines = historyGroupSeries(group.key, ranged, intervalSeconds);
+    lines.forEach((line) => {
+      line.yScale = group.key === 'fan' ? 'fan' : 'temp';
+      (group.key === 'fan' ? fanLines : tempLines).push(line);
+    });
+  });
+
+  const tempValues = tempLines.flatMap((line) => line.segments.flat().map((point) => point.value));
+  const bounds = historyYBounds(tempValues, 20, 90);
+  historyYBoundsState = bounds;
+
+  const chartScale = curveChartScale(svg);
+  const textSize = CURVE_TEXT_PX / chartScale;
+  const x = (ts) => CHART.left + ((clamp(ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (CHART.right - CHART.left);
+  const yTemp = (value) => CHART.bottom - ((clamp(value, bounds.lo, bounds.hi) - bounds.lo) / (bounds.hi - bounds.lo)) * (CHART.bottom - CHART.top);
+  const yFan = (percent) => CHART.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (CHART.bottom - CHART.top);
+  svg.replaceChildren();
+
+  historyNiceTicks(bounds.lo, bounds.hi, 4).forEach((tick) => {
+    svg.append(svgElement('line', { x1: CHART.left, y1: yTemp(tick), x2: CHART.right, y2: yTemp(tick), class: 'chart-grid-line' }));
+    svg.append(svgElement('text', { x: CHART.left - 8 / chartScale, y: yTemp(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${tick}°`));
+  });
+  [0, 25, 50, 75, 100].forEach((tick) => {
+    svg.append(svgElement('text', { x: CHART.right + 8 / chartScale, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
+  });
+  const timeTicks = historyTimeTicks(startSec, nowTs, historyRangeHours);
+  const tickStep = timeTicks.length > 1 ? timeTicks[1] - timeTicks[0] : 0;
+  // 网格线按档位步长全画；刻度文字过密时抽稀，避免相邻标签重叠
+  const labelEvery = Math.max(1, Math.ceil(timeTicks.length / 10));
+  timeTicks.forEach((tick, index) => {
+    svg.append(svgElement('line', { x1: x(tick), y1: CHART.top, x2: x(tick), y2: CHART.bottom, class: 'chart-grid-line' }));
+    if (index % labelEvery === 0) {
+      svg.append(svgElement('text', { x: x(tick), y: CURVE_VIEWBOX.height - 14 / chartScale, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'middle' }, historyTickLabel(tick, tickStep)));
+    }
+  });
+
+  const drawSeries = (line, yScale) => {
+    line.segments.forEach((segment) => {
+      if (segment.length < 2) return;
+      svg.append(svgElement('polyline', {
+        points: segment.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
+        fill: 'none', stroke: line.color, 'stroke-width': 3, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+      }));
+    });
+  };
+  tempLines.forEach((line) => drawSeries(line, yTemp));
+  fanLines.forEach((line) => drawSeries(line, yFan));
+
+  renderHistoryLegend();
+
+  if (status) {
+    status.textContent = `已记录 ${samples.length} 个采样点 · 更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+  }
+  // 自动刷新重绘会清掉十字线；若鼠标仍悬停在图上，按原位置恢复
+  if (historyLastCursorEvent && !$('history-tooltip')?.hidden) showHistoryCursor(historyLastCursorEvent);
+}
+
+// 图例：六个父类行 = 复选框（整组显隐）+ 色点 + ▾（展开子类勾选弹窗）。
+function renderHistoryLegend() {
+  const legend = $('history-legend');
+  if (!legend) return;
+  const identity = JSON.stringify(HISTORY_GROUPS.map((group) => ({
+    key: group.key,
+    children: historyGroupChildIDs(group.key, historyRangedSamples),
+    empty: (historyCache?.samples || []).length === 0,
+  })));
+  if (identity !== historyLegendIdentity || !legend.children.length) {
+    historyLegendIdentity = identity;
+    legend.replaceChildren();
+    HISTORY_GROUPS.forEach((group) => {
+      const item = document.createElement('span');
+      item.className = 'history-legend-item';
+      item.dataset.seriesKey = group.key;
+      const box = document.createElement('input');
+      box.type = 'checkbox';
+      box.checked = historySeriesEnabled[group.key] !== false;
+      box.addEventListener('change', () => {
+        historySeriesEnabled[group.key] = box.checked;
+        saveHistorySeriesEnabled();
+        renderHistoryChart();
+      });
+      const dot = document.createElement('i');
+      dot.className = 'history-dot';
+      dot.style.background = group.color;
+      item.append(box, dot, document.createTextNode(group.label));
+      const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
+      // 所有父类都可展开：无数据的组弹窗里显示“暂无数据”
+      const arrow = document.createElement('button');
+      arrow.type = 'button';
+      arrow.className = 'history-popover-arrow';
+      arrow.textContent = '▾';
+      arrow.setAttribute('aria-label', `选择${group.label}曲线`);
+      arrow.addEventListener('click', (event) => {
+        event.stopPropagation();
+        toggleHistoryPopover(group.key, item);
+      });
+      item.append(arrow);
+      // 父类名字整行也可点击展开；父类勾选框和弹窗内部的点击（子类勾选等）
+      // 不触发展开/折叠——弹窗在行内，冒泡到这里的点击若不排除会把弹窗
+      // 立即折叠，且子类复选框随 DOM 移除导致 change 丢失、勾选不生效
+      item.addEventListener('click', (event) => {
+        if (event.target === box) return;
+        if (event.target.closest?.('.history-popover')) return;
+        toggleHistoryPopover(group.key, item);
+      });
+      legend.append(item);
+    });
+    if (historyOpenPopoverKey) {
+      const anchor = legend.querySelector(`.history-legend-item[data-series-key="${historyOpenPopoverKey}"]`);
+      if (anchor) {
+        const popover = document.createElement('div');
+        popover.className = 'history-popover';
+        popover.dataset.seriesKey = historyOpenPopoverKey;
+        anchor.append(popover);
+        fillHistoryPopover(historyOpenPopoverKey, popover);
+      } else {
+        historyOpenPopoverKey = null;
+      }
+    }
+  }
+}
+
+// 父类弹窗：温度组首行为“取最高”，其余行为组内子类；勾选即改曲线显隐。
+function toggleHistoryPopover(groupKey, anchorItem) {
+  const existing = anchorItem.querySelector('.history-popover');
+  closeHistoryPopovers();
+  if (existing) return;
+  historyOpenPopoverKey = groupKey;
+  const popover = document.createElement('div');
+  popover.className = 'history-popover';
+  popover.dataset.seriesKey = groupKey;
+  anchorItem.append(popover);
+  fillHistoryPopover(groupKey, popover);
+}
+
+function closeHistoryPopovers() {
+  historyOpenPopoverKey = null;
+  document.querySelectorAll('.history-popover').forEach((node) => node.remove());
+}
+
+function fillHistoryPopover(groupKey, popover) {
+  const childIDs = historyGroupChildIDs(groupKey, historyRangedSamples);
+  const selection = historyChildSelectionFor(groupKey);
+  const visible = (childID) => selection === null || selection.has(childID);
+  popover.replaceChildren();
+  if (!childIDs.length) {
+    const empty = document.createElement('div');
+    empty.className = 'history-popover-empty';
+    empty.textContent = '该组暂无数据';
+    popover.append(empty);
+    return;
+  }
+  childIDs.forEach((childID) => {
+    const row = document.createElement('label');
+    row.className = 'history-popover-row';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = visible(childID);
+    box.addEventListener('change', () => {
+      const current = historyChildSelectionFor(groupKey) === null
+        ? new Set(historyGroupChildIDs(groupKey, historyRangedSamples))
+        : new Set(historyChildSelectionFor(groupKey));
+      if (box.checked) current.add(childID);
+      else current.delete(childID);
+      setHistoryChildSelection(groupKey, current);
+      renderHistoryChart();
+    });
+    const dot = document.createElement('i');
+    dot.className = 'history-dot';
+    dot.style.background = historyChildColor(groupKey, childID, childIDs); // 与曲线同色，所见即所得
+    row.append(box, dot, document.createTextNode(historyChildLabel(groupKey, childID)));
+    popover.append(row);
+  });
+}
+
+// 点击图外区域收起弹窗。
+document.addEventListener('click', (event) => {
+  if (!event.target.closest?.('.history-legend-item')) closeHistoryPopovers();
+});
+
+async function fetchHistory(force = false) {
+  if (!force && historyCache && Date.now() - historyFetchedAt < HISTORY_FETCH_TTL) {
+    renderHistoryChart();
+    return historyCache;
+  }
+  try {
+    const requestedRange = historyRangeHours;
+    const data = await request(`api/history?range=${requestedRange}`);
+    // 快速切换范围时丢弃过期响应：慢的旧请求不能覆盖当前范围的缓存
+    if (requestedRange !== historyRangeHours) return historyCache;
+    if (data && Array.isArray(data.samples)) {
+      historyCache = data;
+      historyFetchedAt = Date.now();
+      renderHistoryChart();
+    }
+  } catch (error) {
+    const status = $('history-status');
+    if (status) status.textContent = `历史数据读取失败：${error.message}`;
+  }
+  return historyCache;
+}
+
+function setupHistoryPanel() {
+  document.querySelectorAll('.history-range-btn').forEach((button) => {
+    button.addEventListener('click', () => {
+      const hours = Number(button.dataset.range);
+      if (!hours) return;
+      historyRangeHours = hours;
+      document.querySelectorAll('.history-range-btn').forEach((other) => other.classList.toggle('active', other === button));
+      fetchHistory(true);
+    });
+  });
+  setupHistoryCursor();
+}
+
+// ---- 悬浮十字线：竖虚线 + 各曲线在该时刻的数值提示框 ----
+
+function historyCursorTimeAt(event) {
+  const svg = $('history-chart');
+  if (!svg) return null;
+  const matrix = svg.getScreenCTM();
+  if (!matrix) return null;
+  const point = svg.createSVGPoint();
+  point.x = event.clientX;
+  point.y = event.clientY;
+  const local = point.matrixTransform(matrix.inverse());
+  const nowTs = Math.floor(Date.now() / 1000);
+  const startSec = nowTs - historyRangeHours * 3600;
+  const raw = startSec + ((local.x - CHART.left) / (CHART.right - CHART.left)) * historyRangeHours * 3600;
+  return Math.round(Math.min(nowTs, Math.max(startSec, raw)));
+}
+
+function historyNearestSample(ts) {
+  let best = null;
+  let bestDelta = Infinity;
+  for (const sample of historyRangedSamples) {
+    const delta = Math.abs(sample.ts - ts);
+    if (delta < bestDelta) { best = sample; bestDelta = delta; }
+  }
+  return best;
+}
+
+// 十字线时刻各系列的取值行：与图上可见曲线同色同序。
+function historyCursorRows(sample) {
+  const rows = [];
+  HISTORY_GROUPS.forEach((group) => {
+    if (historySeriesEnabled[group.key] === false) return;
+    const selection = historyChildSelectionFor(group.key);
+    const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
+    childIDs.forEach((childID) => {
+      if (!(selection === null || selection.has(childID))) return;
+      const value = historyChildValue(group.key, childID, sample);
+      if (!(Number.isFinite(value) && value > 0)) return;
+      const color = historyChildColor(group.key, childID, childIDs);
+      const label = historyChildLabel(group.key, childID);
+      if (group.key === 'fan') {
+        const rpm = (sample.fans || []).find((fan) => fan.id === childID)?.rpm ?? 0;
+        rows.push({ color, label, text: `${rpm} RPM · ${Math.round(value)}%`, isFan: true, value });
+      } else {
+        rows.push({ color, label, text: `${value.toFixed(1)}°C`, isFan: false, value });
+      }
+    });
+  });
+  return rows;
+}
+
+function drawHistoryCrosshair(sample) {
+  const svg = $('history-chart');
+  if (!svg) return;
+  svg.querySelectorAll('.history-crosshair').forEach((node) => node.remove());
+  if (!sample) return;
+  const nowTs = Math.floor(Date.now() / 1000);
+  const startSec = nowTs - historyRangeHours * 3600;
+  const cx = CHART.left + ((clamp(sample.ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (CHART.right - CHART.left);
+  svg.append(svgElement('line', { x1: cx, y1: CHART.top, x2: cx, y2: CHART.bottom, class: 'history-crosshair history-crosshair-line' }));
+  const { lo, hi } = historyYBoundsState;
+  const yTemp = (value) => CHART.bottom - ((clamp(value, lo, hi) - lo) / (hi - lo)) * (CHART.bottom - CHART.top);
+  const yFan = (percent) => CHART.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (CHART.bottom - CHART.top);
+  historyCursorRows(sample).forEach((row) => {
+    svg.append(svgElement('circle', { cx, cy: row.isFan ? yFan(row.value) : yTemp(row.value), r: 4, class: 'history-crosshair', fill: row.color }));
+  });
+}
+
+function showHistoryCursor(event) {
+  if (!historyRangedSamples.length) return;
+  historyLastCursorEvent = { clientX: event.clientX, clientY: event.clientY };
+  const ts = historyCursorTimeAt(event);
+  if (ts == null) return;
+  const sample = historyNearestSample(ts);
+  if (!sample) return;
+  drawHistoryCrosshair(sample);
+  const tooltip = $('history-tooltip');
+  if (!tooltip) return;
+  tooltip.replaceChildren();
+  const time = document.createElement('b');
+  time.textContent = new Date(sample.ts * 1000).toLocaleString('zh-CN', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  tooltip.append(time);
+  historyCursorRows(sample).forEach((row) => {
+    const item = document.createElement('div');
+    item.className = 'history-tip-row';
+    const dot = document.createElement('i');
+    dot.className = 'history-dot';
+    dot.style.background = row.color;
+    item.append(dot, document.createTextNode(`${row.label} ${row.text}`));
+    tooltip.append(item);
+  });
+  tooltip.hidden = false;
+  tooltip.classList.add('visible');
+  const gap = 14;
+  const margin = 8;
+  const rect = tooltip.getBoundingClientRect();
+  let left = event.clientX + gap;
+  if (left + rect.width > window.innerWidth - margin) left = event.clientX - rect.width - gap;
+  const top = Math.min(Math.max(margin, event.clientY - rect.height / 2), Math.max(margin, window.innerHeight - rect.height - margin));
+  tooltip.style.left = `${Math.max(margin, left)}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+function hideHistoryCursor() {
+  historyLastCursorEvent = null;
+  const svg = $('history-chart');
+  if (svg) svg.querySelectorAll('.history-crosshair').forEach((node) => node.remove());
+  const tooltip = $('history-tooltip');
+  if (tooltip) {
+    tooltip.classList.remove('visible');
+    tooltip.hidden = true;
+  }
+}
+
+function setupHistoryCursor() {
+  const svg = $('history-chart');
+  if (!svg) return;
+  svg.addEventListener('mousemove', showHistoryCursor);
+  svg.addEventListener('mouseleave', hideHistoryCursor);
+}
+
+
 function curvePositionFromPointer(kind, event) {
   const svg = $(curveEditors[kind].chartID);
   const matrix = svg.getScreenCTM();
@@ -1470,6 +2166,53 @@ function setDebugStatus(message, error = false) {
   target.className = `message${error ? ' error' : ''}`;
 }
 
+// 宿主窗口探测（仅采集结构信息，脱敏）：fnOS 桌面标题栏由宿主绘制、无官方
+// 配色接口，深色模式下是否变深取决于宿主实现。此处从插件 iframe 向上最多
+// 12 层记录祖先链的标签/id/类名与计算背景色，用于在真机上定位窗口外壳的
+// 真实 DOM 结构；不采集任何文本内容与 URL。
+function collectHostWindowInfo() {
+  const info = {
+    embedded: window.parent !== window,
+    parentReadable: false,
+    parentThemeMode: null,
+    iframe: null,
+    ancestors: [],
+  };
+  try {
+    if (window.parent === window) return info;
+    const parent = window.parent;
+    const doc = parent.document;
+    if (!doc || !doc.body) return info;
+    info.parentReadable = true;
+    info.parentThemeMode = (doc.body.getAttribute('theme-mode') || '').trim().toLowerCase() || null;
+    let frame = null;
+    doc.querySelectorAll('iframe').forEach((candidate) => {
+      if (frame) return;
+      try { if (candidate.contentWindow === window) frame = candidate; } catch (error) { /* 跨域框架跳过 */ }
+    });
+    if (!frame) return info;
+    info.iframe = {
+      id: frame.id || null,
+      class: (`${frame.className || ''}`).slice(0, 120) || null,
+    };
+    let node = frame.parentElement;
+    for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+      const style = parent.getComputedStyle(node);
+      info.ancestors.push({
+        depth,
+        tag: node.tagName.toLowerCase(),
+        id: node.id || null,
+        class: (`${node.className || ''}`).slice(0, 160) || null,
+        backgroundColor: style.backgroundColor,
+        color: style.color,
+      });
+    }
+  } catch (error) {
+    info.error = String((error && error.message) || error);
+  }
+  return info;
+}
+
 function formatDebugReport(payload) {
   const generatedAt = new Date().toISOString();
   let serialized;
@@ -1478,7 +2221,13 @@ function formatDebugReport(payload) {
   } catch (error) {
     throw new Error(`报告格式化失败：${error.message}`);
   }
-  return `# TAD6S4N10G 调试报告\n\n生成时间：${generatedAt}\n\n以下内容由 GET api/debug/report 返回，用于协助定位模块问题。请在公开发布前检查是否包含敏感信息。\n\n## 接口报告\n\n\`\`\`json\n${serialized}\n\`\`\``;
+  let host;
+  try {
+    host = JSON.stringify(collectHostWindowInfo(), null, 2);
+  } catch (error) {
+    host = `{"error": ${JSON.stringify(String(error.message))}}`;
+  }
+  return `# TAD6S4N10G 调试报告\n\n生成时间：${generatedAt}\n\n以下内容由 GET api/debug/report 返回，用于协助定位模块问题。请在公开发布前检查是否包含敏感信息。\n\n## 接口报告\n\n\`\`\`json\n${serialized}\n\`\`\`\n\n## 宿主窗口环境（页面采集，仅结构信息）\n\n\`\`\`json\n${host}\n\`\`\``;
 }
 
 function updateDebugReportActions(enabled) {
@@ -1534,6 +2283,101 @@ async function copyDebugReport() {
   }
 }
 
+// ---- 调试页：传感器显示名设置 ----
+
+function setupSensorNames() {
+  const saveButton = $('sensor-names-save');
+  if (!saveButton) return;
+  saveButton.addEventListener('click', saveSensorNames);
+}
+
+// 从历史数据里发现全部传感器键（cpu/nic/other 组），渲染成行：默认名 + 输入框。
+function renderSensorNamesList() {
+  const wrap = $('sensor-names-list');
+  if (!wrap) return;
+  const samples = historyCache?.samples || [];
+  const keys = [];
+  samples.forEach((sample) => (sample.sensors || []).forEach((sensor) => {
+    if (sensor.group && sensor.key && !keys.includes(sensor.key)) keys.push(sensor.key);
+  }));
+  keys.sort();
+  wrap.replaceChildren();
+  if (!keys.length) {
+    const empty = document.createElement('p');
+    empty.className = 'debug-report-meta';
+    empty.textContent = '暂未发现传感器，请先打开历史图表页等待数据加载。';
+    wrap.append(empty);
+    return;
+  }
+  const saved = currentStatus?.config?.sensor_names || {};
+  keys.forEach((key) => {
+    const row = document.createElement('div');
+    row.className = 'sensor-name-row';
+    const keyLabel = document.createElement('span');
+    keyLabel.className = 'sensor-name-key';
+    keyLabel.textContent = key;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'sensor-name-input';
+    input.dataset.sensorKey = key;
+    input.value = saved[key] || '';
+    input.placeholder = historyChildLabel(key.startsWith('Core ') || key.startsWith('Package') ? 'cpu' : 'other', key);
+    input.maxLength = 40;
+    row.append(keyLabel, input);
+    wrap.append(row);
+  });
+}
+
+async function saveSensorNames() {
+  const status = $('sensor-names-status');
+  const names = {};
+  document.querySelectorAll('.sensor-name-input').forEach((input) => {
+    const value = input.value.trim();
+    if (value) names[input.dataset.sensorKey] = value;
+  });
+  try {
+    const updated = await request('api/config/sensor-names', { method: 'POST', body: JSON.stringify({ names }) });
+    render(updated, true);
+    if (status) status.textContent = `已保存 ${Object.keys(names).length} 个显示名。`;
+    renderHistoryChart();
+  } catch (error) {
+    if (status) status.textContent = `保存失败：${error.message}`;
+  }
+}
+
+// ---- 调试页：历史图表数据导出（sql 快照 / csv 宽表） ----
+
+function setupHistoryExport() {
+  const toggle = $('history-export-toggle');
+  const menu = $('history-export-menu');
+  if (!toggle || !menu) return;
+  toggle.addEventListener('click', (event) => {
+    event.stopPropagation();
+    menu.hidden = !menu.hidden;
+    toggle.setAttribute('aria-expanded', String(!menu.hidden));
+  });
+  document.addEventListener('click', (event) => {
+    if (!event.target.closest?.('.history-export-wrap')) {
+      menu.hidden = true;
+      toggle.setAttribute('aria-expanded', 'false');
+    }
+  });
+  $('history-export-sql').addEventListener('click', () => downloadHistoryExport('sql'));
+  $('history-export-csv').addEventListener('click', () => downloadHistoryExport('csv'));
+}
+
+function downloadHistoryExport(kind) {
+  const status = $('debug-status'); // 状态提示复用调试面板的 aria-live 区
+  const stamp = new Date().toISOString().slice(0, 10);
+  const link = document.createElement('a');
+  link.href = baseUrl(`api/history/export/${kind}`);
+  link.download = kind === 'sql' ? `tad-module-history-${stamp}.db` : `tad-module-history-${stamp}.csv`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  if (status) status.textContent = kind === 'sql' ? '数据库快照下载已开始。' : 'CSV 导出下载已开始。';
+}
+
 function downloadDebugReport() {
   if (!debugReportText) return;
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -1582,6 +2426,8 @@ async function refresh(keepInputs = false) {
     showMessage(`读取状态失败：${error.message}`, true);
     renderHealthBadge('连接失败', 'error', `无法读取模块状态：${error.message}`);
   }
+  const historyPanel = $('panel-history');
+  if (historyPanel && !historyPanel.hidden) fetchHistory();
 }
 
 function reportPanelValidity(panelID) {
@@ -1774,8 +2620,14 @@ function setupCurveEditor(kind) {
 }
 CURVE_KINDS.forEach(setupCurveEditor);
 function setupCurveChartScaling() {
-  const charts = CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)).filter(Boolean);
-  const update = () => CURVE_KINDS.forEach((kind) => renderFanChart(kind));
+  const charts = [
+    ...CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)),
+    $('history-chart'),
+  ].filter(Boolean);
+  const update = () => {
+    CURVE_KINDS.forEach((kind) => renderFanChart(kind));
+    renderHistoryChart();
+  };
   if (typeof ResizeObserver === 'function') {
     const observer = new ResizeObserver(update);
     charts.forEach((chart) => observer.observe(chart));
@@ -1797,6 +2649,7 @@ $('config-form').addEventListener('invalid', (event) => {
   if (tabID) activateTab(tabID);
 }, true);
 setupTabs();
+setupHistoryPanel();
 setupHealthTooltip();
 setupAppModal();
 setupFanSlotSelectors();
@@ -1809,6 +2662,8 @@ $('debug-generate-report').addEventListener('click', generateDebugReport);
 $('debug-copy-report').addEventListener('click', copyDebugReport);
 $('debug-download-report').addEventListener('click', downloadDebugReport);
 $('debug-open-issue').addEventListener('click', openDebugIssue);
+setupHistoryExport();
+setupSensorNames();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);
@@ -1880,10 +2735,19 @@ function resolveAutoTheme() {
   return detectParentTheme() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
 }
 
+// theme-color 与 styles.css 两套 --bg 同值（#f3f4f6 / #141519）。fnOS 桌面
+// 的窗口标题栏由宿主绘制，插件无法直接改色；meta 供手机浏览器地址栏等
+// 外壳取色，切主题时同步，避免深色页面顶着浅色外壳条。
+function syncThemeColorMeta(theme) {
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', theme === 'dark' ? '#141519' : '#f3f4f6');
+}
+
 function applyTheme(mode) {
   if (typeof window === 'undefined' || !window.matchMedia) return;
   const theme = mode === 'auto' ? resolveAutoTheme() : mode;
   document.documentElement.dataset.theme = theme;
+  syncThemeColorMeta(theme);
   const meta = THEME_META[mode];
   const button = $('theme-toggle');
   if (button) {

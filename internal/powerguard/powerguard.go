@@ -57,12 +57,13 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool       `json:"enabled"`
-	PL1W           int64      `json:"pl1_w"`
-	PL2W           int64      `json:"pl2_w"`
-	ReapplySeconds int        `json:"reapply_seconds"`
-	Fan            FanConfig  `json:"fan"`
-	GPIO           GPIOConfig `json:"gpio"`
+	Enabled        bool              `json:"enabled"`
+	PL1W           int64             `json:"pl1_w"`
+	PL2W           int64             `json:"pl2_w"`
+	ReapplySeconds int               `json:"reapply_seconds"`
+	Fan            FanConfig         `json:"fan"`
+	GPIO           GPIOConfig        `json:"gpio"`
+	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
 }
 
 type GlobalConfig struct {
@@ -127,25 +128,26 @@ type PackageStatus struct {
 }
 
 type Status struct {
-	Version          string               `json:"version"`
-	DeviceName       string               `json:"device_name,omitempty"`
-	OSName           string               `json:"os_name,omitempty"`
-	OSVersion        string               `json:"os_version,omitempty"`
-	CPUModel         string               `json:"cpu_model"`
-	Profile          Profile              `json:"profile"`
-	Supported        bool                 `json:"supported"`
-	Config           Config               `json:"config"`
-	EffectiveMaxPL1W int64                `json:"effective_max_pl1_w"`
-	EffectiveMaxPL2W int64                `json:"effective_max_pl2_w"`
-	Packages         []PackageStatus      `json:"packages"`
-	Temperatures     []Temperature        `json:"temperatures"`
-	CPUTemperature   CPUTemperatureStatus `json:"cpu_temperature"`
-	GPURuntime       []string             `json:"gpu_runtime"`
-	FanControl       FanControlStatus     `json:"fan_control"`
-	Storage          StorageStatus        `json:"storage"`
-	GPIO             GPIOStatus           `json:"gpio"`
-	LastApply        time.Time            `json:"last_apply,omitempty"`
-	LastError        string               `json:"last_error,omitempty"`
+	Version           string               `json:"version"`
+	DeviceName        string               `json:"device_name,omitempty"`
+	OSName            string               `json:"os_name,omitempty"`
+	OSVersion         string               `json:"os_version,omitempty"`
+	CPUModel          string               `json:"cpu_model"`
+	Profile           Profile              `json:"profile"`
+	Supported         bool                 `json:"supported"`
+	Config            Config               `json:"config"`
+	EffectiveMaxPL1W  int64                `json:"effective_max_pl1_w"`
+	EffectiveMaxPL2W  int64                `json:"effective_max_pl2_w"`
+	Packages          []PackageStatus      `json:"packages"`
+	Temperatures      []Temperature        `json:"temperatures"`
+	CPUTemperature    CPUTemperatureStatus `json:"cpu_temperature"`
+	GPURuntime        []string             `json:"gpu_runtime"`
+	ExtraTemperatures []Temperature        `json:"extra_temperatures,omitempty"`
+	FanControl        FanControlStatus     `json:"fan_control"`
+	Storage           StorageStatus        `json:"storage"`
+	GPIO              GPIOStatus           `json:"gpio"`
+	LastApply         time.Time            `json:"last_apply,omitempty"`
+	LastError         string               `json:"last_error,omitempty"`
 }
 
 type Manager struct {
@@ -324,6 +326,35 @@ func (m *Manager) SaveAndApply(cfg Config) error {
 	}
 	m.lastError = ""
 	m.lastApply = time.Now()
+	return nil
+}
+
+// SaveSensorNames 保存传感器显示名：裁剪空白、丢弃空值、限制条数与长度。
+func (m *Manager) SaveSensorNames(names map[string]string) error {
+	cleaned := make(map[string]string, len(names))
+	for key, value := range names {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || value == "" || len(key) > 80 || len([]rune(value)) > 40 {
+			continue
+		}
+		cleaned[key] = value
+		if len(cleaned) >= 200 {
+			break
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.SensorNames = cleaned
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
 	return nil
 }
 
@@ -830,6 +861,7 @@ func (m *Manager) Status() Status {
 	}
 	status.Temperatures = m.temperatures()
 	status.CPUTemperature = summarizeCPUTemperatures(status.Temperatures)
+	status.ExtraTemperatures = m.extraTemperatures()
 	status.GPURuntime = m.gpuRuntime()
 	status.FanControl = m.fanStatusLocked(status.Config.Fan)
 	status.Storage = m.StorageStatus()
@@ -872,6 +904,48 @@ func (m *Manager) temperatures() []Temperature {
 			if err == nil {
 				result = append(result, Temperature{Label: label, Celsius: float64(value) / 1000})
 			}
+		}
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
+	return result
+}
+
+// knownGPUDrivers：常见核显/独显驱动名，hwmon 温度归类到「GPU」组。
+var knownGPUDrivers = map[string]bool{
+	"i915": true, "xe": true, "amdgpu": true, "radeon": true,
+	"nouveau": true, "nvidia": true, "panfrost": true, "mgag200": true,
+}
+
+// knownNICDrivers：常见有线/无线网卡驱动名，用于把 hwmon 温度归类到「网卡」组。
+var knownNICDrivers = map[string]bool{
+	"igc": true, "igb": true, "ixgbe": true, "i40e": true, "e1000e": true, "e1000": true,
+	"r8169": true, "atlantic": true, "atl1c": true, "tg3": true, "bnxt_en": true,
+	"brcmfmac": true, "iwlwifi": true, "mt7921e": true, "rtw88_8822ce": true, "rtw89_pci": true,
+}
+
+// extraTemperatures 收集 coretemp 之外的全部 hwmon 温度（网卡、主板 Super IO、
+// ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
+func (m *Manager) extraTemperatures() []Temperature {
+	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
+	var result []Temperature
+	for _, namePath := range namePaths {
+		name, err := readTrim(namePath)
+		if err != nil || name == "coretemp" {
+			continue
+		}
+		dir := filepath.Dir(namePath)
+		inputs, _ := filepath.Glob(filepath.Join(dir, "temp*_input"))
+		for _, input := range inputs {
+			base := strings.TrimSuffix(filepath.Base(input), "_input")
+			label, _ := readTrim(filepath.Join(dir, base+"_label"))
+			if label == "" {
+				label = base
+			}
+			value, err := readInt(input)
+			if err != nil || value <= 0 {
+				continue
+			}
+			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", name, label), Celsius: float64(value) / 1000})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
