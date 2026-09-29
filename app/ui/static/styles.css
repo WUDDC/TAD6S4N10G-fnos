@@ -299,6 +299,8 @@ small {
 .gpio-heading { margin-bottom: 8px; }
 
 .toggle {
+  position: relative; /* input 的包含块：没有它 absolute input 会挂到视口，
+     静态位置在滚动内容深处，聚焦滚动把整页拉出视口（白屏第二根因） */
   display: flex;
   gap: 8px;
   align-items: center;
@@ -310,7 +312,7 @@ small {
   cursor: pointer;
 }
 
-.toggle input { position: absolute; opacity: 0; }
+.toggle input { position: absolute; top: 0; left: 0; opacity: 0; }
 
 .toggle span {
   position: relative;
