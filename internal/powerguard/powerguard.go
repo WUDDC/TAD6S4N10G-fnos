@@ -63,8 +63,9 @@ type Config struct {
 	ReapplySeconds int               `json:"reapply_seconds"`
 	Fan            FanConfig         `json:"fan"`
 	GPIO           GPIOConfig        `json:"gpio"`
-	History        HistoryConfig     `json:"history"` // 历史图表：采样开关与数据库大小上限
-	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
+	History        HistoryConfig     `json:"history"`                 // 历史图表：采样开关与数据库大小上限
+	SensorNames    map[string]string `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
+	SensorGroups   map[string]string `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
 }
 
 type GlobalConfig struct {
@@ -361,17 +362,33 @@ func (m *Manager) SaveAndApply(cfg Config) error {
 	return nil
 }
 
-// SaveSensorNames 保存传感器显示名：裁剪空白、丢弃空值、限制条数与长度。
-func (m *Manager) SaveSensorNames(names map[string]string) error {
-	cleaned := make(map[string]string, len(names))
+// sensorGroupValues：SensorGroups 覆盖允许的父类值。
+var sensorGroupValues = map[string]bool{"gpu": true, "nic": true, "other": true}
+
+// SaveSensorSettings 保存传感器显示名与父类归属覆盖：裁剪空白、丢弃空值与
+// 非法父类、限制条数与长度，一次写盘。
+func (m *Manager) SaveSensorSettings(names, groups map[string]string) error {
+	cleanedNames := make(map[string]string, len(names))
 	for key, value := range names {
 		key = strings.TrimSpace(key)
 		value = strings.TrimSpace(value)
 		if key == "" || value == "" || len(key) > 80 || len([]rune(value)) > 40 {
 			continue
 		}
-		cleaned[key] = value
-		if len(cleaned) >= 200 {
+		cleanedNames[key] = value
+		if len(cleanedNames) >= 200 {
+			break
+		}
+	}
+	cleanedGroups := make(map[string]string, len(groups))
+	for key, value := range groups {
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || len(key) > 80 || !sensorGroupValues[value] {
+			continue
+		}
+		cleanedGroups[key] = value
+		if len(cleanedGroups) >= 200 {
 			break
 		}
 	}
@@ -382,12 +399,24 @@ func (m *Manager) SaveSensorNames(names map[string]string) error {
 		m.lastError = err.Error()
 		return err
 	}
-	cfg.SensorNames = cleaned
+	cfg.SensorNames = cleanedNames
+	cfg.SensorGroups = cleanedGroups
 	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
 	return nil
+}
+
+// SensorGroupOverrides 返回用户配置的父类归属覆盖（读历史数据时应用）。
+func (m *Manager) SensorGroupOverrides() map[string]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return nil
+	}
+	return cfg.SensorGroups
 }
 
 func (m *Manager) SaveGlobalConfig(global GlobalConfig) error {
@@ -948,22 +977,33 @@ var knownGPUDrivers = map[string]bool{
 	"nouveau": true, "nvidia": true, "panfrost": true, "mgag200": true,
 }
 
-// knownNICDrivers：常见有线/无线网卡驱动名，用于把 hwmon 温度归类到「网卡」组。
+// knownNICDrivers：常见有线/无线网卡驱动名（含 mlx5 RoCE/IB 卡），用于把
+// hwmon 温度归类到「网卡」组。
 var knownNICDrivers = map[string]bool{
 	"igc": true, "igb": true, "ixgbe": true, "i40e": true, "e1000e": true, "e1000": true,
-	"r8169": true, "atlantic": true, "atl1c": true, "tg3": true, "bnxt_en": true,
+	"r8169": true, "atlantic": true, "atl1c": true, "tg3": true, "bnxt_en": true, "mlx5": true,
 	"brcmfmac": true, "iwlwifi": true, "mt7921e": true, "rtw88_8822ce": true, "rtw89_pci": true,
 }
 
 // extraTemperatures 收集 coretemp 之外的全部 hwmon 温度（网卡、主板 Super IO、
 // ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
+// 硬盘芯片（nvme/drivetemp）除外：盘温只走槽位采样（history_slots），
+// hwmon 读数与 SATA/NVMe 组的单盘曲线重复。
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
+	seen := make(map[string]int)
 	for _, namePath := range namePaths {
 		name, err := readTrim(namePath)
-		if err != nil || name == "coretemp" {
+		if err != nil || name == "coretemp" || name == "nvme" || name == "drivetemp" {
 			continue
+		}
+		// 同名芯片（多块 NVMe/多张 mlx5）加 #N 后缀：标签是 history_sensors
+		// 主键的一部分，重名会让整个采样点写库失败。
+		seen[name]++
+		prefix := name
+		if n := seen[name]; n > 1 {
+			prefix = fmt.Sprintf("%s#%d", name, n)
 		}
 		dir := filepath.Dir(namePath)
 		inputs, _ := filepath.Glob(filepath.Join(dir, "temp*_input"))
@@ -977,7 +1017,7 @@ func (m *Manager) extraTemperatures() []Temperature {
 			if err != nil || value <= 0 {
 				continue
 			}
-			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", name, label), Celsius: float64(value) / 1000})
+			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", prefix, label), Celsius: float64(value) / 1000})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })

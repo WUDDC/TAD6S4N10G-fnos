@@ -1138,7 +1138,7 @@ body.modal-open { overflow: hidden; }
 
 /* ---- 调试页：传感器显示名 ---- */
 .sensor-names-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
-.sensor-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: center; }
+.sensor-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 110px; gap: 10px; align-items: center; }
 .sensor-name-key {
   font-size: 12px;
   color: var(--muted);
@@ -1155,6 +1155,20 @@ body.modal-open { overflow: hidden; }
   font-size: 13px;
 }
 .sensor-name-input:focus { border-color: var(--primary); outline: none; }
+.sensor-name-group {
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.sensor-name-group:focus { border-color: var(--primary); outline: none; }
+.sensor-name-group-fixed {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
 @media (max-width: 599px) {
   .sensor-name-row { grid-template-columns: 1fr; gap: 4px; }
 }
