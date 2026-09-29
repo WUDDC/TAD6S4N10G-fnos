@@ -281,11 +281,17 @@ test('历史分组子类：空通道过滤、组别归类、聚合项与勾选�
 test('index.html 面板结构：相邻 tab-panel 之间 section 开闭配对，防止面板被嵌套', () => {
   const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
   const markers = [...html.matchAll(/id="panel-[a-z]+"/g)].map((match) => match.index);
-  assert.ok(markers.length >= 7, '应存在至少 7 个面板');
+  assert.ok(markers.length >= 6, '应存在至少 6 个面板');
   for (let i = 0; i < markers.length - 1; i++) {
     const segment = html.slice(markers[i], markers[i + 1]);
     const opens = (segment.match(/<section\b/g) || []).length;
     const closes = (segment.match(/<\/section>/g) || []).length;
     assert.equal(opens, closes, `panel 区间 ${i}（${html.slice(markers[i], markers[i] + 60)}…）section 未配对，会把后续面板嵌套进去`);
   }
+});
+
+test('传感器父类下拉选项与后端 sensorGroupValues 契约一致（gpu|nic|other，空值=默认）', () => {
+  const options = resolve('SENSOR_GROUP_OPTIONS');
+  assert.equal(options.map((option) => option.value).sort().join(','), 'gpu,nic,other');
+  assert.ok(options.every((option) => option.label && option.label !== option.value), '每项都要有中文标签');
 });

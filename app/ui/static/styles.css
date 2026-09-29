@@ -59,7 +59,12 @@
 html, body {
   height: 100%;
   margin: 0;
+  /* overflow:hidden 仍允许程序化/聚焦滚动：手机上点页面底部的控件时，
+   * 浏览器 scroll-into-view 会把根元素滚出视口，整个 100% 高的壳随之
+   * 离开渲染区，只剩背景色（表现为白屏）。clip 连程序化滚动一并禁止，
+   * 不支持 clip 的旧引擎回退到 hidden。 */
   overflow: hidden;
+  overflow: clip;
   background: var(--bg);
 }
 
@@ -294,6 +299,8 @@ small {
 .gpio-heading { margin-bottom: 8px; }
 
 .toggle {
+  position: relative; /* input 的包含块：没有它 absolute input 会挂到视口，
+     静态位置在滚动内容深处，聚焦滚动把整页拉出视口（白屏第二根因） */
   display: flex;
   gap: 8px;
   align-items: center;
@@ -305,7 +312,7 @@ small {
   cursor: pointer;
 }
 
-.toggle input { position: absolute; opacity: 0; }
+.toggle input { position: absolute; top: 0; left: 0; opacity: 0; }
 
 .toggle span {
   position: relative;
@@ -1138,7 +1145,7 @@ body.modal-open { overflow: hidden; }
 
 /* ---- 调试页：传感器显示名 ---- */
 .sensor-names-list { display: flex; flex-direction: column; gap: 8px; margin: 10px 0; }
-.sensor-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; align-items: center; }
+.sensor-name-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 110px; gap: 10px; align-items: center; }
 .sensor-name-key {
   font-size: 12px;
   color: var(--muted);
@@ -1155,6 +1162,20 @@ body.modal-open { overflow: hidden; }
   font-size: 13px;
 }
 .sensor-name-input:focus { border-color: var(--primary); outline: none; }
+.sensor-name-group {
+  padding: 5px 8px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+.sensor-name-group:focus { border-color: var(--primary); outline: none; }
+.sensor-name-group-fixed {
+  font-size: 12px;
+  color: var(--muted);
+  text-align: center;
+}
 @media (max-width: 599px) {
   .sensor-name-row { grid-template-columns: 1fr; gap: 4px; }
 }
@@ -1164,8 +1185,25 @@ body.modal-open { overflow: hidden; }
   border-radius: 50%;
   display: inline-block;
 }
-.history-range { display: inline-flex; gap: 6px; }
+.history-card { margin-top: 16px; }
+.history-toggle { margin: 10px 0 0; }
+.history-size-limit {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+.history-size-field { margin: 0; flex: 0 1 180px; }
+.history-limit-notice { margin-top: 10px; }
+.history-disabled-notice { color: var(--warning, #b8860b); }
+@media (max-width: 599px) {
+  .history-size-limit { flex-wrap: wrap; align-items: stretch; }
+  .history-size-field { flex: 1 1 100%; }
+}
+.history-range { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 6px; }
 .history-range-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 4px 12px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;

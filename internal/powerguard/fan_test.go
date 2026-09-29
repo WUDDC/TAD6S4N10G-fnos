@@ -198,11 +198,15 @@ func TestNormalizeConfigPreservesExplicitlyDisabledStorageMonitoring(t *testing.
 	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
 	cfg.Fan.HDDSlotIDs = []string{}
 	cfg.Fan.NVMeSlotIDs = []string{}
+	cfg.History = HistoryConfig{Enabled: false, MaxSizeMB: 32}
 	if normalizeConfig(&cfg) {
 		t.Fatal("normalized config unexpectedly changed")
 	}
 	if len(cfg.Fan.HDDSlotIDs) != 0 || len(cfg.Fan.NVMeSlotIDs) != 0 {
 		t.Fatalf("disabled storage monitoring was re-enabled: HDD=%v NVMe=%v", cfg.Fan.HDDSlotIDs, cfg.Fan.NVMeSlotIDs)
+	}
+	if cfg.History != (HistoryConfig{Enabled: false, MaxSizeMB: 32}) {
+		t.Fatalf("explicit history settings were overwritten: %+v", cfg.History)
 	}
 }
 
