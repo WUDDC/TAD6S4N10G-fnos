@@ -59,7 +59,12 @@
 html, body {
   height: 100%;
   margin: 0;
+  /* overflow:hidden 仍允许程序化/聚焦滚动：手机上点页面底部的控件时，
+   * 浏览器 scroll-into-view 会把根元素滚出视口，整个 100% 高的壳随之
+   * 离开渲染区，只剩背景色（表现为白屏）。clip 连程序化滚动一并禁止，
+   * 不支持 clip 的旧引擎回退到 hidden。 */
   overflow: hidden;
+  overflow: clip;
   background: var(--bg);
 }
 
