@@ -86,9 +86,10 @@ type HistorySample struct {
 }
 
 type historyFile struct {
-	Version         int             `json:"version"`
-	IntervalSeconds int             `json:"interval_seconds"`
-	Samples         []HistorySample `json:"samples"`
+	Version         int               `json:"version"`
+	IntervalSeconds int               `json:"interval_seconds"`
+	Samples         []HistorySample   `json:"samples"`
+	DefaultGroups   map[string]string `json:"default_groups,omitempty"` // 键→默认父类（当前规则），前端据此展示默认归属
 }
 
 // HistoryStore 把采样写入 SQLite（WAL 模式），读写并发安全。
@@ -639,21 +640,8 @@ func SampleFromStatus(st *Status, now time.Time) HistorySample {
 		}
 	}
 	for _, temp := range st.ExtraTemperatures {
-		chip := temp.Label
-		if idx := strings.Index(chip, ":"); idx > 0 {
-			chip = chip[:idx]
-		}
-		if idx := strings.Index(chip, "#"); idx > 0 { // nvme#2 → nvme，后缀只是消歧
-			chip = chip[:idx]
-		}
-		group := "other"
-		if knownNICDrivers[chip] {
-			group = "nic"
-		} else if knownGPUDrivers[chip] {
-			group = "gpu"
-		}
 		if temp.Celsius > 0 {
-			sample.Sensors = append(sample.Sensors, HistorySensorSample{Group: group, Key: temp.Label, C: temp.Celsius})
+			sample.Sensors = append(sample.Sensors, HistorySensorSample{Group: classifySensorLabel(temp.Label), Key: temp.Label, C: temp.Celsius})
 		}
 	}
 	for i := range st.FanControl.Fans {
@@ -670,6 +658,46 @@ func SampleFromStatus(st *Status, now time.Time) HistorySample {
 func (m *Manager) SampleNow(now time.Time) HistorySample {
 	status := m.Status()
 	return SampleFromStatus(&status, now)
+}
+
+// classifySensorLabel 按传感器键推断父类：无冒号（coretemp 标签，如
+// "Core 0"）为 cpu；其余取芯片名（剥 #N 消歧后缀）查驱动表。写入与读取
+// 共用同一规则，驱动表调整（如 mlx5 归网卡）后旧数据读取时也能整体归入
+// 新父类，不会出现同键曲线在两个父类间断开。
+func classifySensorLabel(label string) string {
+	idx := strings.Index(label, ":")
+	if idx <= 0 {
+		return "cpu"
+	}
+	chip := label[:idx]
+	if hash := strings.Index(chip, "#"); hash > 0 { // nvme#2 → nvme，后缀只是消歧
+		chip = chip[:hash]
+	}
+	switch {
+	case knownNICDrivers[chip]:
+		return "nic"
+	case knownGPUDrivers[chip]:
+		return "gpu"
+	default:
+		return "other"
+	}
+}
+
+// ReclassifySensorGroups 按当前分类规则重写全部采样点的传感器父类，并返回
+// 键→默认父类映射（随 /api/history 下发，前端据此展示默认归属）。
+func ReclassifySensorGroups(samples []HistorySample) map[string]string {
+	defaults := make(map[string]string)
+	for i := range samples {
+		sensors := samples[i].Sensors
+		for j := range sensors {
+			group := classifySensorLabel(sensors[j].Key)
+			sensors[j].Group = group
+			if _, ok := defaults[sensors[j].Key]; !ok {
+				defaults[sensors[j].Key] = group
+			}
+		}
+	}
+	return defaults
 }
 
 // ApplySensorGroupOverrides 按用户配置改写传感器父类归属。读时应用：

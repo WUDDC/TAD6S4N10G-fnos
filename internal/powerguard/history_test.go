@@ -728,6 +728,38 @@ func TestSampleFromStatusGroupsNumberedDuplicateChips(t *testing.T) {
 	}
 }
 
+// ReclassifySensorGroups 按当前规则重写父类并给出默认映射：
+// 旧库中 mlx5 存的 "other" 要整体迁到 "nic"，驱动表调整不断裂历史曲线。
+func TestReclassifySensorGroups(t *testing.T) {
+	samples := []HistorySample{{
+		Sensors: []HistorySensorSample{
+			{Group: "other", Key: "mlx5:temp1", C: 64},   // 旧规则写入
+			{Group: "other", Key: "mlx5#2:temp1", C: 63}, // 旧规则写入
+			{Group: "cpu", Key: "Core 0", C: 45},
+			{Group: "other", Key: "i915#2:temp1", C: 42},
+			{Group: "other", Key: "acpitz:temp1", C: 28},
+		},
+	}}
+	defaults := ReclassifySensorGroups(samples)
+	want := []HistorySensorSample{
+		{Group: "nic", Key: "mlx5:temp1", C: 64},
+		{Group: "nic", Key: "mlx5#2:temp1", C: 63},
+		{Group: "cpu", Key: "Core 0", C: 45},
+		{Group: "gpu", Key: "i915#2:temp1", C: 42},
+		{Group: "other", Key: "acpitz:temp1", C: 28},
+	}
+	if !reflect.DeepEqual(samples[0].Sensors, want) {
+		t.Fatalf("sensors=%+v, want %+v", samples[0].Sensors, want)
+	}
+	wantDefaults := map[string]string{
+		"mlx5:temp1": "nic", "mlx5#2:temp1": "nic", "Core 0": "cpu",
+		"i915#2:temp1": "gpu", "acpitz:temp1": "other",
+	}
+	if !reflect.DeepEqual(defaults, wantDefaults) {
+		t.Fatalf("defaults=%v, want %v", defaults, wantDefaults)
+	}
+}
+
 // ApplySensorGroupOverrides 在查询结果上整体改写父类归属：
 // 数据库保持默认分组，改回覆盖配置即恢复。
 func TestApplySensorGroupOverrides(t *testing.T) {

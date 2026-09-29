@@ -132,8 +132,9 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "读取历史数据失败: "+err.Error())
 		return
 	}
+	defaultGroups := ReclassifySensorGroups(samples)
 	ApplySensorGroupOverrides(samples, s.Manager.SensorGroupOverrides())
-	writeJSON(w, http.StatusOK, historyFile{Version: historyFileVersion, IntervalSeconds: interval, Samples: samples})
+	writeJSON(w, http.StatusOK, historyFile{Version: historyFileVersion, IntervalSeconds: interval, Samples: samples, DefaultGroups: defaultGroups})
 }
 
 // handleHistoryExportSQL 下载 history.db 的一致性快照（VACUUM INTO，含 WAL 数据）。

@@ -2425,18 +2425,18 @@ function renderSensorNamesList() {
       const select = document.createElement('select');
       select.className = 'sensor-name-group';
       select.dataset.sensorKey = key;
+      // 默认归属随 /api/history 下发（default_groups）；选回默认组时保存
+      // 端会自动清除覆盖，跟随驱动表自动归类。
+      select.dataset.defaultGroup = historyCache?.default_groups?.[key] || groupOf.get(key);
       select.title = '归属父类';
-      const defaultOption = document.createElement('option');
-      defaultOption.value = '';
-      defaultOption.textContent = '默认';
-      select.append(defaultOption);
       SENSOR_GROUP_OPTIONS.forEach(({ value, label }) => {
         const option = document.createElement('option');
         option.value = value;
         option.textContent = label;
         select.append(option);
       });
-      select.value = savedGroups[key] || '';
+      // 当前生效父类：用户覆盖优先，否则即默认组
+      select.value = savedGroups[key] || select.dataset.defaultGroup;
       row.append(keyLabel, input, select);
     }
     wrap.append(row);
@@ -2452,12 +2452,14 @@ async function saveSensorNames() {
   });
   const groups = {};
   document.querySelectorAll('.sensor-name-group').forEach((select) => {
-    if (select.value) groups[select.dataset.sensorKey] = select.value;
+    if (select.value && select.value !== select.dataset.defaultGroup) groups[select.dataset.sensorKey] = select.value;
   });
   try {
     const updated = await request('api/config/sensor-names', { method: 'POST', body: JSON.stringify({ names, groups }) });
     render(updated, true);
     if (status) status.textContent = `已保存 ${Object.keys(names).length} 个显示名、${Object.keys(groups).length} 个父类归属。`;
+    // 父类归属在读端生效：强制刷新历史数据，曲线立即搬到新父类
+    await fetchHistory(true);
     renderHistoryChart();
   } catch (error) {
     if (status) status.textContent = `保存失败：${error.message}`;
