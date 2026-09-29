@@ -1213,9 +1213,10 @@ function renderFanChart(kind = 'cpu') {
     svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), class: 'chart-grid-line' }));
     svg.append(svgElement('text', { x: left - axisPad, y: y(speed) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
+  // 线宽与节点尺寸除以 chartScale：viewBox 会被容器拉伸，除以缩放后才是目标真实像素（同文字的处理）
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
-    fill: 'none', stroke: editor.color, 'stroke-width': 4, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    fill: 'none', stroke: editor.color, 'stroke-width': 2.5 / chartScale, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
   }));
   const actualTemperatures = {
     cpu: currentStatus?.fan_control?.cpu_temperature_c ?? currentStatus?.fan_control?.temperature_c,
@@ -1227,7 +1228,7 @@ function renderFanChart(kind = 'cpu') {
     const currentLabel = `当前 ${actualTemp.toFixed(1)}°C`;
     const currentLabelWidth = Math.max(72 / chartScale, currentLabel.length * textSize * 0.6);
     const currentX = clamp(x(actualTemp), currentLabelWidth / 2 + 4 / chartScale, CURVE_VIEWBOX.width - currentLabelWidth / 2 - 4 / chartScale);
-    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, class: 'chart-now-line', 'stroke-width': 2, 'stroke-dasharray': '6 5' }));
+    svg.append(svgElement('line', { x1: x(actualTemp), y1: top, x2: x(actualTemp), y2: bottom, class: 'chart-now-line', 'stroke-width': 1.5 / chartScale, 'stroke-dasharray': '6 5' }));
     svg.append(svgElement('text', { x: currentX, y: textSize + 4 / chartScale, class: 'chart-now-label', 'font-size': textSize, 'text-anchor': 'middle' }, currentLabel));
   }
   curve.forEach((point, index) => {
@@ -1242,8 +1243,9 @@ function renderFanChart(kind = 'cpu') {
     });
     svg.append(hitTarget);
     const node = svgElement('circle', {
-      cx: nodeX, cy: nodeY, r: selected ? 9 : 7,
-      stroke: editor.color, 'stroke-width': 3,
+      // 真实半径约 4px（选中 5px）；命中热区 r=20 刻意不缩放，保证触控
+      cx: nodeX, cy: nodeY, r: (selected ? 5 : 4) / chartScale,
+      stroke: editor.color, 'stroke-width': 2 / chartScale,
       class: `curve-node curve-node-control${selected ? ' selected' : ''}`, 'data-index': index,
       tabindex: 0, role: 'button', 'aria-label': `节点 ${index + 1}，${point.temp_c} 摄氏度，转速 ${point.pwm_percent}%`,
     });
@@ -1683,7 +1685,7 @@ function renderHistoryChart() {
       if (segment.length < 2) return;
       svg.append(svgElement('polyline', {
         points: segment.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
-        fill: 'none', stroke: line.color, 'stroke-width': 3, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+        fill: 'none', stroke: line.color, 'stroke-width': 2 / chartScale, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
       }));
     });
   };
