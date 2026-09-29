@@ -63,7 +63,7 @@ type Config struct {
 	ReapplySeconds int               `json:"reapply_seconds"`
 	Fan            FanConfig         `json:"fan"`
 	GPIO           GPIOConfig        `json:"gpio"`
-	History        HistoryConfig     `json:"history"` // 历史图表：采样开关与数据库大小上限
+	History        HistoryConfig     `json:"history"`                // 历史图表：采样开关与数据库大小上限
 	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
 }
 
@@ -960,10 +960,18 @@ var knownNICDrivers = map[string]bool{
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
+	seen := make(map[string]int)
 	for _, namePath := range namePaths {
 		name, err := readTrim(namePath)
 		if err != nil || name == "coretemp" {
 			continue
+		}
+		// 同名芯片（多块 NVMe/多张 mlx5）加 #N 后缀：标签是 history_sensors
+		// 主键的一部分，重名会让整个采样点写库失败。
+		seen[name]++
+		prefix := name
+		if n := seen[name]; n > 1 {
+			prefix = fmt.Sprintf("%s#%d", name, n)
 		}
 		dir := filepath.Dir(namePath)
 		inputs, _ := filepath.Glob(filepath.Join(dir, "temp*_input"))
@@ -977,7 +985,7 @@ func (m *Manager) extraTemperatures() []Temperature {
 			if err != nil || value <= 0 {
 				continue
 			}
-			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", name, label), Celsius: float64(value) / 1000})
+			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", prefix, label), Celsius: float64(value) / 1000})
 		}
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })

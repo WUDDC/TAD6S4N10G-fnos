@@ -315,7 +315,7 @@ ON CONFLICT(ts) DO UPDATE SET cpu_c=excluded.cpu_c, hdd_c=excluded.hdd_c, nvme_c
 		return err
 	}
 	for _, fan := range sample.Fans {
-		if _, err := tx.Exec(`INSERT INTO history_fans (ts, fan_id, rpm, pwm_percent) VALUES (?, ?, ?, ?)`,
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO history_fans (ts, fan_id, rpm, pwm_percent) VALUES (?, ?, ?, ?)`,
 			sample.TS, fan.ID, fan.RPM, fan.PWMPercent); err != nil {
 			return err
 		}
@@ -324,7 +324,7 @@ ON CONFLICT(ts) DO UPDATE SET cpu_c=excluded.cpu_c, hdd_c=excluded.hdd_c, nvme_c
 		return err
 	}
 	for _, disk := range sample.Disks {
-		if _, err := tx.Exec(`INSERT INTO history_slots (ts, slot_id, temperature_c) VALUES (?, ?, ?)`,
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO history_slots (ts, slot_id, temperature_c) VALUES (?, ?, ?)`,
 			sample.TS, disk.ID, disk.TemperatureC); err != nil {
 			return err
 		}
@@ -333,7 +333,7 @@ ON CONFLICT(ts) DO UPDATE SET cpu_c=excluded.cpu_c, hdd_c=excluded.hdd_c, nvme_c
 		return err
 	}
 	for _, sensor := range sample.Sensors {
-		if _, err := tx.Exec(`INSERT INTO history_sensors (ts, grp, key, c) VALUES (?, ?, ?, ?)`,
+		if _, err := tx.Exec(`INSERT OR REPLACE INTO history_sensors (ts, grp, key, c) VALUES (?, ?, ?, ?)`,
 			sample.TS, sensor.Group, sensor.Key, sensor.C); err != nil {
 			return err
 		}
@@ -641,6 +641,9 @@ func SampleFromStatus(st *Status, now time.Time) HistorySample {
 	for _, temp := range st.ExtraTemperatures {
 		chip := temp.Label
 		if idx := strings.Index(chip, ":"); idx > 0 {
+			chip = chip[:idx]
+		}
+		if idx := strings.Index(chip, "#"); idx > 0 { // nvme#2 → nvme，后缀只是消歧
 			chip = chip[:idx]
 		}
 		group := "other"

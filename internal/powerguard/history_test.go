@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -686,5 +687,55 @@ func TestHistoryLoopSkipsAppendWhenDisabled(t *testing.T) {
 	}
 	if len(samples) != 1 {
 		t.Fatalf("re-enabled history should append again: %+v", samples)
+	}
+}
+
+// 同名芯片（多 NVMe/多 mlx5）在 extraTemperatures 里带 #N 后缀，
+// 分组识别必须剥掉后缀再查驱动表，否则第二块 i915 会从 GPU 组掉进其它组。
+func TestSampleFromStatusGroupsNumberedDuplicateChips(t *testing.T) {
+	status := &Status{ExtraTemperatures: []Temperature{
+		{Label: "i915:temp1", Celsius: 42},
+		{Label: "i915#2:temp1", Celsius: 41},
+		{Label: "mlx5:temp1", Celsius: 64},
+		{Label: "mlx5#2:temp1", Celsius: 63},
+	}}
+	sample := SampleFromStatus(status, time.Unix(1000, 0))
+	groups := map[string]string{}
+	for _, sensor := range sample.Sensors {
+		groups[sensor.Key] = sensor.Group
+	}
+	want := map[string]string{
+		"i915:temp1": "gpu", "i915#2:temp1": "gpu",
+		"mlx5:temp1": "other", "mlx5#2:temp1": "other",
+	}
+	if !reflect.DeepEqual(groups, want) {
+		t.Fatalf("groups=%v, want %v", groups, want)
+	}
+}
+
+// history_sensors 主键是 (ts, grp, key)：即使上游仍产出重复键
+// （旧数据回放、同名芯片），Append 也不得让整个采样点回滚丢失。
+func TestAppendToleratesDuplicateSensorKeys(t *testing.T) {
+	store, err := NewHistoryStore(filepath.Join(t.TempDir(), "history.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sample := HistorySample{
+		TS: time.Now().Unix(), CPUC: 50,
+		Sensors: []HistorySensorSample{
+			{Group: "other", Key: "nvme:temp1", C: 39.85},
+			{Group: "other", Key: "nvme:temp1", C: 43.85},
+		},
+	}
+	if err := store.Append(sample); err != nil {
+		t.Fatalf("append duplicate sensor keys: %v", err)
+	}
+	samples, _, err := store.Aggregated(context.Background(), 1, 480, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].CPUC != 50 {
+		t.Fatalf("sample lost after duplicate-key append: %+v", samples)
 	}
 }
