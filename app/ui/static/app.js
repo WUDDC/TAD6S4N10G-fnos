@@ -2375,16 +2375,24 @@ function setupSensorNames() {
   saveButton.addEventListener('click', saveSensorNames);
 }
 
-// 从历史数据里发现全部传感器键（cpu/nic/other 组），渲染成行：默认名 + 输入框。
+// 父类下拉可选项：与后端 sensorGroupValues 保持一致（gpu|nic|other）。
+const SENSOR_GROUP_OPTIONS = [
+  { value: 'gpu', label: 'GPU' },
+  { value: 'nic', label: '网卡' },
+  { value: 'other', label: '其它' },
+];
+
+// 从历史数据里发现全部传感器键，渲染成行：默认名 + 显示名输入框 + 父类下拉。
+// CPU 组传感器（核心温度）固定归 CPU 父类，不下拉。
 function renderSensorNamesList() {
   const wrap = $('sensor-names-list');
   if (!wrap) return;
   const samples = historyCache?.samples || [];
-  const keys = [];
+  const groupOf = new Map();
   samples.forEach((sample) => (sample.sensors || []).forEach((sensor) => {
-    if (sensor.group && sensor.key && !keys.includes(sensor.key)) keys.push(sensor.key);
+    if (sensor.group && sensor.key && !groupOf.has(sensor.key)) groupOf.set(sensor.key, sensor.group);
   }));
-  keys.sort();
+  const keys = [...groupOf.keys()].sort();
   wrap.replaceChildren();
   if (!keys.length) {
     const empty = document.createElement('p');
@@ -2394,6 +2402,7 @@ function renderSensorNamesList() {
     return;
   }
   const saved = currentStatus?.config?.sensor_names || {};
+  const savedGroups = currentStatus?.config?.sensor_groups || {};
   keys.forEach((key) => {
     const row = document.createElement('div');
     row.className = 'sensor-name-row';
@@ -2407,7 +2416,29 @@ function renderSensorNamesList() {
     input.value = saved[key] || '';
     input.placeholder = historyChildLabel(key.startsWith('Core ') || key.startsWith('Package') ? 'cpu' : 'other', key);
     input.maxLength = 40;
-    row.append(keyLabel, input);
+    if (groupOf.get(key) === 'cpu') {
+      const fixed = document.createElement('span');
+      fixed.className = 'sensor-name-group-fixed';
+      fixed.textContent = 'CPU';
+      row.append(keyLabel, input, fixed);
+    } else {
+      const select = document.createElement('select');
+      select.className = 'sensor-name-group';
+      select.dataset.sensorKey = key;
+      select.title = '归属父类';
+      const defaultOption = document.createElement('option');
+      defaultOption.value = '';
+      defaultOption.textContent = '默认';
+      select.append(defaultOption);
+      SENSOR_GROUP_OPTIONS.forEach(({ value, label }) => {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = label;
+        select.append(option);
+      });
+      select.value = savedGroups[key] || '';
+      row.append(keyLabel, input, select);
+    }
     wrap.append(row);
   });
 }
@@ -2419,10 +2450,14 @@ async function saveSensorNames() {
     const value = input.value.trim();
     if (value) names[input.dataset.sensorKey] = value;
   });
+  const groups = {};
+  document.querySelectorAll('.sensor-name-group').forEach((select) => {
+    if (select.value) groups[select.dataset.sensorKey] = select.value;
+  });
   try {
-    const updated = await request('api/config/sensor-names', { method: 'POST', body: JSON.stringify({ names }) });
+    const updated = await request('api/config/sensor-names', { method: 'POST', body: JSON.stringify({ names, groups }) });
     render(updated, true);
-    if (status) status.textContent = `已保存 ${Object.keys(names).length} 个显示名。`;
+    if (status) status.textContent = `已保存 ${Object.keys(names).length} 个显示名、${Object.keys(groups).length} 个父类归属。`;
     renderHistoryChart();
   } catch (error) {
     if (status) status.textContent = `保存失败：${error.message}`;

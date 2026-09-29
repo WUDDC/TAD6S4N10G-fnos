@@ -542,7 +542,7 @@ func TestHistoryExportCSVWideTable(t *testing.T) {
 	}
 }
 
-func TestSaveSensorNamesPersistsAndCleans(t *testing.T) {
+func TestSaveSensorSettingsPersistsAndCleans(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "proc"), 0o755); err != nil {
 		t.Fatal(err)
@@ -554,12 +554,21 @@ func TestSaveSensorNamesPersistsAndCleans(t *testing.T) {
 	if _, err := manager.LoadOrCreateConfig(); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.SaveSensorNames(map[string]string{
-		"it8613:temp1":          "主板温度",
-		"  acpitz:temp1  ":      "  ACPI 温区 ",
-		"igc:PHY":               "",
-		strings.Repeat("x", 81): "过长键应被丢弃",
-	}); err != nil {
+	if err := manager.SaveSensorSettings(
+		map[string]string{
+			"it8613:temp1":          "主板温度",
+			"  acpitz:temp1  ":      "  ACPI 温区 ",
+			"igc:PHY":               "",
+			strings.Repeat("x", 81): "过长键应被丢弃",
+		},
+		map[string]string{
+			"  mlx5:temp1 ":         " nic ",
+			"i915:temp1":            "other",
+			"acpitz:temp1":          "cpu",   // 非法父类：丢弃
+			"it8613:temp1":          "bogus", // 非法父类：丢弃
+			"":                      "nic",   // 空键：丢弃
+			strings.Repeat("y", 81): "nic",   // 过长键：丢弃
+		}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := manager.LoadOrCreateConfig()
@@ -578,16 +587,22 @@ func TestSaveSensorNamesPersistsAndCleans(t *testing.T) {
 	if _, exists := cfg.SensorNames[strings.Repeat("x", 81)]; exists {
 		t.Fatalf("oversized key should be dropped: %+v", cfg.SensorNames)
 	}
-	// 清空场景：传空 map 应清掉已有名称
-	if err := manager.SaveSensorNames(map[string]string{}); err != nil {
+	if cfg.SensorGroups["mlx5:temp1"] != "nic" || cfg.SensorGroups["i915:temp1"] != "other" {
+		t.Fatalf("valid groups missing: %+v", cfg.SensorGroups)
+	}
+	if len(cfg.SensorGroups) != 2 {
+		t.Fatalf("invalid/empty/oversized groups should be dropped: %+v", cfg.SensorGroups)
+	}
+	// 清空场景：传空 map 应清掉已有名称与归属
+	if err := manager.SaveSensorSettings(map[string]string{}, map[string]string{}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err = manager.LoadOrCreateConfig()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.SensorNames) != 0 {
-		t.Fatalf("empty save should clear names: %+v", cfg.SensorNames)
+	if len(cfg.SensorNames) != 0 || len(cfg.SensorGroups) != 0 {
+		t.Fatalf("empty save should clear names and groups: %+v %+v", cfg.SensorNames, cfg.SensorGroups)
 	}
 }
 
@@ -691,7 +706,7 @@ func TestHistoryLoopSkipsAppendWhenDisabled(t *testing.T) {
 }
 
 // 同名芯片（多 NVMe/多 mlx5）在 extraTemperatures 里带 #N 后缀，
-// 分组识别必须剥掉后缀再查驱动表，否则第二块 i915 会从 GPU 组掉进其它组。
+// 分组识别必须剥掉后缀再查驱动表（mlx5 归「网卡」组）。
 func TestSampleFromStatusGroupsNumberedDuplicateChips(t *testing.T) {
 	status := &Status{ExtraTemperatures: []Temperature{
 		{Label: "i915:temp1", Celsius: 42},
@@ -706,10 +721,35 @@ func TestSampleFromStatusGroupsNumberedDuplicateChips(t *testing.T) {
 	}
 	want := map[string]string{
 		"i915:temp1": "gpu", "i915#2:temp1": "gpu",
-		"mlx5:temp1": "other", "mlx5#2:temp1": "other",
+		"mlx5:temp1": "nic", "mlx5#2:temp1": "nic",
 	}
 	if !reflect.DeepEqual(groups, want) {
 		t.Fatalf("groups=%v, want %v", groups, want)
+	}
+}
+
+// ApplySensorGroupOverrides 在查询结果上整体改写父类归属：
+// 数据库保持默认分组，改回覆盖配置即恢复。
+func TestApplySensorGroupOverrides(t *testing.T) {
+	samples := []HistorySample{{
+		Sensors: []HistorySensorSample{
+			{Group: "other", Key: "mlx5:temp1", C: 64},
+			{Group: "cpu", Key: "Core 0", C: 45},
+			{Group: "gpu", Key: "i915:temp1", C: 42},
+		},
+	}}
+	ApplySensorGroupOverrides(samples, map[string]string{"mlx5:temp1": "nic", "i915:temp1": "other", "Core 0": "nic"})
+	want := []HistorySensorSample{
+		{Group: "nic", Key: "mlx5:temp1", C: 64},
+		{Group: "nic", Key: "Core 0", C: 45},
+		{Group: "other", Key: "i915:temp1", C: 42},
+	}
+	if !reflect.DeepEqual(samples[0].Sensors, want) {
+		t.Fatalf("sensors=%+v, want %+v", samples[0].Sensors, want)
+	}
+	ApplySensorGroupOverrides(samples, nil)
+	if samples[0].Sensors[0].Group != "nic" {
+		t.Fatalf("nil overrides must not touch samples: %+v", samples[0].Sensors)
 	}
 }
 

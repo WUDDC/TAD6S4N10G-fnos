@@ -672,6 +672,23 @@ func (m *Manager) SampleNow(now time.Time) HistorySample {
 	return SampleFromStatus(&status, now)
 }
 
+// ApplySensorGroupOverrides 按用户配置改写传感器父类归属。读时应用：
+// 数据库始终存默认分组（改回配置即恢复原样），查询结果整体迁移到新父类，
+// 历史曲线立即跟随，无需等新采样覆盖。
+func ApplySensorGroupOverrides(samples []HistorySample, overrides map[string]string) {
+	if len(overrides) == 0 {
+		return
+	}
+	for i := range samples {
+		sensors := samples[i].Sensors
+		for j := range sensors {
+			if group, ok := overrides[sensors[j].Key]; ok {
+				sensors[j].Group = group
+			}
+		}
+	}
+}
+
 // HistoryLoop 周期采样历史数据；启动先采一个点，让图表尽快有首条数据。
 func HistoryLoop(ctx context.Context, manager *Manager, logger *log.Logger, store *HistoryStore) {
 	store.appendAndLog(ctx, manager, logger)

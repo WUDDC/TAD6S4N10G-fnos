@@ -289,3 +289,9 @@ test('index.html 面板结构：相邻 tab-panel 之间 section 开闭配对，�
     assert.equal(opens, closes, `panel 区间 ${i}（${html.slice(markers[i], markers[i] + 60)}…）section 未配对，会把后续面板嵌套进去`);
   }
 });
+
+test('传感器父类下拉选项与后端 sensorGroupValues 契约一致（gpu|nic|other，空值=默认）', () => {
+  const options = resolve('SENSOR_GROUP_OPTIONS');
+  assert.equal(options.map((option) => option.value).sort().join(','), 'gpu,nic,other');
+  assert.ok(options.every((option) => option.label && option.label !== option.value), '每项都要有中文标签');
+});

@@ -132,6 +132,7 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "读取历史数据失败: "+err.Error())
 		return
 	}
+	ApplySensorGroupOverrides(samples, s.Manager.SensorGroupOverrides())
 	writeJSON(w, http.StatusOK, historyFile{Version: historyFileVersion, IntervalSeconds: interval, Samples: samples})
 }
 
@@ -254,7 +255,8 @@ func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var payload struct {
-		Names map[string]string `json:"names"`
+		Names  map[string]string `json:"names"`
+		Groups map[string]string `json:"groups"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
@@ -263,7 +265,10 @@ func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request)
 	if payload.Names == nil {
 		payload.Names = map[string]string{}
 	}
-	if err := s.Manager.SaveSensorNames(payload.Names); err != nil {
+	if payload.Groups == nil {
+		payload.Groups = map[string]string{}
+	}
+	if err := s.Manager.SaveSensorSettings(payload.Names, payload.Groups); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
