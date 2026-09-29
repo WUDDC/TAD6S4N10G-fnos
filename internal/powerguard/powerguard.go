@@ -957,13 +957,15 @@ var knownNICDrivers = map[string]bool{
 
 // extraTemperatures 收集 coretemp 之外的全部 hwmon 温度（网卡、主板 Super IO、
 // ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
+// 硬盘芯片（nvme/drivetemp）除外：盘温只走槽位采样（history_slots），
+// hwmon 读数与 SATA/NVMe 组的单盘曲线重复。
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
 	seen := make(map[string]int)
 	for _, namePath := range namePaths {
 		name, err := readTrim(namePath)
-		if err != nil || name == "coretemp" {
+		if err != nil || name == "coretemp" || name == "nvme" || name == "drivetemp" {
 			continue
 		}
 		// 同名芯片（多块 NVMe/多张 mlx5）加 #N 后缀：标签是 history_sensors

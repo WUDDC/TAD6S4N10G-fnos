@@ -258,7 +258,7 @@ func TestCaptureAndRestoreRejectOriginalStateFromOtherCPU(t *testing.T) {
 	}
 }
 
-// 多块同名芯片（多 NVMe/多 mlx5）的 hwmon 温度标签必须可区分：
+// 多块同名芯片（多 mlx5/多 i915）的 hwmon 温度标签必须可区分：
 // 标签作为 history_sensors 主键的一部分，重复会让整个采样点写库失败。
 func TestExtraTemperaturesDisambiguatesDuplicateChips(t *testing.T) {
 	root := t.TempDir()
@@ -267,8 +267,8 @@ func TestExtraTemperaturesDisambiguatesDuplicateChips(t *testing.T) {
 		name  string
 		temps map[string]int
 	}{
-		{"hwmon1", "nvme", map[string]int{"temp1_input": 39850}},
-		{"hwmon2", "nvme", map[string]int{"temp1_input": 43850}},
+		{"hwmon1", "mlx5", map[string]int{"temp1_input": 64000}},
+		{"hwmon2", "mlx5", map[string]int{"temp1_input": 63500}},
 		{"hwmon4", "i915", map[string]int{"temp1_input": 42000}},
 		{"hwmon5", "i915", map[string]int{"temp1_input": 41000}},
 		{"hwmon9", "coretemp", map[string]int{"temp1_input": 45000}}, // coretemp 由 temperatures() 负责
@@ -292,8 +292,44 @@ func TestExtraTemperaturesDisambiguatesDuplicateChips(t *testing.T) {
 	for _, temp := range manager.extraTemperatures() {
 		labels = append(labels, temp.Label)
 	}
-	want := []string{"i915#2:temp1", "i915:temp1", "nvme#2:temp1", "nvme:temp1"}
+	want := []string{"i915#2:temp1", "i915:temp1", "mlx5#2:temp1", "mlx5:temp1"}
 	if !reflect.DeepEqual(labels, want) {
 		t.Fatalf("labels=%v, want %v", labels, want)
+	}
+}
+
+// 硬盘芯片（nvme/drivetemp）不进 extraTemperatures：盘温只走槽位采样，
+// 否则与 SATA/NVMe 组的单盘曲线重复落进「其它」组。
+func TestExtraTemperaturesExcludesDiskChips(t *testing.T) {
+	root := t.TempDir()
+	chips := []struct {
+		dir   string
+		name  string
+		temps map[string]int
+	}{
+		{"hwmon1", "nvme", map[string]int{"temp1_input": 39850, "temp2_input": 41850}},
+		{"hwmon2", "nvme", map[string]int{"temp1_input": 43850}},
+		{"hwmon11", "drivetemp", map[string]int{"temp1_input": 39000}},
+		{"hwmon12", "drivetemp", map[string]int{"temp1_input": 41000}},
+		{"hwmon0", "acpitz", map[string]int{"temp1_input": 27800}},
+	}
+	for _, chip := range chips {
+		dir := filepath.Join(root, "sys", "class", "hwmon", chip.dir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "name"), []byte(chip.name), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		for file, value := range chip.temps {
+			if err := os.WriteFile(filepath.Join(dir, file), []byte(strconv.Itoa(value)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	manager := &Manager{Root: root}
+	temps := manager.extraTemperatures()
+	if len(temps) != 1 || temps[0].Label != "acpitz:temp1" || temps[0].Celsius != 27.8 {
+		t.Fatalf("temps=%+v, want only acpitz:temp1 27.8", temps)
 	}
 }
