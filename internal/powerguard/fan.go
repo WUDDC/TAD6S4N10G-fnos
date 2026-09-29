@@ -180,6 +180,14 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.GPIO = DefaultGPIOConfig()
 		changed = true
 	}
+	if cfg.History.MaxSizeMB == 0 {
+		// 旧版本配置文件没有 history 段：默认启用采样并套用默认大小上限
+		cfg.History = DefaultHistoryConfig()
+		changed = true
+	} else if clamped := ClampHistoryMaxSize(cfg.History.MaxSizeMB); clamped != cfg.History.MaxSizeMB {
+		cfg.History.MaxSizeMB = clamped
+		changed = true
+	}
 	for index := range cfg.GPIO.Buttons {
 		if cfg.GPIO.Buttons[index].Actions.Short != GPIOActionNone {
 			cfg.GPIO.Buttons[index].Actions.Short = GPIOActionNone

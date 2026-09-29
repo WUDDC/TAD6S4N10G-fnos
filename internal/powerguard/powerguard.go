@@ -63,6 +63,7 @@ type Config struct {
 	ReapplySeconds int               `json:"reapply_seconds"`
 	Fan            FanConfig         `json:"fan"`
 	GPIO           GPIOConfig        `json:"gpio"`
+	History        HistoryConfig     `json:"history"` // 历史图表：采样开关与数据库大小上限
 	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
 }
 
@@ -193,7 +194,38 @@ func DefaultConfig(profile Profile) Config {
 	return Config{
 		Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2,
 		ReapplySeconds: 30, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(),
+		History: DefaultHistoryConfig(),
 	}
+}
+
+// SaveHistoryConfig 只保存历史图表配置（采样开关与大小上限），不触碰功耗/风扇状态。
+func (m *Manager) SaveHistoryConfig(history HistoryConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.History = history
+	normalizeConfig(&cfg)
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
+// HistorySettings 供采样循环读取历史配置；读文件失败按默认值降级（继续采样）。
+func (m *Manager) HistorySettings() HistoryConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return DefaultHistoryConfig()
+	}
+	return cfg.History
 }
 
 func (m *Manager) CPUModel() (string, error) {

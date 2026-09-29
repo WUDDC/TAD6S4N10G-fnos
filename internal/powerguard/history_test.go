@@ -3,6 +3,7 @@ package powerguard
 import (
 	"bytes"
 	"context"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -253,6 +254,53 @@ func TestHistoryPruneRemovesExpiredRows(t *testing.T) {
 	}
 	if len(samples) != 1 || samples[0].CPUC != 55 {
 		t.Fatalf("expired rows should be pruned: %+v", samples)
+	}
+}
+
+func TestHistoryPruneKeepsTwoDayBufferBeyondDisplayWindow(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	// 展示窗口 30 天之外、存储 32 天之内：31 天前的数据必须保留
+	if err := store.Append(HistorySample{TS: now.Add(-31 * 24 * time.Hour).Unix(), CPUC: 31}); err != nil {
+		t.Fatal(err)
+	}
+	// 超过存储 32 天：轮转删除
+	if err := store.Append(HistorySample{TS: now.Add(-33 * 24 * time.Hour).Unix(), CPUC: 33}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(HistorySample{TS: now.Add(-29 * 24 * time.Hour).Unix(), CPUC: 29}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	// 展示窗口 30 天：Aggregated 只能看到 29d，31d 落在窗口外但仍在库中
+	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	visible := make([]float64, 0, len(samples))
+	for _, sample := range samples {
+		if sample.CPUC > 0 {
+			visible = append(visible, sample.CPUC)
+		}
+	}
+	if len(visible) != 1 || visible[0] != 29 {
+		t.Fatalf("display window should only see the 29d sample, got: %v", visible)
+	}
+	// 直接查库：31d 必须保留（2 天缓冲），33d 必须已轮转删除
+	var surviving int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 31`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 1 {
+		t.Fatalf("31d sample must survive within 32-day storage buffer, got %d rows", surviving)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 33`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 0 {
+		t.Fatalf("33d sample must rotate beyond 32-day retention, got %d rows", surviving)
 	}
 }
 
@@ -539,5 +587,104 @@ func TestSaveSensorNamesPersistsAndCleans(t *testing.T) {
 	}
 	if len(cfg.SensorNames) != 0 {
 		t.Fatalf("empty save should clear names: %+v", cfg.SensorNames)
+	}
+}
+
+func TestHistorySizeLimitPrunesOldestDays(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	base := now.Add(-6 * 24 * time.Hour)
+	// 6 天逐小时采样，每个点带风扇/盘位/传感器行，撑起可观测的库体积
+	for i := 0; i <= 144; i++ {
+		sample := HistorySample{
+			TS:      base.Add(time.Duration(i) * time.Hour).Unix(),
+			CPUC:    40 + float64(i%10),
+			Fans:    []HistoryFanSample{{ID: "it8613:it87.2608:fan2", RPM: 900, PWMPercent: 40}},
+			Disks:   []HistoryDiskSample{{ID: "front-2", TemperatureC: 41.5}},
+			Sensors: []HistorySensorSample{{Group: "cpu", Key: "Core 0", C: 45}},
+		}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	newest := base.Add(144 * time.Hour).Unix()
+	before := store.dbSizeBytes()
+	if before <= 1<<20 {
+		t.Fatalf("test dataset should exceed the 1MB limit, got %d bytes", before)
+	}
+	if err := store.PruneIfNeeded(now, 1); err != nil { // 1MB 上限：MB→字节换算 + 按天删最旧
+		t.Fatal(err)
+	}
+	if store.dbSizeBytes() > 1<<20 {
+		t.Fatalf("size limit not enforced: %d bytes", store.dbSizeBytes())
+	}
+	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) == 0 || samples[len(samples)-1].TS != newest {
+		t.Fatalf("newest sample must survive size pruning: %+v", samples)
+	}
+	if samples[0].TS <= base.Unix() {
+		t.Fatalf("pruning should remove from the oldest side: kept ts=%d", samples[0].TS)
+	}
+	// 0 表示不启用大小限制，此时不得报错也不得继续删除
+	kept := len(samples)
+	if err := store.PruneIfNeeded(now, 0); err != nil {
+		t.Fatal(err)
+	}
+	samples, _, _ = store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	if len(samples) != kept {
+		t.Fatalf("disabled size limit must not prune: before=%d after=%d", kept, len(samples))
+	}
+}
+
+func TestHistoryLoopSkipsAppendWhenDisabled(t *testing.T) {
+	dir := t.TempDir()
+	procDir := filepath.Join(dir, "proc")
+	if err := os.MkdirAll(procDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.json")
+	statePath := filepath.Join(dir, "state.json")
+	manager := &Manager{Root: dir, ConfigPath: configPath, StatePath: statePath}
+	if _, err := manager.LoadOrCreateConfig(); err != nil {
+		t.Fatalf("config setup: %v", err)
+	}
+	if !manager.HistorySettings().Enabled {
+		t.Fatal("history should default to enabled")
+	}
+	if err := manager.SaveHistoryConfig(HistoryConfig{Enabled: false, MaxSizeMB: 64}); err != nil {
+		t.Fatal(err)
+	}
+	if manager.HistorySettings().Enabled {
+		t.Fatal("history should be disabled after save")
+	}
+	store := newTestStore(t)
+	logger := log.New(os.Stderr, "", 0)
+	for i := 0; i < 3; i++ {
+		store.appendAndLog(context.Background(), manager, logger)
+	}
+	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 0 {
+		t.Fatalf("disabled history must not write samples: %+v", samples)
+	}
+	// 重新启用后恢复写入
+	if err := manager.SaveHistoryConfig(HistoryConfig{Enabled: true, MaxSizeMB: 64}); err != nil {
+		t.Fatal(err)
+	}
+	store.appendAndLog(context.Background(), manager, logger)
+	samples, _, err = store.Aggregated(context.Background(), historyMaxRangeHours, 2000, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 {
+		t.Fatalf("re-enabled history should append again: %+v", samples)
 	}
 }

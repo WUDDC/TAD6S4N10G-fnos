@@ -57,7 +57,6 @@
         <button id="theme-toggle" type="button" class="theme-toggle" aria-label="切换主题">🌗</button>
         <nav class="app-tabs" role="tablist" aria-label="插件功能">
           <button id="tab-temperature" type="button" role="tab" aria-selected="true" aria-controls="panel-temperature" tabindex="0"><img src="images/panel/监控面板图标.svg" alt="">监控面板</button>
-          <button id="tab-history" type="button" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1"><img src="images/panel/历史图表图标.svg" alt="">历史图表</button>
           <button id="tab-fan" type="button" role="tab" aria-selected="false" aria-controls="panel-fan" tabindex="-1"><img src="images/panel/风扇控制图标.svg" alt="">风扇控制</button>
           <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
           <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
@@ -134,30 +133,6 @@
             </dl>
             <p class="notice temperature-notice">插件仿照 RR CPUinfo，只用标签为 Core N 的传感器最大值作为 CPU 显示温度；Package 热点原值单独保留。插件不会修改飞牛内置资源监控，因此飞牛桌面的原有温度和告警颜色不会改变。</p>
             <p class="notice">降低功耗可能减少极限性能。风扇曲线依赖 IT87 驱动（安装/启动时由本插件尝试内置 DKMS 安装，已有独立驱动则跳过）；停止或卸载时会恢复首次捕获的功耗限制与 BIOS 风扇模式，但不会卸载 it87 内核模块。</p>
-          </section>
-        </section>
-
-        <section id="panel-history" class="tab-panel" role="tabpanel" aria-labelledby="tab-history" hidden>
-          <section class="card" aria-labelledby="history-heading">
-            <div class="panel-heading">
-              <div>
-                <h2 id="history-heading">历史图表</h2>
-                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化。</p>
-              </div>
-              <div class="history-range" role="group" aria-label="时间范围">
-                <button type="button" class="history-range-btn" data-range="0.5">30 分钟</button>
-                <button type="button" class="history-range-btn" data-range="1">1 小时</button>
-                <button type="button" class="history-range-btn" data-range="6">6 小时</button>
-                <button type="button" class="history-range-btn active" data-range="24">24 小时</button>
-                <button type="button" class="history-range-btn" data-range="168">7 天</button>
-                <button type="button" class="history-range-btn" data-range="720">30 天</button>
-              </div>
-            </div>
-            <div id="history-legend" class="history-legend"></div>
-            <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
-            <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
-            <p id="history-status" class="inline-status"></p>
-            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，保留最近 30 天；插件停止运行期间不采集，重启后曲线会出现断口。长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
           </section>
         </section>
 
@@ -263,6 +238,39 @@
             <button id="save-fan" type="button" class="primary">保存风扇控制</button>
           </div>
           <p id="message-fan" class="message" role="status" aria-live="polite"></p>
+
+          <section class="card history-card" aria-labelledby="history-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="history-heading">历史图表</h2>
+                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化。</p>
+              </div>
+              <div class="history-range" role="group" aria-label="时间范围">
+                <button type="button" class="history-range-btn" data-range="0.5">30 分钟</button>
+                <button type="button" class="history-range-btn" data-range="1">1 小时</button>
+                <button type="button" class="history-range-btn" data-range="6">6 小时</button>
+                <button type="button" class="history-range-btn active" data-range="24">24 小时</button>
+                <button type="button" class="history-range-btn" data-range="168">7 天</button>
+                <button type="button" class="history-range-btn" data-range="720">30 天</button>
+              </div>
+            </div>
+            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
+            <div class="history-size-limit">
+              <label class="field history-size-field">
+                <span>数据库大小上限（MB）</span>
+                <input id="history-max-size" class="text-input" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric">
+              </label>
+              <button id="save-history" type="button">保存历史设置</button>
+            </div>
+            <p id="message-history" class="message" role="status" aria-live="polite"></p>
+            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 30 天保留期与大小上限约束，超限后从最旧的一天开始删除。</p>
+            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
+            <div id="history-legend" class="history-legend"></div>
+            <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
+            <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
+            <p id="history-status" class="inline-status"></p>
+            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，保留最近 30 天；插件停止运行期间不采集，重启后曲线会出现断口。长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
+          </section>
         </section>
 
         <section id="panel-gpio" class="tab-panel" role="tabpanel" aria-labelledby="tab-gpio" hidden>
