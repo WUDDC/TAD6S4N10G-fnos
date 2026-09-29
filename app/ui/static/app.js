@@ -903,8 +903,7 @@ function activateTab(tabID, focus = false) {
     if (panel) panel.hidden = !active;
     if (active && focus) tab.focus();
   });
-  if (tabID === 'tab-fan') requestAnimationFrame(() => CURVE_KINDS.forEach(renderFanChart));
-  if (tabID === 'tab-history') requestAnimationFrame(() => { fetchHistory(); renderHistoryChart(); });
+  if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); });
   if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
 }
 
@@ -1157,6 +1156,15 @@ function curveChartScale(svg) {
   return Math.max(0.25, Math.min(width / CURVE_VIEWBOX.width, height / CURVE_VIEWBOX.height));
 }
 
+// 轴刻度换算成 viewBox 单位后的实际宽度：窄屏时 SVG 内文字字号按 1/chartScale
+// 放大以保持物理尺寸，留白必须按同一比例跟着放大。用 canvas 按页面字体栈测量。
+let historyAxisMeasureCtx = null;
+function historyAxisTextWidth(text, fontSize) {
+  if (!historyAxisMeasureCtx) historyAxisMeasureCtx = document.createElement('canvas').getContext('2d');
+  historyAxisMeasureCtx.font = `${fontSize}px "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif`;
+  return historyAxisMeasureCtx.measureText(text).width;
+}
+
 function updateCurveChartTextScale(svg) {
   if (!svg) return;
   const scale = curveChartScale(svg);
@@ -1175,20 +1183,35 @@ function renderFanChart(kind = 'cpu') {
   svg.classList.add(`curve-chart-${kind}`);
   const curve = curveFromInputs(kind);
   if (curve.some((point) => !Number.isFinite(point.temp_c) || !Number.isFinite(point.pwm_percent))) return;
-  const { left, right, top, bottom } = CHART;
+  const { right, top, bottom } = CHART;
   const chartScale = curveChartScale(svg);
   const textSize = CURVE_TEXT_PX / chartScale;
+  // 左轴最宽刻度固定是 100%；窄屏下 SVG 内字号放大，左留白同步放大，
+  // 否则转速刻度被 viewBox 裁掉。三个曲线编辑器几何一致，fanPlotBox 共用。
+  const axisPad = 8 / chartScale;
+  const left = Math.max(CHART.left, axisPad + historyAxisTextWidth('100%', textSize) + 2 / chartScale);
+  fanPlotBox = { left, right, top, bottom };
   const x = (temp) => left + ((clamp(temp, 20, 100) - 20) / 80) * (right - left);
   const y = (speed) => bottom - ((clamp(speed, 30, 100) - 30) / 70) * (bottom - top);
   svg.replaceChildren();
 
+  // 横轴标签行高随字号放大，低于绘图区底线时下移，避免顶到网格线；
+  // 标签行与纵轴刻度有垂直重叠时，端部标签压到刻度列就向图内锚定
+  const xLabelBase = Math.max(CURVE_VIEWBOX.height - 14 / chartScale, bottom + textSize * 0.75 + 1 / chartScale);
+  const xRowNearGutter = xLabelBase < bottom + textSize * 1.07;
   [20, 40, 60, 80, 100].forEach((temp) => {
     svg.append(svgElement('line', { x1: x(temp), y1: top, x2: x(temp), y2: bottom, class: 'chart-grid-line' }));
-    svg.append(svgElement('text', { x: x(temp), y: CURVE_VIEWBOX.height - 14 / chartScale, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'middle' }, `${temp}°`));
+    const label = `${temp}°`;
+    const lx = x(temp);
+    const halfLabel = historyAxisTextWidth(label, textSize) / 2;
+    let anchor = 'middle';
+    if (xRowNearGutter && lx - halfLabel < left - axisPad) anchor = 'start';
+    else if (xRowNearGutter && lx + halfLabel > right + axisPad) anchor = 'end';
+    svg.append(svgElement('text', { x: lx, y: xLabelBase, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': anchor }, label));
   });
   [30, 50, 70, 100].forEach((speed) => {
     svg.append(svgElement('line', { x1: left, y1: y(speed), x2: right, y2: y(speed), class: 'chart-grid-line' }));
-    svg.append(svgElement('text', { x: left - 8 / chartScale, y: y(speed) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
+    svg.append(svgElement('text', { x: left - axisPad, y: y(speed) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${speed}%`));
   });
   svg.append(svgElement('polyline', {
     points: curve.map((point) => `${x(point.temp_c)},${y(point.pwm_percent)}`).join(' '),
@@ -1288,6 +1311,8 @@ let historyFetchedAt = 0;
 let historyRangeHours = HISTORY_DEFAULT_HOURS;
 let historyRangedSamples = [];   // 当前范围采样（与图上折线一致）
 let historyYBoundsState = { lo: 20, hi: 90 }; // 渲染时缓存，供十字线取点
+let historyPlotBox = { ...CHART }; // 渲染时缓存绘图区（窄屏下左右边距会随字号放大），供十字线换算
+let fanPlotBox = { ...CHART }; // 曲线编辑器渲染时缓存绘图区（窄屏下左边距随字号放大），供拖拽换算
 let historyLastCursorEvent = null; // 最后悬停位置，自动刷新重绘后恢复十字线
 let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
@@ -1608,27 +1633,49 @@ function renderHistoryChart() {
 
   const chartScale = curveChartScale(svg);
   const textSize = CURVE_TEXT_PX / chartScale;
-  const x = (ts) => CHART.left + ((clamp(ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (CHART.right - CHART.left);
-  const yTemp = (value) => CHART.bottom - ((clamp(value, bounds.lo, bounds.hi) - bounds.lo) / (bounds.hi - bounds.lo)) * (CHART.bottom - CHART.top);
-  const yFan = (percent) => CHART.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (CHART.bottom - CHART.top);
+  const tempTicks = historyNiceTicks(bounds.lo, bounds.hi, 4);
+  // 左右留白按最宽轴刻度的实际宽度放大（右轴最宽固定是 100%）；
+  // 桌面 scale≥1 时不小于 CHART 原值，布局保持不变。
+  const axisPad = 8 / chartScale;
+  const leftLabelWidth = Math.max(0, ...tempTicks.map((tick) => historyAxisTextWidth(`${tick}°`, textSize)));
+  const plot = {
+    left: Math.max(CHART.left, axisPad + leftLabelWidth),
+    right: Math.min(CHART.right, CURVE_VIEWBOX.width - axisPad - historyAxisTextWidth('100%', textSize)),
+    top: CHART.top,
+    bottom: CHART.bottom,
+  };
+  historyPlotBox = plot;
+  const x = (ts) => plot.left + ((clamp(ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
+  const yTemp = (value) => plot.bottom - ((clamp(value, bounds.lo, bounds.hi) - bounds.lo) / (bounds.hi - bounds.lo)) * (plot.bottom - plot.top);
+  const yFan = (percent) => plot.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (plot.bottom - plot.top);
   svg.replaceChildren();
 
-  historyNiceTicks(bounds.lo, bounds.hi, 4).forEach((tick) => {
-    svg.append(svgElement('line', { x1: CHART.left, y1: yTemp(tick), x2: CHART.right, y2: yTemp(tick), class: 'chart-grid-line' }));
-    svg.append(svgElement('text', { x: CHART.left - 8 / chartScale, y: yTemp(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${tick}°`));
+  tempTicks.forEach((tick) => {
+    svg.append(svgElement('line', { x1: plot.left, y1: yTemp(tick), x2: plot.right, y2: yTemp(tick), class: 'chart-grid-line' }));
+    svg.append(svgElement('text', { x: plot.left - axisPad, y: yTemp(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'end' }, `${tick}°`));
   });
   [0, 25, 50, 75, 100].forEach((tick) => {
-    svg.append(svgElement('text', { x: CHART.right + 8 / chartScale, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
+    svg.append(svgElement('text', { x: plot.right + axisPad, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
   });
   const timeTicks = historyTimeTicks(startSec, nowTs, historyRangeHours);
   const tickStep = timeTicks.length > 1 ? timeTicks[1] - timeTicks[0] : 0;
-  // 网格线按档位步长全画；刻度文字过密时抽稀，避免相邻标签重叠
-  const labelEvery = Math.max(1, Math.ceil(timeTicks.length / 10));
+  // 网格线按档位步长全画；刻度文字过密时抽稀，可容纳的标签数随缩放比例减少
+  const maxLabels = Math.min(10, Math.max(5, Math.round(10 * chartScale)));
+  const labelEvery = Math.max(1, Math.ceil(timeTicks.length / maxLabels));
+  // 窄屏下横轴标签行高随字号放大，低于绘图区底线时下移，避免顶到网格线；
+  // 标签行与两侧轴刻度有垂直重叠时，端部标签压到刻度列就向图内锚定
+  const xLabelBase = Math.max(CURVE_VIEWBOX.height - 14 / chartScale, plot.bottom + textSize * 0.75 + 1 / chartScale);
+  const xRowNearGutter = xLabelBase < plot.bottom + textSize * 1.07;
   timeTicks.forEach((tick, index) => {
-    svg.append(svgElement('line', { x1: x(tick), y1: CHART.top, x2: x(tick), y2: CHART.bottom, class: 'chart-grid-line' }));
-    if (index % labelEvery === 0) {
-      svg.append(svgElement('text', { x: x(tick), y: CURVE_VIEWBOX.height - 14 / chartScale, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'middle' }, historyTickLabel(tick, tickStep)));
-    }
+    svg.append(svgElement('line', { x1: x(tick), y1: plot.top, x2: x(tick), y2: plot.bottom, class: 'chart-grid-line' }));
+    if (index % labelEvery !== 0) return;
+    const label = historyTickLabel(tick, tickStep);
+    const lx = x(tick);
+    const halfLabel = historyAxisTextWidth(label, textSize) / 2;
+    let anchor = 'middle';
+    if (xRowNearGutter && lx - halfLabel < plot.left - axisPad) anchor = 'start';
+    else if (xRowNearGutter && lx + halfLabel > plot.right + axisPad) anchor = 'end';
+    svg.append(svgElement('text', { x: lx, y: xLabelBase, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': anchor }, label));
   });
 
   const drawSeries = (line, yScale) => {
@@ -1823,7 +1870,7 @@ function historyCursorTimeAt(event) {
   const local = point.matrixTransform(matrix.inverse());
   const nowTs = Math.floor(Date.now() / 1000);
   const startSec = nowTs - historyRangeHours * 3600;
-  const raw = startSec + ((local.x - CHART.left) / (CHART.right - CHART.left)) * historyRangeHours * 3600;
+  const raw = startSec + ((local.x - historyPlotBox.left) / (historyPlotBox.right - historyPlotBox.left)) * historyRangeHours * 3600;
   return Math.round(Math.min(nowTs, Math.max(startSec, raw)));
 }
 
@@ -1868,11 +1915,12 @@ function drawHistoryCrosshair(sample) {
   if (!sample) return;
   const nowTs = Math.floor(Date.now() / 1000);
   const startSec = nowTs - historyRangeHours * 3600;
-  const cx = CHART.left + ((clamp(sample.ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (CHART.right - CHART.left);
-  svg.append(svgElement('line', { x1: cx, y1: CHART.top, x2: cx, y2: CHART.bottom, class: 'history-crosshair history-crosshair-line' }));
+  const plot = historyPlotBox;
+  const cx = plot.left + ((clamp(sample.ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
+  svg.append(svgElement('line', { x1: cx, y1: plot.top, x2: cx, y2: plot.bottom, class: 'history-crosshair history-crosshair-line' }));
   const { lo, hi } = historyYBoundsState;
-  const yTemp = (value) => CHART.bottom - ((clamp(value, lo, hi) - lo) / (hi - lo)) * (CHART.bottom - CHART.top);
-  const yFan = (percent) => CHART.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (CHART.bottom - CHART.top);
+  const yTemp = (value) => plot.bottom - ((clamp(value, lo, hi) - lo) / (hi - lo)) * (plot.bottom - plot.top);
+  const yFan = (percent) => plot.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (plot.bottom - plot.top);
   historyCursorRows(sample).forEach((row) => {
     svg.append(svgElement('circle', { cx, cy: row.isFan ? yFan(row.value) : yTemp(row.value), r: 4, class: 'history-crosshair', fill: row.color }));
   });
@@ -1941,8 +1989,8 @@ function curvePositionFromPointer(kind, event) {
   point.y = event.clientY;
   const local = point.matrixTransform(matrix.inverse());
   return {
-    temperature: 20 + ((local.x - CHART.left) / (CHART.right - CHART.left)) * 80,
-    pwm: 30 + ((CHART.bottom - local.y) / (CHART.bottom - CHART.top)) * 70,
+    temperature: 20 + ((local.x - fanPlotBox.left) / (fanPlotBox.right - fanPlotBox.left)) * 80,
+    pwm: 30 + ((fanPlotBox.bottom - local.y) / (fanPlotBox.bottom - fanPlotBox.top)) * 70,
   };
 }
 
@@ -2030,6 +2078,41 @@ function fillFanInputs(fan = {}) {
   fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
   fillFanSlotSelections(fan);
 }
+
+function fillHistoryInputs(history = {}) {
+  const enabled = history.enabled !== false; // 后端旧配置无 history 段，默认启用
+  $('history-enabled').checked = enabled;
+  const maxSize = Number(history.max_size_mb) || 64;
+  $('history-max-size').value = maxSize;
+  updateHistoryDisabledNotice(enabled);
+}
+
+function updateHistoryDisabledNotice(enabled) {
+  $('history-disabled-notice').hidden = enabled;
+}
+
+$('history-enabled').addEventListener('change', () => {
+  updateHistoryDisabledNotice($('history-enabled').checked);
+});
+
+$('save-history').addEventListener('click', async () => {
+  const maxSizeInput = $('history-max-size');
+  if (!maxSizeInput.reportValidity()) return;
+  const maxSize = Number(maxSizeInput.value);
+  if (!Number.isFinite(maxSize) || maxSize < 8 || maxSize > 1024) {
+    showMessage('数据库大小上限需在 8–1024 MB 之间。', true, 'message-history');
+    return;
+  }
+  setBusy(true);
+  try {
+    render(await request('api/config/history', { method: 'POST', body: JSON.stringify({ enabled: $('history-enabled').checked, max_size_mb: maxSize }) }), true);
+    showMessage($('history-enabled').checked ? '历史设置已保存；后台每分钟继续写入采样。' : '历史设置已保存；后台已停止写入新采样。', false, 'message-history');
+  } catch (error) {
+    showMessage(`保存失败：${error.message}`, true, 'message-history');
+  } finally {
+    setBusy(false);
+  }
+});
 
 function renderFanRPMs(fanStatus = {}) {
   const target = $('fan-rpm-list');
@@ -2150,6 +2233,7 @@ function render(status, keepInputs = false) {
     updatePowerMode(detectedPowerMode(status, status.config || {}), false);
     fillFanInputs(status.config?.fan);
     fillGPIOInputs(status.config?.gpio);
+    fillHistoryInputs(status.config?.history);
   }
   CURVE_KINDS.forEach(renderFanChart);
 }
@@ -2426,7 +2510,7 @@ async function refresh(keepInputs = false) {
     showMessage(`读取状态失败：${error.message}`, true);
     renderHealthBadge('连接失败', 'error', `无法读取模块状态：${error.message}`);
   }
-  const historyPanel = $('panel-history');
+  const historyPanel = $('panel-fan');
   if (historyPanel && !historyPanel.hidden) fetchHistory();
 }
 

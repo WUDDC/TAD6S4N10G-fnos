@@ -1164,8 +1164,25 @@ body.modal-open { overflow: hidden; }
   border-radius: 50%;
   display: inline-block;
 }
-.history-range { display: inline-flex; gap: 6px; }
+.history-card { margin-top: 16px; }
+.history-toggle { margin: 10px 0 0; }
+.history-size-limit {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+.history-size-field { margin: 0; flex: 0 1 180px; }
+.history-limit-notice { margin-top: 10px; }
+.history-disabled-notice { color: var(--warning, #b8860b); }
+@media (max-width: 599px) {
+  .history-size-limit { flex-wrap: wrap; align-items: stretch; }
+  .history-size-field { flex: 1 1 100%; }
+}
+.history-range { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 6px; }
 .history-range-btn {
+  flex: 0 0 auto;
+  white-space: nowrap;
   padding: 4px 12px;
   border: 1px solid var(--line-strong);
   border-radius: 999px;

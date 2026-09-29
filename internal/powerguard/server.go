@@ -88,6 +88,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/api/config/fan", s.handleFanConfig)
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
+	mux.HandleFunc("/api/config/history", s.handleHistoryConfig)
 	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
@@ -263,6 +264,22 @@ func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request)
 		payload.Names = map[string]string{}
 	}
 	if err := s.Manager.SaveSensorNames(payload.Names); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+func (s *Server) handleHistoryConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg HistoryConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveHistoryConfig(cfg); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

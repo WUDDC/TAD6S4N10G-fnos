@@ -20,15 +20,43 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// 历史采样参数：60 秒一个点、保留 30 天（约 4.3 万行），单文件 history.db。
+// 历史采样参数：60 秒一个点、实际存储 32 天（约 4.6 万行），单文件 history.db。
+// 满配设备每分钟约 0.7KB（主表 45B + 风扇 165B + 盘位 180B + 传感器 315B），
+// 32 天约 32–48MB，默认大小上限 64MB 是两倍余量；超限后按天删最旧数据。
+// 存储比展示窗口（historyMaxRangeHours = 30 天）多 2 天缓冲：日期/大小清理
+// 以天粒度从最旧侧删除时，用户可见的 30 天窗口前缘永远不会缺数据。
 const (
-	historyInterval      = time.Minute
-	historyRetentionDays = 30
-	historyPruneEvery    = time.Hour
-	historyMaxPoints     = 480
-	historyMaxRangeHours = 30 * 24
-	historyFileVersion   = 1 // /api/history 响应结构版本
+	historyInterval        = time.Minute
+	historyRetentionDays   = 32 // 实际保留天数；展示窗口另由 historyMaxRangeHours 钳制在 30 天
+	historyPruneEvery      = time.Hour
+	historyMaxPoints       = 480
+	historyMaxRangeHours   = 30 * 24 // 用户可查询的最大范围：30 天（< 存储的 32 天）
+	historyFileVersion     = 1       // /api/history 响应结构版本
+	historyMinMaxSizeMB    = 8
+	historyMaxMaxSizeMB    = 1024
+	historySizePruneBytes  = 24 * 60 * 60 // 大小超限时每次删除的最旧数据跨度（秒）
+	historySizePruneRounds = 64           // 单次清理最多删除的天数，防止死循环
 )
+
+type HistoryConfig struct {
+	Enabled   bool  `json:"enabled"`
+	MaxSizeMB int64 `json:"max_size_mb"`
+}
+
+func DefaultHistoryConfig() HistoryConfig {
+	return HistoryConfig{Enabled: true, MaxSizeMB: 64}
+}
+
+// ClampHistoryMaxSize 把大小上限限制在合理区间，配置文件里的非法值静默归位。
+func ClampHistoryMaxSize(maxSizeMB int64) int64 {
+	if maxSizeMB < historyMinMaxSizeMB {
+		return historyMinMaxSizeMB
+	}
+	if maxSizeMB > historyMaxMaxSizeMB {
+		return historyMaxMaxSizeMB
+	}
+	return maxSizeMB
+}
 
 type HistoryFanSample struct {
 	ID         string `json:"id"`
@@ -68,6 +96,7 @@ type historyFile struct {
 type HistoryStore struct {
 	mu        sync.Mutex
 	db        *sql.DB
+	path      string
 	lastPrune time.Time
 }
 
@@ -122,7 +151,7 @@ CREATE TABLE IF NOT EXISTS history_sensors (
 		db.Close()
 		return nil, fmt.Errorf("history schema: %w", err)
 	}
-	store := &HistoryStore{db: db, lastPrune: time.Time{}}
+	store := &HistoryStore{db: db, path: path, lastPrune: time.Time{}}
 	if err := store.Prune(time.Now()); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("history prune: %w", err)
@@ -312,13 +341,24 @@ ON CONFLICT(ts) DO UPDATE SET cpu_c=excluded.cpu_c, hdd_c=excluded.hdd_c, nvme_c
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// 顺带做低频清理：距上次超过 1 小时才真正执行 DELETE。
+	return nil
+}
+
+// PruneIfNeeded 挂在采样循环上的低频清理：日期轮转距上次超过 1 小时才真正
+// 执行 DELETE；大小上限每次都检查（仅两次 stat），超限才进入删除与 VACUUM。
+// 历史记录停用后清理照跑，让旧数据按期收敛。
+func (s *HistoryStore) PruneIfNeeded(now time.Time, maxSizeMB int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.lastPrune.IsZero() || time.Since(s.lastPrune) >= historyPruneEvery {
-		if err := s.pruneLocked(time.Unix(sample.TS, 0)); err != nil {
+		if err := s.pruneLocked(now); err != nil {
 			return err
 		}
 	}
-	return nil
+	if maxSizeMB <= 0 {
+		return nil
+	}
+	return s.enforceSizeLocked(maxSizeMB << 20)
 }
 
 // Prune 删除保留期之外的采样（history_fans 级联删除）。
@@ -335,6 +375,53 @@ func (s *HistoryStore) pruneLocked(now time.Time) error {
 	}
 	s.lastPrune = now
 	return nil
+}
+
+// dbSizeBytes 统计主库与 WAL 文件大小；文件不存在按 0 处理。
+func (s *HistoryStore) dbSizeBytes() int64 {
+	total := int64(0)
+	for _, name := range []string{s.path, s.path + "-wal"} {
+		if info, err := os.Stat(name); err == nil {
+			total += info.Size()
+		}
+	}
+	return total
+}
+
+// enforceSizeLocked 数据库（含 WAL）超过上限时，从最旧的一天开始逐段删除，
+// 至少保留最新一个采样点。删除发生在采样间隙且只在超限时发生，VACUUM 的
+// I/O 开销可以接受。
+func (s *HistoryStore) enforceSizeLocked(limitBytes int64) error {
+	deleted := false
+	for round := 0; round < historySizePruneRounds; round++ {
+		if s.dbSizeBytes() <= limitBytes {
+			break
+		}
+		var oldest, newest sql.NullInt64
+		if err := s.db.QueryRow(`SELECT MIN(ts), MAX(ts) FROM history`).Scan(&oldest, &newest); err != nil {
+			return err
+		}
+		if !oldest.Valid || !newest.Valid || newest.Int64-oldest.Int64 <= historySizePruneBytes {
+			break // 不足一天可删时停止，至少保留最新一天的采样
+		}
+		cutoff := oldest.Int64 + historySizePruneBytes
+		if cutoff > newest.Int64 {
+			cutoff = newest.Int64
+		}
+		if _, err := s.db.Exec(`DELETE FROM history WHERE ts < ?`, cutoff); err != nil {
+			return err
+		}
+		deleted = true
+	}
+	if !deleted {
+		return nil
+	}
+	if _, err := s.db.Exec(`VACUUM`); err != nil {
+		return err
+	}
+	// VACUUM 只压缩主库；WAL 文件停在高位水位，必须显式截断才真正归还磁盘
+	_, err := s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
 }
 
 // Aggregated 返回最近 rangeHours 小时的采样（支持 0.5 这样的半小时范围）；
@@ -603,7 +690,16 @@ func (s *HistoryStore) appendAndLog(ctx context.Context, manager *Manager, logge
 		return
 	default:
 	}
-	if err := s.Append(manager.SampleNow(time.Now())); err != nil {
-		logger.Printf("history append failed: %v", err)
+	now := time.Now()
+	settings := manager.HistorySettings()
+	// 停用时只停写入：已入库的数据仍可查看，并由下面的清理按保留期与
+	// 大小上限继续收敛，数据库不会一直膨胀。
+	if settings.Enabled {
+		if err := s.Append(manager.SampleNow(now)); err != nil {
+			logger.Printf("history append failed: %v", err)
+		}
+	}
+	if err := s.PruneIfNeeded(now, settings.MaxSizeMB); err != nil {
+		logger.Printf("history prune failed: %v", err)
 	}
 }
