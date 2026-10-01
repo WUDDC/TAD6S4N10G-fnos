@@ -332,7 +332,7 @@ test('滑杆双段换算：无极区 1 分钟粒度往返一致；挡位段吸�
   assert.equal(historyPosToHours(401), 6, '无极区之后立刻是 6h 挡');
   assert.equal(historyPosToHours(460), 6, '6h 停靠位');
   assert.equal(historyPosToHours(580), 12, '12h 停靠位');
-  assert.equal(historyPosToHours(940), 720, '30 天停靠位');
+  assert.equal(historyPosToHours(940), 720, '30 天停靠位(=滑杆 max,可填满轨道)');
   assert.equal(historyPosToHours(9999), 720, '越界钳到尾挡');
   // 挡位小时→位置:停靠位
   assert.equal(historyHoursToPos(6), 460);
