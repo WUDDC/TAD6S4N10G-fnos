@@ -181,11 +181,24 @@ func normalizeConfig(cfg *Config) bool {
 		changed = true
 	}
 	if cfg.History.MaxSizeMB == 0 {
-		// 旧版本配置文件没有 history 段：默认启用采样并套用默认大小上限
+		// 旧版本配置文件没有 history 段：默认启用采样并套用默认大小上限与保留期
 		cfg.History = DefaultHistoryConfig()
 		changed = true
 	} else if clamped := ClampHistoryMaxSize(cfg.History.MaxSizeMB); clamped != cfg.History.MaxSizeMB {
 		cfg.History.MaxSizeMB = clamped
+		changed = true
+	}
+	if cfg.History.RetentionDays == 0 {
+		// 旧配置没有 retention_days 字段：解析后为 0，静默归位为默认保留期
+		cfg.History.RetentionDays = historyDefaultRetentionDays
+		changed = true
+	} else if clamped := ClampHistoryRetentionDays(cfg.History.RetentionDays); clamped != cfg.History.RetentionDays {
+		cfg.History.RetentionDays = clamped
+		changed = true
+	}
+	if !cfg.History.ArchiveEnabled && cfg.History.ArchiveDir != "" {
+		// 长期记录关闭时清掉目录，避免配置里残留无意义路径
+		cfg.History.ArchiveDir = ""
 		changed = true
 	}
 	for index := range cfg.GPIO.Buttons {

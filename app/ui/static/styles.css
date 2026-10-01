@@ -1036,9 +1036,13 @@ body.modal-open { overflow: hidden; }
 .curve-chart-nvme .curve-node-control.selected,
 .curve-chart-nvme .curve-node-label.selected { fill: #a25bd7; }
 
-/* ---- 历史图表 ---- */
+/* ---- 历史温度 ---- */
 .history-chart { cursor: default; touch-action: auto; }
-.history-crosshair-line { stroke: var(--muted); stroke-dasharray: 4 4; }
+.history-crosshair-line {
+  stroke: var(--muted);
+  stroke-dasharray: 4 4;
+  stroke-width: 1.5px; /* 配合 non-scaling-stroke：viewBox 拉伸时线宽保持 1.5 屏幕像素 */
+}
 .history-tooltip {
   position: fixed;
   z-index: 120;
@@ -1187,20 +1191,67 @@ body.modal-open { overflow: hidden; }
 }
 .history-card { margin-top: 16px; }
 .history-toggle { margin: 10px 0 0; }
-.history-size-limit {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
+.history-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 10px;
 }
-.history-size-field { margin: 0; flex: 0 1 180px; }
+.history-actions { margin-top: 12px; }
+/* 长期记录：开关与保存位置（绝对路径文本框）整行排布 */
+.history-archive { display: grid; gap: 8px; margin-top: 12px; }
+.history-archive-dir input { width: 100%; }
 .history-limit-notice { margin-top: 10px; }
 .history-disabled-notice { color: var(--warning, #b8860b); }
-@media (max-width: 599px) {
-  .history-size-limit { flex-wrap: wrap; align-items: stretch; }
-  .history-size-field { flex: 1 1 100%; }
+.history-range { display: inline-flex; flex-wrap: wrap; align-items: center; max-width: 100%; gap: 6px; }
+/* 时间范围拖动条：值标签在上、滑杆居中、刻度文字在下（半小时一格） */
+.history-range-slider {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  min-width: 240px;
+  max-width: 100%;
 }
-.history-range { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 6px; }
+.history-range-value {
+  font-size: 12px;
+  line-height: 1.4;
+  font-weight: 650;
+  color: var(--text-secondary);
+  text-align: right;
+}
+.history-range-input {
+  width: 100%;
+  height: 20px;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+/* 刻度按档位均匀占位（每档 20%），不按实际时间比例分布——滑杆本身
+   就是六档位取值，刻度与拇指停靠位严格对齐，单行即可放下 */
+.history-range-ticks {
+  position: relative;
+  height: 18px;
+  margin: 2px 7px 0; /* 7px≈半个拇指宽：让首尾刻度对齐拇指中心的实际行程 */
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--muted);
+}
+.history-range-tick { position: absolute; top: 0; white-space: nowrap; }
+.history-range-tick::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 4px;
+  margin: 0 auto 2px;
+  background: var(--line-strong);
+}
+.history-range-tick[data-stop] { transform: translateX(-50%); text-align: center; }
+.history-range-tick[data-stop="0"] { left: 0; transform: none; text-align: left; }
+.history-range-tick[data-stop="1"] { left: 20%; }
+.history-range-tick[data-stop="2"] { left: 40%; }
+.history-range-tick[data-stop="3"] { left: 60%; }
+.history-range-tick[data-stop="4"] { left: 80%; }
+.history-range-tick[data-stop="5"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-tick[data-stop="0"]::before { margin-left: 0; }
+.history-range-tick[data-stop="5"]::before { margin-right: 0; }
 .history-range-btn {
   flex: 0 0 auto;
   white-space: nowrap;
@@ -1219,6 +1270,10 @@ body.modal-open { overflow: hidden; }
   background: var(--primary-soft);
   color: var(--primary);
   font-weight: 650;
+}
+@media (max-width: 599px) {
+  .history-range { width: 100%; }
+  .history-range-slider { flex: 1 1 100%; width: 100%; min-width: 0; }
 }
 
 .curve-toolbar {

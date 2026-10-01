@@ -3,7 +3,12 @@ package powerguard
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/json"
+	"io"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -133,7 +138,7 @@ func TestHistoryStoreAppendPersistsAndReloads(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reloaded.Close()
-	samples, interval, err := reloaded.Aggregated(context.Background(), historyMaxRangeHours, 2000, base.Add(2*time.Minute))
+	samples, interval, err := reloaded.Aggregated(context.Background(), reloaded.maxRangeHours(), 2000, base.Add(2*time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +167,7 @@ func TestHistoryStoreUpsertOverwritesSameTimestamp(t *testing.T) {
 	if err := store.Append(HistorySample{TS: ts.Unix(), CPUC: 52, Fans: []HistoryFanSample{{ID: "fan", RPM: 1400, PWMPercent: 62}}}); err != nil {
 		t.Fatal(err)
 	}
-	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, ts.Add(time.Minute))
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, ts.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +254,7 @@ func TestHistoryPruneRemovesExpiredRows(t *testing.T) {
 	if err := store.Prune(now); err != nil {
 		t.Fatal(err)
 	}
-	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -276,7 +281,7 @@ func TestHistoryPruneKeepsTwoDayBufferBeyondDisplayWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 展示窗口 30 天：Aggregated 只能看到 29d，31d 落在窗口外但仍在库中
-	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -480,7 +485,7 @@ func TestHistoryExportSQLiteSnapshot(t *testing.T) {
 		t.Fatalf("reopen snapshot: %v", err)
 	}
 	defer snap.Close()
-	samples, _, err := snap.Aggregated(context.Background(), historyMaxRangeHours, 2000, now.Add(time.Minute))
+	samples, _, err := snap.Aggregated(context.Background(), snap.maxRangeHours(), 2000, now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,13 +633,13 @@ func TestHistorySizeLimitPrunesOldestDays(t *testing.T) {
 	if before <= 1<<20 {
 		t.Fatalf("test dataset should exceed the 1MB limit, got %d bytes", before)
 	}
-	if err := store.PruneIfNeeded(now, 1); err != nil { // 1MB 上限：MB→字节换算 + 按天删最旧
+	if err := store.PruneIfNeeded(now, HistoryConfig{MaxSizeMB: 1, RetentionDays: historyDefaultRetentionDays}); err != nil { // 1MB 上限：MB→字节换算 + 按天删最旧
 		t.Fatal(err)
 	}
 	if store.dbSizeBytes() > 1<<20 {
 		t.Fatalf("size limit not enforced: %d bytes", store.dbSizeBytes())
 	}
-	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,10 +651,10 @@ func TestHistorySizeLimitPrunesOldestDays(t *testing.T) {
 	}
 	// 0 表示不启用大小限制，此时不得报错也不得继续删除
 	kept := len(samples)
-	if err := store.PruneIfNeeded(now, 0); err != nil {
+	if err := store.PruneIfNeeded(now, HistoryConfig{MaxSizeMB: 0, RetentionDays: historyDefaultRetentionDays}); err != nil {
 		t.Fatal(err)
 	}
-	samples, _, _ = store.Aggregated(context.Background(), historyMaxRangeHours, 2000, now)
+	samples, _, _ = store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
 	if len(samples) != kept {
 		t.Fatalf("disabled size limit must not prune: before=%d after=%d", kept, len(samples))
 	}
@@ -684,7 +689,7 @@ func TestHistoryLoopSkipsAppendWhenDisabled(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		store.appendAndLog(context.Background(), manager, logger)
 	}
-	samples, _, err := store.Aggregated(context.Background(), historyMaxRangeHours, 2000, time.Now())
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,7 +701,7 @@ func TestHistoryLoopSkipsAppendWhenDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.appendAndLog(context.Background(), manager, logger)
-	samples, _, err = store.Aggregated(context.Background(), historyMaxRangeHours, 2000, time.Now())
+	samples, _, err = store.Aggregated(context.Background(), store.maxRangeHours(), 2000, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -809,5 +814,956 @@ func TestAppendToleratesDuplicateSensorKeys(t *testing.T) {
 	}
 	if len(samples) != 1 || samples[0].CPUC != 50 {
 		t.Fatalf("sample lost after duplicate-key append: %+v", samples)
+	}
+}
+
+// ---- 保留期（retention_days）可配置 ----
+
+func TestClampHistoryRetentionDays(t *testing.T) {
+	tests := []struct {
+		in, want int
+	}{
+		{-3, historyMinRetentionDays},
+		{0, historyMinRetentionDays},
+		{1, 1},
+		{30, 30},
+		{90, 90},
+		{91, 91}, // 不设产品上限：91 天起原样保留
+		{1000, 1000},
+		{36500, 36500},
+		{40000, historyMaxRetentionDays},   // 防溢出护栏：荒谬大值钳到 100 年
+		{1 << 30, historyMaxRetentionDays}, // 溢出量级：必须钳住，否则 cutoff 变负清空数据
+	}
+	for _, test := range tests {
+		if got := ClampHistoryRetentionDays(test.in); got != test.want {
+			t.Fatalf("ClampHistoryRetentionDays(%d)=%d, want %d", test.in, got, test.want)
+		}
+	}
+}
+
+// SyncSettings 立即按“配置天数 + 2 天缓冲”清理，并把展示窗口上限
+// 收紧为 配置天数×24（不含缓冲）。
+func TestSyncSettingsPrunesImmediatelyAndShrinksWindow(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	appendCPUC := func(age time.Duration, value float64) {
+		t.Helper()
+		if err := store.Append(HistorySample{TS: now.Add(-age).Unix(), CPUC: value}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	appendCPUC(5*24*time.Hour, 5) // 超过 2+2 天：必须删除
+	appendCPUC(84*time.Hour, 35)  // 3.5 天：在存储（4 天）内必须保留，但在窗口（2 天）外
+	appendCPUC(time.Hour, 51)     // 窗口内
+	if err := store.SyncSettings(HistoryConfig{RetentionDays: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if store.retentionDays != 2 {
+		t.Fatalf("retentionDays=%d, want 2", store.retentionDays)
+	}
+	var surviving int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 5`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 0 {
+		t.Fatalf("5d sample must be pruned by 2d+2d retention, got %d rows", surviving)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 35`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 1 {
+		t.Fatalf("3.5d sample must survive within 2d+2d storage buffer, got %d rows", surviving)
+	}
+	// 展示窗口上限 = 2×24h：请求 720h 也只能看到窗口内的 1 个点
+	samples, _, err := store.Aggregated(context.Background(), 720, 2000, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].CPUC != 51 {
+		t.Fatalf("display window should clamp to retention days, got %+v", samples)
+	}
+}
+
+// PruneIfNeeded 每次调用都同步保留天数；日期清理仍按 1 小时节流，到期后按
+// “配置天数 + 2 天缓冲”删除（配置变更最迟下个采样点生效）。
+func TestPruneIfNeededSyncsRetentionDays(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	if err := store.Append(HistorySample{TS: now.Add(-40 * 24 * time.Hour).Unix(), CPUC: 40}); err != nil {
+		t.Fatal(err)
+	}
+	// 构造函数刚清理过（lastPrune=now）：本次只同步天数，不触发日期删除
+	if err := store.PruneIfNeeded(now, HistoryConfig{MaxSizeMB: 0, RetentionDays: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if store.retentionDays != 7 {
+		t.Fatalf("retentionDays=%d, want 7", store.retentionDays)
+	}
+	var surviving int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 40`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 1 {
+		t.Fatalf("date prune should stay throttled within an hour, got %d rows", surviving)
+	}
+	// 距上次清理超过 1 小时：按 7+2 天清理
+	store.lastPrune = now.Add(-2 * time.Hour)
+	if err := store.PruneIfNeeded(now, HistoryConfig{MaxSizeMB: 0, RetentionDays: 7}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 40`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 0 {
+		t.Fatalf("40d sample must be pruned by 7d+2d retention, got %d rows", surviving)
+	}
+}
+
+// 旧配置文件没有 retention_days 字段：解析为 0 后静默归位默认 30，
+// 并回写配置文件；非法值在保存时钳制。
+func TestHistoryRetentionDaysLegacyConfigAndClamping(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	// 直接写入旧版配置（无 retention_days 字段），模拟升级场景
+	legacy := `{"enabled":true,"pl1_w":6,"pl2_w":15,"reapply_seconds":30,"history":{"enabled":true,"max_size_mb":32}}`
+	if err := os.WriteFile(manager.ConfigPath, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.LoadOrCreateConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.HistorySettings().RetentionDays; got != historyDefaultRetentionDays {
+		t.Fatalf("legacy config retention=%d, want %d", got, historyDefaultRetentionDays)
+	}
+	data, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"retention_days"`) {
+		t.Fatalf("migrated config should persist retention_days:\n%s", data)
+	}
+	// 保存接口对非法值做与 max_size_mb 相同风格的静默钳制
+	for _, test := range []struct{ in, want int }{{-5, historyMinRetentionDays}, {0, historyDefaultRetentionDays}, {100, 100}, {100000, historyMaxRetentionDays}} {
+		if err := manager.SaveHistoryConfig(HistoryConfig{Enabled: true, MaxSizeMB: 32, RetentionDays: test.in}); err != nil {
+			t.Fatal(err)
+		}
+		if got := manager.HistorySettings().RetentionDays; got != test.want {
+			t.Fatalf("SaveHistoryConfig(retention=%d) persisted %d, want %d", test.in, got, test.want)
+		}
+	}
+}
+
+// ---- 清空历史数据库 ----
+
+func TestHistoryStoreClearEmptiesAllTablesAndKeepsSchema(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	sample := HistorySample{
+		TS: now.Unix(), CPUC: 50,
+		Fans:    []HistoryFanSample{{ID: "fan", RPM: 1200, PWMPercent: 50}},
+		Disks:   []HistoryDiskSample{{ID: "front-1", TemperatureC: 41}},
+		Sensors: []HistorySensorSample{{Group: "cpu", Key: "Core 0", C: 50}},
+	}
+	if err := store.Append(sample); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Append(HistorySample{TS: now.Add(-time.Minute).Unix(), CPUC: 49}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Clear(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range []string{"history", "history_fans", "history_slots", "history_sensors"} {
+		var count int64
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM ` + table).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("%s should be empty after Clear, got %d rows", table, count)
+		}
+	}
+	samples, _, err := store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 0 {
+		t.Fatalf("aggregated should return nothing after Clear: %+v", samples)
+	}
+	// schema 保留：清空后可立即继续采样，四张表都能再写入
+	if err := store.Append(sample); err != nil {
+		t.Fatal(err)
+	}
+	samples, _, err = store.Aggregated(context.Background(), store.maxRangeHours(), 2000, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(samples) != 1 || samples[0].CPUC != 50 || len(samples[0].Fans) != 1 || len(samples[0].Disks) != 1 || len(samples[0].Sensors) != 1 {
+		t.Fatalf("sample after Clear mismatch: %+v", samples)
+	}
+}
+
+func newHistoryTestManager(t *testing.T) *Manager {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "proc", "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: dir, ConfigPath: filepath.Join(dir, "config.json"), StatePath: filepath.Join(dir, "state.json"), Version: "test"}
+	if _, err := manager.LoadOrCreateConfig(); err != nil {
+		t.Fatalf("config setup: %v", err)
+	}
+	return manager
+}
+
+// /api/history/clear：方法守卫 + 管理员鉴权与 handleHistoryConfig 一致，
+// 成功返回 {"ok": true} 并清空数据。
+func TestHandleHistoryClear(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	store := newTestStore(t)
+	server := &Server{Manager: manager, History: store, Logger: log.New(os.Stderr, "", 0)}
+	if err := store.Append(HistorySample{TS: time.Now().Unix(), CPUC: 50}); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name    string
+		method  string
+		admin   bool
+		status  int
+		wantOK  bool
+		emptied bool
+	}{
+		{"get rejected", http.MethodGet, true, http.StatusMethodNotAllowed, false, false},
+		{"non-admin rejected", http.MethodPost, false, http.StatusForbidden, false, false},
+		{"admin post clears", http.MethodPost, true, http.StatusOK, true, true},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(test.method, "/api/history/clear", nil)
+		if test.admin {
+			req.Header.Set("X-Trim-Isadmin", "true")
+		}
+		rec := httptest.NewRecorder()
+		server.handleHistoryClear(rec, req)
+		if rec.Code != test.status {
+			t.Fatalf("%s: status=%d, want %d (body %s)", test.name, rec.Code, test.status, rec.Body.String())
+		}
+		if test.wantOK {
+			var payload map[string]bool
+			if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("%s: decode response: %v", test.name, err)
+			}
+			if payload["ok"] != true {
+				t.Fatalf("%s: response should be {\"ok\": true}, got %s", test.name, rec.Body.String())
+			}
+		}
+		if test.emptied {
+			var count int64
+			if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 0 {
+				t.Fatalf("%s: history should be empty, got %d rows", test.name, count)
+			}
+		}
+	}
+}
+
+// /api/config/history 保存后立即按新保留期清理一次（存储保留 9 天，
+// 10 天前的数据当场删除），且响应仍是 Status()。
+func TestHandleHistoryConfigAppliesRetentionImmediately(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	store := newTestStore(t)
+	now := time.Now()
+	if err := store.Append(HistorySample{TS: now.Add(-10 * 24 * time.Hour).Unix(), CPUC: 10}); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Manager: manager, History: store, Logger: log.New(os.Stderr, "", 0)}
+	req := httptest.NewRequest(http.MethodPost, "/api/config/history", strings.NewReader(`{"enabled":true,"max_size_mb":64,"retention_days":7}`))
+	req.Header.Set("X-Trim-Isadmin", "true")
+	rec := httptest.NewRecorder()
+	server.handleHistoryConfig(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+	var status Status
+	if err := json.Unmarshal(rec.Body.Bytes(), &status); err != nil {
+		t.Fatalf("response should stay Status-shaped: %v", err)
+	}
+	if got := manager.HistorySettings().RetentionDays; got != 7 {
+		t.Fatalf("saved retention=%d, want 7", got)
+	}
+	if store.retentionDays != 7 {
+		t.Fatalf("store retention=%d, want 7", store.retentionDays)
+	}
+	var surviving int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history WHERE cpu_c = 10`).Scan(&surviving); err != nil {
+		t.Fatal(err)
+	}
+	if surviving != 0 {
+		t.Fatalf("10d sample must be pruned immediately after saving 7d retention, got %d rows", surviving)
+	}
+}
+
+// SaveUIPrefs：合法档位落盘、区间外清零；保存传感器名等其它配置段不受影响。
+func TestSaveUIPrefsPersistsAndClamps(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	if err := manager.SaveSensorSettings(map[string]string{"mlx5:temp1": "万兆卡"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 6}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UIPrefs.HistoryRangeHours != 6 {
+		t.Fatalf("ui pref should persist, got %+v", cfg.UIPrefs)
+	}
+	if cfg.SensorNames["mlx5:temp1"] != "万兆卡" {
+		t.Fatalf("saving ui prefs must not wipe sensor names: %+v", cfg.SensorNames)
+	}
+	// 区间外按未设置处理：负数/0/超 30 天全部清零
+	for _, invalid := range []float64{-1, 0, 0.2, 720.5, 10000} {
+		if got := ClampUIHistoryRangeHours(invalid); got != 0 {
+			t.Fatalf("ClampUIHistoryRangeHours(%v) = %v, want 0", invalid, got)
+		}
+	}
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 720}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UIPrefs.HistoryRangeHours != 720 {
+		t.Fatalf("30d stop should persist, got %+v", cfg.UIPrefs)
+	}
+}
+
+// /api/config/ui-prefs：方法守卫 + 管理员鉴权同其它配置接口，成功返回 Status。
+func TestHandleUIPrefsConfig(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	server := &Server{Manager: manager, Logger: log.New(os.Stderr, "", 0)}
+	tests := []struct {
+		name   string
+		method string
+		admin  bool
+		body   string
+		status int
+		saved  float64
+	}{
+		{"get rejected", http.MethodGet, true, "", http.StatusMethodNotAllowed, 0},
+		{"non-admin rejected", http.MethodPost, false, `{"history_range_hours":2}`, http.StatusForbidden, 0},
+		{"admin post saves", http.MethodPost, true, `{"history_range_hours":2}`, http.StatusOK, 2},
+		{"out of range zeroed", http.MethodPost, true, `{"history_range_hours":9000}`, http.StatusOK, 0},
+	}
+	for _, test := range tests {
+		var body io.Reader
+		if test.body != "" {
+			body = strings.NewReader(test.body)
+		}
+		req := httptest.NewRequest(test.method, "/api/config/ui-prefs", body)
+		if test.admin {
+			req.Header.Set("X-Trim-Isadmin", "true")
+		}
+		rec := httptest.NewRecorder()
+		server.handleUIPrefsConfig(rec, req)
+		if rec.Code != test.status {
+			t.Fatalf("%s: status=%d, want %d (body %s)", test.name, rec.Code, test.status, rec.Body.String())
+		}
+		if test.saved != 0 || test.name == "out of range zeroed" {
+			cfg, err := manager.LoadOrCreateConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.UIPrefs.HistoryRangeHours != test.saved {
+				t.Fatalf("%s: stored ui pref = %v, want %v", test.name, cfg.UIPrefs.HistoryRangeHours, test.saved)
+			}
+		}
+	}
+}
+
+// 流式 CSV 归并连接的边界：子表孤儿行（ts 不在主表，老库的 foreign_keys 是
+// 连接级 PRAGMA、无法完全排除）既不成列也不成行，导出不报错。
+func TestHistoryExportCSVSkipsOrphanSubRows(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	if err := store.Append(HistorySample{TS: now.Unix(), CPUC: 50, Fans: []HistoryFanSample{{ID: "it87:fan1", RPM: 900, PWMPercent: 30}}}); err != nil {
+		t.Fatal(err)
+	}
+	// 直接往子表塞孤儿行（ts 不在主表）：ID/键独有，走列发现与归并两条路径。
+	// FK 生效时插不进孤儿行（这本身就是运行中库的保障），这里按连接关掉
+	// PRAGMA 模拟"老库历史遗留"。
+	conn, err := store.db.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `PRAGMA foreign_keys = OFF`); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `INSERT INTO history_fans (ts, fan_id, rpm, pwm_percent) VALUES (?, 'ghost:fan9', 1, 1)`, now.Add(time.Hour).Unix()); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(context.Background(), `INSERT INTO history_sensors (ts, grp, key, c) VALUES (?, 'other', 'orphan', 99)`, now.Add(2*time.Hour).Unix()); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	conn.Close()
+	var buf bytes.Buffer
+	if err := store.WriteCSV(context.Background(), &buf); err != nil {
+		t.Fatalf("csv: %v", err)
+	}
+	content := buf.String()
+	if strings.Contains(content, "ghost:fan9") {
+		t.Fatalf("orphan fan (ts not in main) must not become a column:\n%s", content)
+	}
+	if strings.Contains(content, "99") {
+		t.Fatalf("orphan sensor value must not leak into export:\n%s", content)
+	}
+	if !strings.Contains(content, "it87:fan1_rpm") || !strings.Contains(content, "900") {
+		t.Fatalf("real data must survive orphan handling:\n%s", content)
+	}
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expect header + 1 data row, got %d:\n%s", len(lines), content)
+	}
+}
+
+// ---- 长期记录（归档后再清理） ----
+
+// 开启长期记录后，日期清理先把待删数据按月归档成独立 SQLite 文件
+// （tad-history-YYYYMM.db），主库再删除；跨月数据各归各的文件。
+func TestArchiveBeforePruneMonthlyFiles(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	base := now.Add(-10 * 24 * time.Hour) // 2026-09-25 12:00，跨 9/10 两个月
+	var tsList []int64
+	for ts := base; !ts.After(now); ts = ts.Add(time.Hour) {
+		sample := HistorySample{TS: ts.Unix(), CPUC: 50,
+			Fans:  []HistoryFanSample{{ID: "f1", RPM: 1000, PWMPercent: 40}},
+			Disks: []HistoryDiskSample{{ID: "d1", TemperatureC: 40}}}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+		tsList = append(tsList, ts.Unix())
+	}
+	// 直接设字段 + Prune(now)：SyncSettings 用真实 time.Now()，测试日期会漂
+	store.retentionDays = 5
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := now.Add(-7 * 24 * time.Hour).Unix()
+	var wantSep int
+	for _, ts := range tsList {
+		if ts < cutoff {
+			wantSep++
+		}
+	}
+	// 9 月的旧数据归档成 202609 文件；10 月数据都还在保留期内，不该有 202610 文件
+	sepPath := filepath.Join(archiveDir, "tad-history-202609.db")
+	if _, err := os.Stat(sepPath); err != nil {
+		t.Fatalf("September archive missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir, "tad-history-202610.db")); !os.IsNotExist(err) {
+		t.Fatalf("October archive should not exist (nothing pruned from October), err=%v", err)
+	}
+	archiveDB, err := sql.Open("sqlite", sepPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archiveDB.Close()
+	var archived, archivedFans int64
+	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&archived); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history_fans`).Scan(&archivedFans); err != nil {
+		t.Fatal(err)
+	}
+	if archived != int64(wantSep) || archivedFans != int64(wantSep) {
+		t.Fatalf("archive should hold %d samples+fans, got %d/%d", wantSep, archived, archivedFans)
+	}
+	var archivedOld int64
+	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history WHERE ts >= ?`, cutoff).Scan(&archivedOld); err != nil {
+		t.Fatal(err)
+	}
+	if archivedOld != 0 {
+		t.Fatalf("archive must not contain rows inside the retention window, got %d", archivedOld)
+	}
+	var mainCount int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&mainCount); err != nil {
+		t.Fatal(err)
+	}
+	if mainCount != int64(len(tsList)-wantSep) {
+		t.Fatalf("main should keep only in-window samples: got %d, want %d", mainCount, len(tsList)-wantSep)
+	}
+}
+
+// SaveHistoryConfig 对长期记录目录的保存时校验：开关开了必须有绝对路径且可
+// 创建可写；关闭时目录字段清空。
+func TestSaveHistoryConfigArchiveValidation(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	save := func(history HistoryConfig) error {
+		return manager.SaveHistoryConfig(history)
+	}
+	if err := save(HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: 30, ArchiveEnabled: true}); err == nil || !strings.Contains(err.Error(), "绝对路径") {
+		t.Fatalf("enabled without dir should fail with abs-path error, got %v", err)
+	}
+	if err := save(HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: 30, ArchiveEnabled: true, ArchiveDir: "relative/dir"}); err == nil || !strings.Contains(err.Error(), "绝对路径") {
+		t.Fatalf("relative dir should fail, got %v", err)
+	}
+	valid := filepath.Join(t.TempDir(), "archive")
+	if err := save(HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: 30, ArchiveEnabled: true, ArchiveDir: valid + "/深层级"}); err != nil {
+		t.Fatalf("valid dir should save: %v", err)
+	}
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.History.ArchiveEnabled || cfg.History.ArchiveDir != filepath.Join(valid, "深层级") {
+		t.Fatalf("archive config not persisted: %+v", cfg.History)
+	}
+	if err := save(HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: 30, ArchiveEnabled: false, ArchiveDir: valid}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.History.ArchiveDir != "" {
+		t.Fatalf("disabling archive should clear dir, got %q", cfg.History.ArchiveDir)
+	}
+}
+
+// 长期记录持续失败（目录不可写）时先暂停删除保数据；连续失败达到阈值后
+// 回退为直接删除保磁盘，目录修好（SyncSettings）后恢复归档。
+func TestArchiveFailureFallback(t *testing.T) {
+	store := newTestStore(t)
+	blocked := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocked, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := store.Append(HistorySample{TS: now.Add(-40 * 24 * time.Hour).Unix(), CPUC: 40}); err != nil {
+		t.Fatal(err)
+	}
+	store.retentionDays = 5
+	store.archiveEnabled = true
+	store.archiveDir = blocked
+	count := func() int64 {
+		t.Helper()
+		var n int64
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if err := store.Prune(now); err == nil {
+		t.Fatal("archive failure should pause pruning and surface the error")
+	}
+	if count() != 1 {
+		t.Fatal("data must be kept while archiving fails")
+	}
+	deleted := false
+	for i := 1; i <= 30 && !deleted; i++ {
+		if err := store.Prune(now.Add(time.Duration(i) * time.Hour)); err == nil {
+			deleted = true
+		}
+	}
+	if !deleted {
+		t.Fatal("fallback to plain delete never engaged")
+	}
+	if count() != 0 {
+		t.Fatal("fallback should delete the expired sample")
+	}
+	// 用户修好目录重新保存：失败计数清零，恢复归档路径
+	fixed := filepath.Join(t.TempDir(), "archive")
+	store.SyncSettings(HistoryConfig{Enabled: true, MaxSizeMB: 64, RetentionDays: 5, ArchiveEnabled: true, ArchiveDir: fixed})
+	if store.archiveFailStreak != 0 {
+		t.Fatalf("SyncSettings should reset the failure streak, got %d", store.archiveFailStreak)
+	}
+}
+
+// ---- 用户问的组合边界（大小上限 × 保存天数 × 长期记录） ----
+
+// 边界1：大小上限最小（8MB）+ 保存 1 天 + 长期记录开。
+// 1 天保留让主库只剩 ~3 天数据（几百 KB），大小清理永远够不着 8MB；
+// 过期数据按月归档后再删。整个组合正常收敛，互不干扰。
+func TestEdgeTinyCapShortRetentionArchiveOn(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	base := now.Add(-5 * 24 * time.Hour)
+	for ts := base; !ts.After(now); ts = ts.Add(time.Hour) {
+		if err := store.Append(HistorySample{TS: ts.Unix(), CPUC: 50}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.retentionDays = 1
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	cutoff := now.Add(-3 * 24 * time.Hour).Unix()
+	var mainCount, mainOld int64
+	if err := store.db.QueryRow(`SELECT COUNT(*), SUM(ts < ?) FROM history`, cutoff).Scan(&mainCount, &mainOld); err != nil {
+		t.Fatal(err)
+	}
+	if mainOld != 0 || mainCount == 0 {
+		t.Fatalf("main should hold only the 3-day window, got %d rows (%d old)", mainCount, mainOld)
+	}
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	if len(entries) == 0 {
+		t.Fatal("expired days should be archived before deletion")
+	}
+	if store.dbSizeBytes() > 8<<20 {
+		t.Fatalf("db should stay far below the 8MB cap, got %d", store.dbSizeBytes())
+	}
+}
+
+// 边界2：保存天数巨大（365000 被钳到 36500）+ 长期记录开 + 小上限。
+// 日期清理永不触发；数据涨到上限后由大小清理接管——旧的一天先归档成
+// 月文件再删，主库有界、归档持续累积（这正是长期记录的用途）。
+func TestEdgeHugeRetentionArchiveOnSizeDrivesPrune(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	if got := ClampHistoryRetentionDays(365000); got != historyMaxRetentionDays {
+		t.Fatalf("365000 days must clamp to the overflow guard, got %d", got)
+	}
+	now := time.Now()
+	// 满配形态灌到超过 1MB（≈5000+ 采样点），小时级跨 5+ 天
+	base := now.Add(-6 * 24 * time.Hour)
+	inserted := 0
+	for ts := base; inserted < 5600; ts = ts.Add(time.Minute) {
+		sample := HistorySample{TS: ts.Unix(), CPUC: 50,
+			Fans:    []HistoryFanSample{{ID: "f1", RPM: 1000, PWMPercent: 40}, {ID: "f2", RPM: 1100, PWMPercent: 45}},
+			Disks:   []HistoryDiskSample{{ID: "d1", TemperatureC: 40}, {ID: "d2", TemperatureC: 41}},
+			Sensors: []HistorySensorSample{{Group: "cpu", Key: "Core 0", C: 50}, {Group: "other", Key: "acpi", C: 30}}}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+		inserted++
+	}
+	if store.dbSizeBytes() <= 1<<20 {
+		t.Fatalf("dataset should exceed the 1MB test cap, got %d", store.dbSizeBytes())
+	}
+	store.retentionDays = historyMaxRetentionDays
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	if err := store.PruneIfNeeded(now.Add(time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: historyMaxRetentionDays, ArchiveEnabled: true, ArchiveDir: archiveDir}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	if len(entries) == 0 {
+		t.Fatal("size-driven prune should archive expired days when retention is huge")
+	}
+	if store.dbSizeBytes() > 1<<20+2<<20 {
+		t.Fatalf("db should be bounded near the cap after size pruning, got %d", store.dbSizeBytes())
+	}
+	var remaining int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining == 0 || int(remaining) >= inserted {
+		t.Fatalf("some oldest data should be archived+deleted, remaining=%d inserted=%d", remaining, inserted)
+	}
+}
+
+// 边界4（对照）：同样的巨大保留天数 + 小上限，但长期记录关——大小清理直接删，
+// 不产生任何归档文件（数据按设计永久丢弃）。
+func TestEdgeHugeRetentionArchiveOffSizePruneDeletesSilently(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Now()
+	base := now.Add(-6 * 24 * time.Hour)
+	for i := 0; i < 5600; i++ {
+		sample := HistorySample{TS: base.Add(time.Duration(i) * time.Minute).Unix(), CPUC: 50,
+			Fans:    []HistoryFanSample{{ID: "f1", RPM: 1000, PWMPercent: 40}, {ID: "f2", RPM: 1100, PWMPercent: 45}},
+			Disks:   []HistoryDiskSample{{ID: "d1", TemperatureC: 40}, {ID: "d2", TemperatureC: 41}},
+			Sensors: []HistorySensorSample{{Group: "cpu", Key: "Core 0", C: 50}, {Group: "other", Key: "acpi", C: 30}}}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.retentionDays = historyMaxRetentionDays
+	store.archiveEnabled = false
+	store.archiveDir = archiveDir
+	if err := store.PruneIfNeeded(now.Add(time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: historyMaxRetentionDays, ArchiveDir: archiveDir}); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	if len(entries) != 0 {
+		t.Fatalf("archive off must not create archive files, got %v", entries)
+	}
+	var remaining int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&remaining); err != nil {
+		t.Fatal(err)
+	}
+	if remaining == 0 || int(remaining) >= 5600 {
+		t.Fatalf("size prune should still delete without archiving, remaining=%d", remaining)
+	}
+}
+
+// 归档缓冲（SSD）+ 冲刷（HDD）：数据照常按"当前时刻"落库（现实中不存在
+// 低于水位的行），过期后先留在主库当缓冲，攒到跨自然月或体量达阈值才一次性
+// 写入归档盘并删除——HDD 平时可持续休眠。
+func TestArchiveFlushBuffering(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	store.retentionDays = 1 // cutoff = now-3d
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	insert := func(at time.Time) {
+		t.Helper()
+		if err := store.Append(HistorySample{TS: at.Unix(), CPUC: 50}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainCount := func() int64 {
+		t.Helper()
+		var n int64
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	archiveRows := func() int64 {
+		t.Helper()
+		db, err := sql.Open("sqlite", filepath.Join(archiveDir, "tad-history-202610.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		var n int64
+		if err := db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// 首轮(水位未建立):已过期的数据立即冲刷归档+删除
+	for i := 0; i < 5; i++ {
+		insert(now.Add(-4 * 24 * time.Hour).Add(time.Duration(i) * time.Hour))
+	}
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	if archiveRows() != 5 || mainCount() != 0 {
+		t.Fatalf("first flush: archive=%d main=%d, want 5/0", archiveRows(), mainCount())
+	}
+	// 照常落库(窗口内);当它随时间过期后,同月且体量未达阈值 → 继续缓冲
+	for i := 0; i < 5; i++ {
+		insert(now.Add(-time.Duration(i) * time.Hour))
+	}
+	if err := store.Prune(now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if archiveRows() != 5 {
+		t.Fatalf("buffering phase must not write the HDD, archive=%d", archiveRows())
+	}
+	if mainCount() != 5 {
+		t.Fatalf("in-window rows must stay in main, main=%d", mainCount())
+	}
+	// 过期后仍未达阈值:继续缓冲(数据不丢)
+	if err := store.Prune(now.Add(4 * 24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if archiveRows() != 5 || mainCount() != 5 {
+		t.Fatalf("under-threshold buffering: archive=%d main=%d, want 5/5", archiveRows(), mainCount())
+	}
+	// 跨自然月:一次性把缓冲冲进归档盘并删除
+	if err := store.Prune(now.Add(35 * 24 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if archiveRows() != 10 || mainCount() != 0 {
+		t.Fatalf("month-rollover flush: archive=%d main=%d, want 10/0", archiveRows(), mainCount())
+	}
+}
+
+// ---- 用户追问的冲刷版组合边界 ----
+
+// 边界1：最小上限（8MB，用户嘴里的"1M"会被钳到这）+ 1 天保留 + 长期记录开。
+// 首轮冲刷后过期数据在 SSD 缓冲；缓冲+窗口顶到大小上限时，大小清理提前
+// 冲刷（HDD 写入频率从"每月"提前到"每约一周"，仍是大块单写）。
+func TestEdgeSmallCapArchiveOnEarlyFlushBySize(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Now()
+	base := now.Add(-6 * 24 * time.Hour)
+	for i := 0; i < 5600; i++ {
+		sample := HistorySample{TS: base.Add(time.Duration(i) * time.Minute).Unix(), CPUC: 50,
+			Fans:    []HistoryFanSample{{ID: "f1", RPM: 1000, PWMPercent: 40}, {ID: "f2", RPM: 1100, PWMPercent: 45}},
+			Disks:   []HistoryDiskSample{{ID: "d1", TemperatureC: 40}, {ID: "d2", TemperatureC: 41}},
+			Sensors: []HistorySensorSample{{Group: "cpu", Key: "Core 0", C: 50}, {Group: "other", Key: "acpi", C: 30}}}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.retentionDays = 1
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	// 首轮：水位未建立，立即冲刷（把已过期的部分写走）
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	first := store.dbSizeBytes()
+	// 同月且未达 42MB 行数阈值：继续缓冲（不碰 HDD）
+	if err := store.PruneIfNeeded(now.Add(time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: 1, ArchiveEnabled: true, ArchiveDir: archiveDir}); err != nil {
+		t.Fatal(err)
+	}
+	// 大小上限（1MB 测试档，路径与 8MB 完全一致）压过来：提前冲刷+收缩
+	if err := store.PruneIfNeeded(now.Add(2*time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: 1, ArchiveEnabled: true, ArchiveDir: archiveDir}); err != nil {
+		t.Fatal(err)
+	}
+	if store.dbSizeBytes() > first && store.dbSizeBytes() > 1<<20+3<<20 {
+		t.Fatalf("size pressure should trigger early flush, db=%d (first=%d)", store.dbSizeBytes(), first)
+	}
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	if len(entries) == 0 {
+		t.Fatal("archive files should exist after early flush")
+	}
+}
+
+// 边界2：巨大保留天数（365000 被钳 36500）+ 长期记录开。
+// cutoff 和水位都在极远的历史里：跨月条件必须比较 cutoff 的月份而不是
+// now 的月份，否则每小时都误判"该冲刷"空跑全库扫描。这里锁定：首轮之后
+// 同小时的第二轮不再产生任何冲刷动作（无归档文件、无数据变动）。
+func TestEdgeHugeRetentionArchiveOnNoFlushChurn(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Now()
+	if err := store.Append(HistorySample{TS: now.Add(-time.Hour).Unix(), CPUC: 50}); err != nil {
+		t.Fatal(err)
+	}
+	store.retentionDays = historyMaxRetentionDays
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	// 首轮：水位建立（指向极远的过去），没有数据过期，归档目录应为空
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	if len(entries) != 0 {
+		t.Fatalf("nothing expired yet, no archive files expected, got %v", entries)
+	}
+	if store.archiveFlushDue(now.Add(time.Hour), now.Add(time.Hour).Add(-time.Duration(historyMaxRetentionDays+2)*24*time.Hour).Unix()) {
+		// cutoff 仍与水位同月（都在极远过去）：不得判定需要冲刷
+		t.Fatal("month condition must compare against cutoff, not now")
+	}
+	// 第二轮：无数据变化 → 无归档文件、采样原样保留
+	if err := store.Prune(now.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	entries, _ = filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	if len(entries) != 0 {
+		t.Fatalf("huge retention must not produce archive churn, got %v", entries)
+	}
+	var count int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("sample must be kept under huge retention, got %d", count)
+	}
+}
+
+// FlushArchive（清空前的补冲刷）：把水位到当前 cutoff 的过期缓冲一次性写进
+// 归档盘并从主库删除；长期记录关闭或保留期极长时是空操作。
+func TestFlushArchivePendingBuffer(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	store.retentionDays = 1 // cutoff = now-3d
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	// 首轮定时冲刷:老数据走掉,水位建立
+	for i := 0; i < 5; i++ {
+		if err := store.Append(HistorySample{TS: now.Add(-4 * 24 * time.Hour).Add(time.Duration(i) * time.Hour).Unix(), CPUC: 50}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Prune(now); err != nil {
+		t.Fatal(err)
+	}
+	// 缓冲期 3 行:首轮冲刷时还在窗口内(水位=cutoff1 之后)、随后过期进入
+	// 待冲刷区间 [cutoff1, cutoff2)
+	for i := 0; i < 3; i++ {
+		if err := store.Append(HistorySample{TS: now.Add(-3 * 24 * time.Hour).Add(time.Duration(30+i*10) * time.Minute).Unix(), CPUC: 51}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	flushed, err := store.FlushArchive(now.Add(time.Hour))
+	if err != nil || !flushed {
+		t.Fatalf("manual flush: flushed=%v err=%v", flushed, err)
+	}
+	archiveDB, err := sql.Open("sqlite", filepath.Join(archiveDir, "tad-history-202610.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archiveDB.Close()
+	var archived int64
+	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&archived); err != nil {
+		t.Fatal(err)
+	}
+	if archived != 8 {
+		t.Fatalf("archive should hold 5+3=8 samples after manual flush, got %d", archived)
+	}
+	var mainCount int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&mainCount); err != nil {
+		t.Fatal(err)
+	}
+	if mainCount != 0 {
+		t.Fatalf("flushed buffer should be deleted from main, got %d rows", mainCount)
+	}
+	// 长期记录关闭:空操作
+	store2 := newTestStore(t)
+	if err := store2.Append(HistorySample{TS: now.Add(-time.Hour).Unix(), CPUC: 50}); err != nil {
+		t.Fatal(err)
+	}
+	flushed, err = store2.FlushArchive(now)
+	if err != nil || flushed {
+		t.Fatalf("archive-off flush should be a no-op, flushed=%v err=%v", flushed, err)
+	}
+	var n int64
+	if err := store2.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("no-op flush must not delete, got %d rows", n)
+	}
+}
+
+// /api/history/archive：方法守卫 + 管理员鉴权同其它配置接口。
+func TestHandleHistoryArchive(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	store := newTestStore(t)
+	server := &Server{Manager: manager, History: store, Logger: log.New(os.Stderr, "", 0)}
+	tests := []struct {
+		name   string
+		method string
+		admin  bool
+		status int
+	}{
+		{"get rejected", http.MethodGet, true, http.StatusMethodNotAllowed},
+		{"non-admin rejected", http.MethodPost, false, http.StatusForbidden},
+		{"admin post ok", http.MethodPost, true, http.StatusOK},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(test.method, "/api/history/archive", nil)
+		if test.admin {
+			req.Header.Set("X-Trim-Isadmin", "true")
+		}
+		rec := httptest.NewRecorder()
+		server.handleHistoryArchive(rec, req)
+		if rec.Code != test.status {
+			t.Fatalf("%s: status=%d, want %d (body %s)", test.name, rec.Code, test.status, rec.Body.String())
+		}
 	}
 }

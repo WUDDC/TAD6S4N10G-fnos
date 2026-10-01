@@ -242,34 +242,31 @@
           <section class="card history-card" aria-labelledby="history-heading">
             <div class="panel-heading">
               <div>
-                <h2 id="history-heading">历史图表</h2>
+                <h2 id="history-heading">历史温度</h2>
                 <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化。</p>
               </div>
               <div class="history-range" role="group" aria-label="时间范围">
-                <button type="button" class="history-range-btn" data-range="0.5">30 分钟</button>
-                <button type="button" class="history-range-btn" data-range="1">1 小时</button>
-                <button type="button" class="history-range-btn" data-range="6">6 小时</button>
-                <button type="button" class="history-range-btn active" data-range="24">24 小时</button>
+                <div class="history-range-slider">
+                  <output id="history-range-value" class="history-range-value" for="history-range-slider">30 分钟</output>
+                  <input id="history-range-slider" class="history-range-input" type="range" min="0" max="5" step="1" value="0" aria-label="历史时间范围档位：30 分钟、1 小时、2 小时、6 小时、12 小时、24 小时">
+                  <div class="history-range-ticks" aria-hidden="true">
+                    <span class="history-range-tick" data-stop="0">30分</span>
+                    <span class="history-range-tick" data-stop="1">1时</span>
+                    <span class="history-range-tick" data-stop="2">2时</span>
+                    <span class="history-range-tick" data-stop="3">6时</span>
+                    <span class="history-range-tick" data-stop="4">12时</span>
+                    <span class="history-range-tick" data-stop="5">24时</span>
+                  </div>
+                </div>
                 <button type="button" class="history-range-btn" data-range="168">7 天</button>
                 <button type="button" class="history-range-btn" data-range="720">30 天</button>
               </div>
             </div>
-            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
-            <div class="history-size-limit">
-              <label class="field history-size-field">
-                <span>数据库大小上限（MB）</span>
-                <input id="history-max-size" class="text-input" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric">
-              </label>
-              <button id="save-history" type="button">保存历史设置</button>
-            </div>
-            <p id="message-history" class="message" role="status" aria-live="polite"></p>
-            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 30 天保留期与大小上限约束，超限后从最旧的一天开始删除。</p>
-            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
             <div id="history-legend" class="history-legend"></div>
             <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
             <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
             <p id="history-status" class="inline-status"></p>
-            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，保留最近 30 天；插件停止运行期间不采集，重启后曲线会出现断口。长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
+            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度设定”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
           </section>
         </section>
 
@@ -376,31 +373,68 @@
               <button id="debug-copy-report" type="button" disabled>复制报告</button>
               <button id="debug-download-report" type="button" disabled>下载报告</button>
               <button id="debug-open-issue" type="button" disabled>打开 GitHub Issue</button>
-              <div class="history-export-wrap" title="导出后台采样的温度、风扇与传感器历史（SQLite 数据库，保留最近 30 天）；sql 为数据库快照，csv 为可用 Excel 打开的宽表">
-                <button id="history-export-toggle" type="button" aria-haspopup="true" aria-expanded="false">导出历史图表数据 ▾</button>
-                <div id="history-export-menu" class="history-export-menu" hidden>
-                  <button id="history-export-sql" type="button">下载sql</button>
-                  <button id="history-export-csv" type="button">下载为csv</button>
-                </div>
-              </div>
             </div>
             <p id="debug-report-meta" class="debug-report-meta">尚未生成报告</p>
             <textarea id="debug-report" class="debug-report" readonly spellcheck="false" aria-label="调试报告内容" placeholder="点击“生成调试报告”获取报告"></textarea>
             <p id="debug-status" class="message" role="status" aria-live="polite">可以生成一份新的调试报告。</p>
           </section>
 
+          <section class="card debug-panel" aria-labelledby="history-settings-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="history-settings-heading">历史温度设定</h2>
+                <p>采样开关、数据库大小上限与保存天数，以及历史数据的导出与清空；曲线与时间范围在“风扇控制”页的历史温度卡片。</p>
+              </div>
+            </div>
+            <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
+            <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>数据库大小上限</span>
+                <div class="input-wrap"><input id="history-max-size" type="number" min="8" max="1024" step="8" value="64" inputmode="numeric"><b>MB</b></div>
+                <small>超限后同步清理运行日志</small>
+              </label>
+              <label class="field">
+                <span>保存天数</span>
+                <div class="input-wrap"><input id="history-retention-days" type="number" min="1" step="1" value="30" inputmode="numeric"><b>天</b></div>
+                <small>默认 30 天；可设大实现接近不限期，磁盘由大小上限兜底</small>
+              </label>
+            </div>
+            <div class="history-archive">
+              <label class="toggle history-archive-toggle"><input id="history-archive-enabled" type="checkbox"><span></span>启用长期记录</label>
+              <label class="field history-archive-dir">
+                <span>长期记录保存位置</span>
+                <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
+                <small>开启后，旧数据先在系统盘缓冲，攒够约 42 MB 或跨月后一次性按月归档（文件名 tad-history-年月.db）到保存位置，HDD 平时可持续休眠；文件数量不限；保存时会校验目录可写</small>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-history" type="button" class="primary">保存历史设置</button>
+              <div class="history-export-wrap" title="导出后台采样的温度、风扇与传感器历史（SQLite 数据库，按保存天数保留）；sql 为数据库快照，csv 为可用 Excel 打开的宽表">
+                <button id="history-export-toggle" type="button" aria-haspopup="true" aria-expanded="false">导出历史温度数据 ▾</button>
+                <div id="history-export-menu" class="history-export-menu" hidden>
+                  <button id="history-export-sql" type="button">下载sql</button>
+                  <button id="history-export-csv" type="button">下载为csv</button>
+                </div>
+              </div>
+              <button id="history-clear" type="button" class="danger">清空数据库</button>
+            </div>
+            <p id="message-history" class="message" role="status" aria-live="polite"></p>
+            <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 保留天数与大小上限约束，超限后从最旧的一天开始删除。</p>
+          </section>
+
           <section class="card debug-panel" aria-labelledby="sensor-names-heading">
             <div class="panel-heading">
               <div>
                 <h2 id="sensor-names-heading">传感器显示名</h2>
-                <p>为温度传感器设置便于辨认的显示名（如多个 temp1），并可选择其归属父类（默认按驱动自动归类）；历史图表与悬浮提示会使用该名称，配置保存在本机，所有设备生效。</p>
+                <p>为温度传感器设置便于辨认的显示名（如多个 temp1），并可选择其归属父类（默认按驱动自动归类）；历史温度与悬浮提示会使用该名称，配置保存在本机，所有设备生效。</p>
               </div>
             </div>
             <div id="sensor-names-list" class="sensor-names-list"></div>
             <div class="actions debug-actions">
               <button id="sensor-names-save" type="button" class="primary">保存显示名</button>
             </div>
-            <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史图表页一次即可列出全部传感器。</p>
+            <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史温度页一次即可列出全部传感器。</p>
           </section>
         </section>
 

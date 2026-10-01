@@ -27,18 +27,48 @@ function stubElement() {
   });
 }
 
-function loadAppContext() {
+// 可记录事件监听的元素桩：value/checked 按元素持久保存，供交互用例读取与触发
+function listeningStub() {
+  const store = { checked: false, value: '', textContent: '' };
+  const listeners = new Map();
+  const stub = new Proxy(function stub() {}, {
+    get(_target, prop) {
+      if (prop === Symbol.toPrimitive || prop === 'toString') return () => '';
+      if (prop === 'addEventListener') return (type, handler) => { listeners.set(type, handler); };
+      if (prop in store) return store[prop];
+      return stubElement();
+    },
+    set(_target, prop, value) {
+      store[prop] = value;
+      return true;
+    },
+    apply() {
+      return stubElement();
+    },
+  });
+  stub.listeners = listeners;
+  return stub;
+}
+
+function loadAppContext(overrides = {}) {
   const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
   const matchMedia = () => ({ matches: false, addEventListener() {} });
+  // getElementById 按 id 复用同一元素桩（与真实 DOM 一致），交互用例才能读回输入值
+  const elements = new Map();
+  const element = (id) => {
+    if (!elements.has(id)) elements.set(id, listeningStub());
+    return elements.get(id);
+  };
   const sandbox = {
     console,
+    URL,
     URLSearchParams,
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
     clearTimeout: () => {},
     requestAnimationFrame: () => 0,
-    fetch: () => new Promise(() => {}),
+    fetch: overrides.fetch || (() => new Promise(() => {})),
     Image: function Image() {},
     ResizeObserver: class ResizeObserver {
       observe() {}
@@ -46,10 +76,10 @@ function loadAppContext() {
       unobserve() {}
     },
     navigator: { userAgent: 'node-test' },
-    location: { reload() {}, href: '', pathname: '/' },
+    location: { reload() {}, href: '', pathname: '/', origin: 'http://localhost' },
     document: {
       readyState: 'complete',
-      getElementById: () => stubElement(),
+      getElementById: (id) => element(id),
       createElement: () => stubElement(),
       createElementNS: () => stubElement(),
       createTextNode: () => stubElement(),
@@ -65,15 +95,37 @@ function loadAppContext() {
     addEventListener() {},
     innerWidth: 1280,
     innerHeight: 800,
+    confirm: overrides.confirm || (() => true),
     location: sandbox.location,
   };
   sandbox.globalThis = sandbox;
   const context = vm.createContext(sandbox);
   vm.runInContext(source, context, { filename: 'app.js' });
-  return (name) => vm.runInContext(name, context);
+  return {
+    resolve: (name) => vm.runInContext(name, context),
+    element,
+    click: (id, type = 'click') => {
+      const handler = element(id).listeners.get(type);
+      return handler ? handler({ preventDefault() {}, stopPropagation() {} }) : undefined;
+    },
+  };
 }
 
-const resolve = loadAppContext();
+// 记录型 fetch 桩：按 URL 返回可配置响应体，供交互用例断言实际发出的请求
+function recordingFetch(responseFor) {
+  const requests = [];
+  const fetch = async (url, init = {}) => {
+    const href = String(url);
+    requests.push({ url: href, init });
+    const payload = responseFor(href, init);
+    // 返回体里带布尔 ok 字段时按它模拟 HTTP 失败（request 会 throw）
+    const ok = payload && typeof payload === 'object' && typeof payload.ok === 'boolean' ? payload.ok : true;
+    return { ok, status: ok ? 200 : 500, json: async () => payload };
+  };
+  return { requests, fetch };
+}
+
+const { resolve } = loadAppContext();
 
 test('盘位覆盖层标签：empty/present/used/warning/unknown 各状态文案统一', () => {
   const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
@@ -137,7 +189,7 @@ test('已勾选风扇 1200→0→1200 仍可见；未勾选的 0 RPM / 负值通
   assert.equal(connectedFans({ fans: [{ id: 'fan1', rpm: 0, selected: true }] }).length, 1);
 });
 
-// ---- 历史图表纯函数 ----
+// ---- 历史温度纯函数 ----
 
 test('历史范围过滤：只保留 now-range 之后的采样', () => {
   const historyFilterRange = resolve('historyFilterRange');
@@ -232,6 +284,199 @@ test('历史时间格式：本地 HH:MM 两位补零', () => {
   const ts = new Date(2026, 8, 15, 9, 5).getTime() / 1000;
   assert.equal(historyFormatClock(ts), '09:05');
 });
+
+test('历史范围标签：分钟/小时/天数三态文案', () => {
+  const historyRangeLabel = resolve('historyRangeLabel');
+  assert.equal(historyRangeLabel(0.5), '30 分钟');
+  assert.equal(historyRangeLabel(1), '1 小时');
+  assert.equal(historyRangeLabel(1.5), '1.5 小时');
+  assert.equal(historyRangeLabel(2.5), '2.5 小时');
+  assert.equal(historyRangeLabel(6), '6 小时');
+  assert.equal(historyRangeLabel(24), '24 小时');
+  assert.equal(historyRangeLabel(168), '7 天');
+  assert.equal(historyRangeLabel(720), '30 天');
+});
+
+test('历史范围钳制：吸附到六档位，7/30 天按钮档保留，非法值回默认', () => {
+  const normalizeHistoryRangeHours = resolve('normalizeHistoryRangeHours');
+  const historyHoursToStopIndex = resolve('historyHoursToStopIndex');
+  const historyStopToHours = resolve('historyStopToHours');
+  assert.equal(normalizeHistoryRangeHours(2.3), 2, '档位外的旧值吸附到最近档');
+  assert.equal(normalizeHistoryRangeHours(2.5), 2, '旧版半小时值吸附到最近档');
+  assert.equal(normalizeHistoryRangeHours(4), 2, '2 与 6 正中间时吸附到较小档');
+  assert.equal(normalizeHistoryRangeHours(0.1), 0.5);
+  assert.equal(normalizeHistoryRangeHours(30), 24, '超出滑杆上限压回 24');
+  assert.equal(normalizeHistoryRangeHours(100), 24);
+  assert.equal(normalizeHistoryRangeHours(-5), 0.5);
+  assert.equal(normalizeHistoryRangeHours(168), 168, '7 天按钮档原样保留');
+  assert.equal(normalizeHistoryRangeHours(720), 720, '30 天按钮档原样保留');
+  assert.equal(normalizeHistoryRangeHours(NaN), 0.5, '非法值回落默认 30 分钟档');
+  assert.equal(normalizeHistoryRangeHours('abc'), 0.5);
+  // 档位序号 ↔ 小时的双向换算（滑杆 value 就是档位序号）
+  for (let index = 0; index < 6; index++) {
+    assert.equal(historyHoursToStopIndex(historyStopToHours(index)), index, `档位 ${index} 换算往返一致`);
+  }
+  assert.equal(historyStopToHours(0), 0.5);
+  assert.equal(historyStopToHours(5), 24);
+  assert.equal(historyStopToHours(99), 24, '越界序号钳到尾档');
+  assert.equal(historyStopToHours(-3), 0.5, '负序号钳到首档');
+});
+
+test('历史时间刻度：2 小时与 12 小时档固定步长 1800/10800（4–5 条网格线）', () => {
+  const historyTimeTicks = resolve('historyTimeTicks');
+  const start = 1700000000;
+  const twoHour = historyTimeTicks(start, start + 7200, 2);
+  assert.ok(twoHour.length >= 4, '2h 范围至少 4 条刻度（30 分钟步长）');
+  assert.ok(twoHour.every((ts) => ts % 1800 === 0), '2h 范围刻度应为 30 分钟步长');
+  const twelveHour = historyTimeTicks(start, start + 43200, 12);
+  assert.ok(twelveHour.length >= 4, '12h 范围至少 4 条刻度（3 小时步长）');
+  assert.ok(twelveHour.every((ts) => ts % 10800 === 0), '12h 范围刻度应为 3 小时步长');
+});
+
+test('风扇组配色：黑灰阶梯取色，不混入温度传感器色系', () => {
+  const historyChildColor = resolve('historyChildColor');
+  const HISTORY_GROUPS = resolve('HISTORY_GROUPS');
+  const HISTORY_FAN_SHADES = resolve('HISTORY_FAN_SHADES');
+  const fanGroup = HISTORY_GROUPS.find((group) => group.key === 'fan');
+  assert.equal(fanGroup.color, '#6e7780', '风扇组基础色应为中性灰');
+  const fanIDs = ['fan1', 'fan2', 'fan3', 'fan4'];
+  const colors = fanIDs.map((id) => historyChildColor('fan', id, fanIDs));
+  // vm 上下文里的数组原型与宿主不同，先展开成普通数组再比较
+  assert.deepEqual([...colors], [...HISTORY_FAN_SHADES.slice(0, 4)], '按子类序号取灰色阶梯');
+  assert.equal(new Set(colors).size, 4, '4 个风扇颜色彼此可区分');
+  // 温度组仍走 HSL 派生（同色相明度阶梯），与风扇灰阶不冲突
+  const sataIDs = ['front-1', 'front-2'];
+  const sataColors = sataIDs.map((id) => historyChildColor('sata', id, sataIDs));
+  assert.ok(sataColors.every((color) => color.startsWith('hsl(')));
+  assert.equal(new Set(sataColors).size, 2);
+});
+
+// ---- 历史设置与保存天数 ----
+
+test('fillHistoryInputs：保存天数缺省或旧后端无字段时按 30 天兜底', () => {
+  const { resolve, element } = loadAppContext();
+  resolve('fillHistoryInputs')({ enabled: true, max_size_mb: 128, retention_days: 45 });
+  assert.equal(element('history-retention-days').value, 45);
+  assert.equal(element('history-max-size').value, 128);
+  assert.equal(element('history-enabled').checked, true);
+  resolve('fillHistoryInputs')({ retention_days: 0 }); // 0 等非法值同样兜底
+  assert.equal(element('history-retention-days').value, 30);
+  resolve('fillHistoryInputs')({}); // 旧后端无 retention_days 字段
+  assert.equal(element('history-retention-days').value, 30);
+  assert.equal(element('history-max-size').value, 64);
+});
+
+test('历史设置校验：上限 8–1024 MB、保存天数至少 1 天（不设上限），越界返回对应文案', () => {
+  const historySettingsError = resolve('historySettingsError');
+  assert.equal(historySettingsError(64, 30), null);
+  assert.equal(historySettingsError(8, 1), null, '下限边界应通过');
+  assert.equal(historySettingsError(1024, 90), null, '上限边界应通过');
+  assert.equal(historySettingsError(64, 365), null, '保存天数不设产品上限');
+  assert.equal(historySettingsError(7, 30), '数据库大小上限需在 8–1024 MB 之间。');
+  assert.equal(historySettingsError(1025, 30), '数据库大小上限需在 8–1024 MB 之间。');
+  assert.equal(historySettingsError(64, 0), '保存天数需至少为 1 天。');
+  assert.equal(historySettingsError(64, NaN), '保存天数需至少为 1 天。');
+});
+
+test('保存历史设置：请求体携带 retention_days 与长期记录字段，成功后按启停状态提示', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const { element, click } = loadAppContext({ fetch });
+  element('history-max-size').value = '96';
+  element('history-retention-days').value = '45';
+  element('history-enabled').checked = true;
+  element('history-archive-enabled').checked = true;
+  element('history-archive-dir').value = ' /vol1/1000/长期记录 ';
+  await click('save-history');
+  const saves = requests.filter((req) => req.url.includes('api/config/history')); // 过滤掉加载期的 api/status 等
+  assert.equal(saves.length, 1);
+  assert.equal(saves[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(saves[0].init.body), {
+    enabled: true, max_size_mb: 96, retention_days: 45,
+    archive_enabled: true, archive_dir: '/vol1/1000/长期记录', // 前端 trim，后端负责绝对路径校验
+  });
+  assert.equal(element('message-history').textContent, '历史设置已保存；后台每分钟继续写入采样。');
+});
+
+test('保存历史设置：开启长期记录但未填位置时不发请求', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const { element, click } = loadAppContext({ fetch });
+  element('history-max-size').value = '64';
+  element('history-retention-days').value = '30';
+  element('history-archive-enabled').checked = true;
+  element('history-archive-dir').value = '   ';
+  await click('save-history');
+  assert.equal(requests.filter((req) => req.url.includes('api/config/history')).length, 0, '缺位置应拦截');
+  assert.equal(element('message-history').textContent, '开启长期记录需先填写保存位置。');
+});
+
+test('保存历史设置：保存天数越界时不发请求，仅在 message-history 提示', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const { element, click } = loadAppContext({ fetch });
+  element('history-max-size').value = '64';
+  element('history-retention-days').value = '0';
+  await click('save-history');
+  assert.equal(requests.filter((req) => req.url.includes('api/config/history')).length, 0, '越界时应拦截，不发 POST');
+  assert.equal(element('message-history').textContent, '保存天数需至少为 1 天。');
+});
+
+test('清空数据库：点击即补冲刷（取消也发）；确认后 POST api/history/clear 并强制刷新缓存', async () => {
+  const cancelled = recordingFetch(() => ({ ok: true, flushed: false }));
+  const cancelledApp = loadAppContext({ fetch: cancelled.fetch, confirm: () => false });
+  await cancelledApp.click('history-clear');
+  assert.ok(
+    cancelled.requests.some((req) => req.url.includes('api/history/archive')),
+    '点击瞬间就应补冲刷（取消确认也发）',
+  );
+  assert.equal(cancelled.requests.filter((req) => req.url.includes('api/history/clear')).length, 0, '取消确认时不应发清空请求');
+
+  const { requests, fetch } = recordingFetch((href) => (href.includes('api/history/archive') ? { ok: true, flushed: true } : href.includes('api/history/clear') ? { ok: true } : { samples: [] }));
+  const app = loadAppContext({ fetch });
+  await app.click('history-clear');
+  const archiveIndex = requests.findIndex((req) => req.url.includes('api/history/archive'));
+  const clearIndex = requests.findIndex((req) => req.url.includes('api/history/clear'));
+  assert.ok(archiveIndex >= 0, '确认流程也应先补冲刷');
+  assert.ok(clearIndex > archiveIndex, '清空请求应在补冲刷之后');
+  assert.equal(requests[clearIndex].init.method, 'POST');
+  assert.ok(
+    requests.some((req, index) => index > clearIndex && req.url.includes('api/history?range=')),
+    '清空后应强制刷新历史缓存',
+  );
+  assert.equal(app.element('message-history').textContent, '历史数据库已清空。');
+});
+
+test('清空数据库：补冲刷失败时弹窗明示后果，用户确认仍可清空', async () => {
+  const confirms = [];
+  const { requests, fetch } = recordingFetch((href) => (href.includes('api/history/archive') ? { ok: false, error: 'HDD 不可写' } : href.includes('api/history/clear') ? { ok: true } : { samples: [] }));
+  const app = loadAppContext({
+    fetch,
+    confirm: (message) => { confirms.push(message); return true; },
+  });
+  await app.click('history-clear');
+  assert.equal(requests.filter((req) => req.url.includes('api/history/clear')).length, 1, '用户确认后仍应清空');
+  assert.match(confirms[0], /冲刷失败/, '弹窗应明示冲刷失败与数据丢失后果');
+});
+
+test('档位记忆挂后端：切档 POST api/config/ui-prefs；首帧采纳后端档位，手动切过后不被覆盖', async () => {
+  // 切档双写：localStorage + 后端配置
+  const wrote = recordingFetch(() => ({ samples: [] }));
+  const writeApp = loadAppContext({ fetch: wrote.fetch });
+  writeApp.resolve('setHistoryRange')(6);
+  const prefPosts = wrote.requests.filter((req) => req.url.includes('api/config/ui-prefs'));
+  assert.equal(prefPosts.length, 1, '切档应 POST 一次 ui-prefs');
+  assert.equal(prefPosts[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(prefPosts[0].init.body), { history_range_hours: 6 });
+
+  // 独立上下文（未手动切档）：后端下发 2 小时 → 采纳并按新档位取数
+  const adopt = recordingFetch(() => ({ samples: [] }));
+  const adoptApp = loadAppContext({ fetch: adopt.fetch });
+  adoptApp.resolve('applyBackendHistoryRange')({ history_range_hours: 2 });
+  assert.equal(adoptApp.resolve('historyRangeHours'), 2, '应采纳后端档位');
+  assert.ok(adopt.requests.some((req) => req.url.includes('api/history?range=2')), '采纳后应按新档位取数');
+  // 已采纳过后再下发不同档位：不覆盖
+  adoptApp.resolve('applyBackendHistoryRange')({ history_range_hours: 12 });
+  assert.equal(adoptApp.resolve('historyRangeHours'), 2, '二次下发不应覆盖');
+});
+
 test('历史分组子类：空通道过滤、组别归类、聚合项与勾选可见性', () => {
   const historyGroupChildIDs = resolve('historyGroupChildIDs');
   const historyGroupSeries = resolve('historyGroupSeries');
@@ -276,6 +521,32 @@ test('历史分组子类：空通道过滤、组别归类、聚合项与勾选�
   assert.equal(aggOnly.length, 1, '只勾聚合项时应只有一条线');
   assert.equal(aggOnly[0].id, 'sata:__agg__');
   assert.equal(aggOnly[0].color, '#18a779');
+});
+
+test('父类取消勾选连带清空子类勾选，重新勾上后子类为空', () => {
+  const setHistoryChildSelection = resolve('setHistoryChildSelection');
+  const historyChildSelectionFor = resolve('historyChildSelectionFor');
+  const setHistoryGroupEnabled = resolve('setHistoryGroupEnabled');
+  const seriesEnabled = (key) => resolve('historySeriesEnabledFor')(key);
+  setHistoryChildSelection('sata', new Set(['__agg__', 'front-1']));
+  setHistoryGroupEnabled('sata', false); // 取消父类
+  assert.equal(seriesEnabled('sata'), false, '父类应记录为关闭');
+  const cleared = historyChildSelectionFor('sata');
+  assert.ok(cleared && cleared.size === 0, `取消父类应清空子类勾选集合，实际 ${cleared}`);
+  // 重新勾上父类:子类仍为空（残留会违背"取消=清空"的直觉）
+  setHistoryGroupEnabled('sata', true);
+  assert.equal(seriesEnabled('sata'), true);
+  assert.ok(historyChildSelectionFor('sata').size === 0);
+});
+
+test('取消父类不影响其它组的子类勾选', () => {
+  const setHistoryChildSelection = resolve('setHistoryChildSelection');
+  const historyChildSelectionFor = resolve('historyChildSelectionFor');
+  const setHistoryGroupEnabled = resolve('setHistoryGroupEnabled');
+  setHistoryChildSelection('sata', new Set(['front-1']));
+  setHistoryChildSelection('fan', new Set(['fan3']));
+  setHistoryGroupEnabled('sata', false);
+  assert.equal(historyChildSelectionFor('fan').has('fan3'), true, '其它组勾选应原样保留');
 });
 
 test('index.html 面板结构：相邻 tab-panel 之间 section 开闭配对，防止面板被嵌套', () => {
