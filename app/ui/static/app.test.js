@@ -327,19 +327,19 @@ test('滑杆双段换算：无极区 1 分钟粒度往返一致；挡位段吸�
   }
   // 位置→小时:无极区按 1 分钟粒度
   assert.equal(historyPosToHours(0), 0.5);
-  assert.equal(historyPosToHours(300), 2, '无极区末端是 2h');
+  assert.equal(historyPosToHours(400), 2, '无极区末端是 2h');
   // 挡位段:落入即吸附
-  assert.equal(historyPosToHours(301), 6, '无极区之后立刻是 6h 挡');
-  assert.equal(historyPosToHours(370), 6, '6h 停靠位');
-  assert.equal(historyPosToHours(510), 12, '12h 停靠位');
-  assert.equal(historyPosToHours(930), 720, '30 天停靠位');
+  assert.equal(historyPosToHours(401), 6, '无极区之后立刻是 6h 挡');
+  assert.equal(historyPosToHours(460), 6, '6h 停靠位');
+  assert.equal(historyPosToHours(580), 12, '12h 停靠位');
+  assert.equal(historyPosToHours(940), 720, '30 天停靠位');
   assert.equal(historyPosToHours(9999), 720, '越界钳到尾挡');
   // 挡位小时→位置:停靠位
-  assert.equal(historyHoursToPos(6), 370);
-  assert.equal(historyHoursToPos(12), 510);
-  assert.equal(historyHoursToPos(24), 650);
-  assert.equal(historyHoursToPos(168), 790);
-  assert.equal(historyHoursToPos(720), 930);
+  assert.equal(historyHoursToPos(6), 460);
+  assert.equal(historyHoursToPos(12), 580);
+  assert.equal(historyHoursToPos(24), 700);
+  assert.equal(historyHoursToPos(168), 820);
+  assert.equal(historyHoursToPos(720), 940);
 });
 
 test('渲染抽稀：≤2h 全精度，>2h 5 抽 1，>6h 15 抽 1；保留末点且不断口', () => {

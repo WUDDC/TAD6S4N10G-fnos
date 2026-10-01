@@ -1245,25 +1245,25 @@ body.modal-open { overflow: hidden; }
 }
 .history-range-tick[data-tick="cont-min"] { left: 0; transform: none; text-align: left; }
 .history-range-tick[data-tick="cont-min"]::before { margin-left: 0; }
-/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=1000（无极区 300 + 5×140），
-   挡位停靠位 = 300 + i×140 + 70 → 370/510/650/790/930 */
-.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 30%; }
-.history-range-ticks.layout-7 [data-tick="6h"] { left: 37%; }
-.history-range-ticks.layout-7 [data-tick="12h"] { left: 51%; }
-.history-range-ticks.layout-7 [data-tick="24h"] { left: 65%; }
-.history-range-ticks.layout-7 [data-tick="7d"] { left: 79%; }
-.history-range-ticks.layout-7 [data-tick="30d"] { left: 93%; }
-/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=860，停靠位 370/510/650/790 */
-.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 34.9%; }
-.history-range-ticks.layout-6 [data-tick="6h"] { left: 43%; }
-.history-range-ticks.layout-6 [data-tick="12h"] { left: 59.3%; }
-.history-range-ticks.layout-6 [data-tick="24h"] { left: 75.6%; }
-.history-range-ticks.layout-6 [data-tick="7d"] { left: 91.9%; }
-/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=720，停靠位 370/510/650 */
-.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 41.7%; }
-.history-range-ticks.layout-5 [data-tick="6h"] { left: 51.4%; }
-.history-range-ticks.layout-5 [data-tick="12h"] { left: 70.8%; }
-.history-range-ticks.layout-5 [data-tick="24h"] { left: 90.3%; }
+/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=1000（无极区 400 + 5×120），
+   挡位停靠位 = 400 + i×120 + 60 → 460/580/700/820/940 */
+.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 40%; }
+.history-range-ticks.layout-7 [data-tick="6h"] { left: 46%; }
+.history-range-ticks.layout-7 [data-tick="12h"] { left: 58%; }
+.history-range-ticks.layout-7 [data-tick="24h"] { left: 70%; }
+.history-range-ticks.layout-7 [data-tick="7d"] { left: 82%; }
+.history-range-ticks.layout-7 [data-tick="30d"] { left: 94%; }
+/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=880，停靠位 460/580/700/820 */
+.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 45.5%; }
+.history-range-ticks.layout-6 [data-tick="6h"] { left: 52.3%; }
+.history-range-ticks.layout-6 [data-tick="12h"] { left: 65.9%; }
+.history-range-ticks.layout-6 [data-tick="24h"] { left: 79.5%; }
+.history-range-ticks.layout-6 [data-tick="7d"] { left: 93.2%; }
+/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=760，停靠位 460/580/700 */
+.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 52.6%; }
+.history-range-ticks.layout-5 [data-tick="6h"] { left: 60.5%; }
+.history-range-ticks.layout-5 [data-tick="12h"] { left: 76.3%; }
+.history-range-ticks.layout-5 [data-tick="24h"] { left: 92.1%; }
 @media (max-width: 599px) {
   .history-range { width: 100%; }
   .history-range-slider { flex: 1 1 100%; width: 100%; min-width: 0; }

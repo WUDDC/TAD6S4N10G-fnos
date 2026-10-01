@@ -1396,8 +1396,8 @@ function saveHistoryChildSelection() {
 // 粒度吸附，0.3 分钟/位），后 70% 每 140 位一个固定挡位（6时/12时/24时 +
 // 按保存天数显隐的 7天/30天），拇指落入挡位段即吸附到段中心的停靠位，
 // 刻度画在停靠位上。挡位总数由 updateHistoryRangeAvailability 维护。
-const HISTORY_CONT_POSITIONS = 300; // 无极区占用的滑杆位置数（总行程的 30%）
-const HISTORY_STOP_SPAN = 140;      // 每个固定挡位占用的位置数
+const HISTORY_CONT_POSITIONS = 400; // 无极区占用的滑杆位置数（总行程的 40%）
+const HISTORY_STOP_SPAN = 120;      // 每个固定挡位占用的位置数
 const HISTORY_CONT_MIN_HOURS = 0.5;
 const HISTORY_CONT_MAX_HOURS = 2;
 const HISTORY_BASE_STOPS = [6, 12, 24];
