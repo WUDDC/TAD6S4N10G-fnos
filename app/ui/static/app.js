@@ -1417,7 +1417,7 @@ function historyStopCenterPos(stopIndex) {
 
 // 滑杆位置 → 小时。无极区按 1 分钟粒度吸附；挡位区整段吸附到对应挡位。
 function historyPosToHours(pos) {
-  const max = HISTORY_CONT_POSITIONS + historySliderStopCount * HISTORY_STOP_SPAN;
+  const max = historySliderStopCount > 0 ? historyStopCenterPos(historySliderStopCount - 1) : HISTORY_CONT_POSITIONS;
   const position = Math.round(clamp(Number(pos) || 0, 0, max));
   if (position <= HISTORY_CONT_POSITIONS) {
     const minutes = Math.round(HISTORY_CONT_MIN_HOURS * 60 + (position / HISTORY_CONT_POSITIONS) * (HISTORY_CONT_MAX_HOURS - HISTORY_CONT_MIN_HOURS) * 60);
@@ -2016,11 +2016,20 @@ async function fetchHistory(force = false) {
 
 // 把当前 historyRangeHours 同步到滑杆与按钮：固定挡位停在吸附位中心，
 // 动一下滑杆（input/change）就回到滑杆值。
+// 值标签跟随拇指：把滑杆位置百分比写入 CSS 变量（夹在 6%–94%，标签居中
+// 对准拇指且不出容器）。
+function syncRunLogThumbPct(slider) {
+  const max = Number(slider.max) || 1;
+  const pct = clamp((Number(slider.value) / max) * 100, 6, 94);
+  slider.parentElement.style.setProperty('--thumb-pct', `${pct}%`);
+}
+
 function syncHistoryRangeUI() {
   const slider = $('history-range-slider');
   if (slider) {
     slider.value = String(historyHoursToPos(historyRangeHours));
     slider.setAttribute('aria-valuetext', historyRangeLabel(historyRangeHours));
+    syncRunLogThumbPct(slider);
   }
   const label = $('history-range-value');
   if (label) label.textContent = historyRangeLabel(historyRangeHours);
@@ -2060,7 +2069,9 @@ function updateHistoryRangeAvailability(retentionDays) {
   const days = Math.round(Number(retentionDays) || 30);
   historySliderStopCount = 3 + (days >= 7 ? 1 : 0) + (days >= 30 ? 1 : 0);
   const slider = $('history-range-slider');
-  if (slider) slider.max = String(HISTORY_CONT_POSITIONS + historySliderStopCount * HISTORY_STOP_SPAN);
+  // 滑杆 max = 末挡停靠位：拖到最右恰好填满整条轨道（进度条 100%），
+  // 吸附回拉不会让尾巴留一段灰色。
+  if (slider) slider.max = String(historyStopCenterPos(historySliderStopCount - 1));
   const ticks = document.querySelector('.history-range-ticks');
   if (ticks) {
     ticks.classList.remove('layout-5', 'layout-6', 'layout-7');
@@ -2079,8 +2090,10 @@ function setupHistoryPanel() {
     // 拖动中只实时刷新标签，松手（change）才取数，避免半路连续请求；
     // 滑杆位置经双段映射换成小时（无极区 1 分钟粒度 / 挡位区整段吸附）。
     slider.addEventListener('input', () => {
+      const hours = historyPosToHours(parseFloat(slider.value));
       const label = $('history-range-value');
-      if (label) label.textContent = historyRangeLabel(historyPosToHours(parseFloat(slider.value)));
+      if (label) label.textContent = historyRangeLabel(hours);
+      syncRunLogThumbPct(slider);
     });
     slider.addEventListener('change', () => setHistoryRange(historyPosToHours(parseFloat(slider.value))));
   }

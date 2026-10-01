@@ -1210,12 +1210,18 @@ body.modal-open { overflow: hidden; }
   min-width: 240px;
   max-width: 100%;
 }
+/* 值标签跟随拇指：--thumb-pct 由 JS 写入（CSS 变量，非 style 属性，CSP 安全），
+   translateX(-50%) 以标签自身宽度居中对准拇指；百分比由 JS 夹在 6%–94%，
+   标签不会溢出滑杆容器 */
 .history-range-value {
+  position: relative;
+  left: var(--thumb-pct, 92%);
+  transform: translateX(-50%);
+  white-space: nowrap;
   font-size: 12px;
   line-height: 1.4;
   font-weight: 650;
   color: var(--text-secondary);
-  text-align: right;
 }
 .history-range-input {
   width: 100%;
@@ -1245,25 +1251,28 @@ body.modal-open { overflow: hidden; }
 }
 .history-range-tick[data-tick="cont-min"] { left: 0; transform: none; text-align: left; }
 .history-range-tick[data-tick="cont-min"]::before { margin-left: 0; }
-/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=1000（无极区 400 + 5×120），
-   挡位停靠位 = 400 + i×120 + 60 → 460/580/700/820/940 */
-.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 40%; }
-.history-range-ticks.layout-7 [data-tick="6h"] { left: 46%; }
-.history-range-ticks.layout-7 [data-tick="12h"] { left: 58%; }
-.history-range-ticks.layout-7 [data-tick="24h"] { left: 70%; }
-.history-range-ticks.layout-7 [data-tick="7d"] { left: 82%; }
-.history-range-ticks.layout-7 [data-tick="30d"] { left: 94%; }
-/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=880，停靠位 460/580/700/820 */
-.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 45.5%; }
-.history-range-ticks.layout-6 [data-tick="6h"] { left: 52.3%; }
-.history-range-ticks.layout-6 [data-tick="12h"] { left: 65.9%; }
-.history-range-ticks.layout-6 [data-tick="24h"] { left: 79.5%; }
-.history-range-ticks.layout-6 [data-tick="7d"] { left: 93.2%; }
-/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=760，停靠位 460/580/700 */
-.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 52.6%; }
-.history-range-ticks.layout-5 [data-tick="6h"] { left: 60.5%; }
-.history-range-ticks.layout-5 [data-tick="12h"] { left: 76.3%; }
-.history-range-ticks.layout-5 [data-tick="24h"] { left: 92.1%; }
+/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=末挡停靠位 940（无极区 400
+   + 4×120 + 60 尾段），挡位停靠位 = 400 + i×120 + 60 → 460/580/700/820/940 */
+.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 42.6%; }
+.history-range-ticks.layout-7 [data-tick="6h"] { left: 48.9%; }
+.history-range-ticks.layout-7 [data-tick="12h"] { left: 61.7%; }
+.history-range-ticks.layout-7 [data-tick="24h"] { left: 74.5%; }
+.history-range-ticks.layout-7 [data-tick="7d"] { left: 87.2%; }
+.history-range-ticks.layout-7 [data-tick="30d"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-7 [data-tick="30d"]::before { margin-right: 0; }
+/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=820 */
+.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 48.8%; }
+.history-range-ticks.layout-6 [data-tick="6h"] { left: 56.1%; }
+.history-range-ticks.layout-6 [data-tick="12h"] { left: 70.7%; }
+.history-range-ticks.layout-6 [data-tick="24h"] { left: 85.4%; }
+.history-range-ticks.layout-6 [data-tick="7d"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-6 [data-tick="7d"]::before { margin-right: 0; }
+/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=700 */
+.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 57.1%; }
+.history-range-ticks.layout-5 [data-tick="6h"] { left: 65.7%; }
+.history-range-ticks.layout-5 [data-tick="12h"] { left: 82.9%; }
+.history-range-ticks.layout-5 [data-tick="24h"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-5 [data-tick="24h"]::before { margin-right: 0; }
 @media (max-width: 599px) {
   .history-range { width: 100%; }
   .history-range-slider { flex: 1 1 100%; width: 100%; min-width: 0; }
