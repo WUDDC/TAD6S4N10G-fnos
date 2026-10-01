@@ -1767,3 +1767,124 @@ func TestHandleHistoryArchive(t *testing.T) {
 		}
 	}
 }
+
+// ---- 运行日志：独立大小设置与清理/导出 ----
+
+func TestClampLogMaxSize(t *testing.T) {
+	for _, test := range []struct{ in, want int64 }{{-5, 1}, {0, 1}, {1, 1}, {16, 16}, {256, 256}, {257, 256}, {9999, 256}} {
+		if got := ClampLogMaxSize(test.in); got != test.want {
+			t.Fatalf("ClampLogMaxSize(%d)=%d, want %d", test.in, got, test.want)
+		}
+	}
+}
+
+func TestSaveLogConfigPersistsAndNormalizes(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	if err := manager.SaveLogConfig(LogConfig{MaxSizeMB: 32}); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.LogSettings().MaxSizeMB; got != 32 {
+		t.Fatalf("log max = %d, want 32", got)
+	}
+	if err := manager.SaveLogConfig(LogConfig{MaxSizeMB: 9999}); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.LogSettings().MaxSizeMB; got != logMaxMaxSizeMB {
+		t.Fatalf("9999 should clamp to %d, got %d", logMaxMaxSizeMB, got)
+	}
+	// 保存日志设置不影响历史配置
+	if got := manager.HistorySettings().MaxSizeMB; got != 64 {
+		t.Fatalf("history config should be untouched, max_size=%d", got)
+	}
+	// 旧配置迁移：log 段缺失时归一为默认
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Log = LogConfig{}
+	if err := writeJSONAtomic(manager.ConfigPath, cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.LogSettings().MaxSizeMB; got != logDefaultMaxSizeMB {
+		t.Fatalf("missing log section should default to %d, got %d", logDefaultMaxSizeMB, got)
+	}
+}
+
+func TestHandleLogClearAndExport(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "tad-module.log")
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("old line\n"); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if err := os.WriteFile(logPath+".1", []byte("older backup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager := newHistoryTestManager(t)
+	server := &Server{Manager: manager, History: nil, LogPath: logPath, Logger: log.New(os.Stderr, "", 0)}
+
+	// 清空：截断主文件、删两代备份
+	req := httptest.NewRequest(http.MethodPost, "/api/log/clear", nil)
+	req.Header.Set("X-Trim-Isadmin", "true")
+	rec := httptest.NewRecorder()
+	server.handleLogClear(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	info, err := os.Stat(logPath)
+	if err != nil || info.Size() != 0 {
+		t.Fatalf("main log should be truncated, size=%d err=%v", info.Size(), err)
+	}
+	if _, err := os.Stat(logPath + ".1"); !os.IsNotExist(err) {
+		t.Fatalf(".1 backup should be removed, err=%v", err)
+	}
+
+	// 导出：.1 与主文件按序拼接（此刻都为空/不存在，应 200 且空体）
+	req = httptest.NewRequest(http.MethodGet, "/api/log/export", nil)
+	rec = httptest.NewRecorder()
+	server.handleLogExport(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	// 重新写入内容后导出应包含全部行
+	file, err = os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteString("current line\n"); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	req = httptest.NewRequest(http.MethodGet, "/api/log/export", nil)
+	rec = httptest.NewRecorder()
+	server.handleLogExport(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "current line") {
+		t.Fatalf("export should stream main log, status=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// 方法守卫与非文件模式
+	req = httptest.NewRequest(http.MethodPost, "/api/log/export", nil)
+	rec = httptest.NewRecorder()
+	server.handleLogExport(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("export POST should 405, got %d", rec.Code)
+	}
+	empty := &Server{Manager: manager, LogPath: "", Logger: log.New(os.Stderr, "", 0)}
+	req = httptest.NewRequest(http.MethodGet, "/api/log/export", nil)
+	rec = httptest.NewRecorder()
+	empty.handleLogExport(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("stderr-mode export should 404, got %d", rec.Code)
+	}
+	req = httptest.NewRequest(http.MethodPost, "/api/log/clear", nil)
+	req.Header.Set("X-Trim-Isadmin", "true")
+	rec = httptest.NewRecorder()
+	empty.handleLogClear(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stderr-mode clear should be ok (no-op), got %d", rec.Code)
+	}
+}

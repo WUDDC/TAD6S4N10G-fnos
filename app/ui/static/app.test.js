@@ -566,3 +566,34 @@ test('传感器父类下拉选项与后端 sensorGroupValues 契约一致（gpu|
   assert.equal(options.map((option) => option.value).sort().join(','), 'gpu,nic,other');
   assert.ok(options.every((option) => option.label && option.label !== option.value), '每项都要有中文标签');
 });
+
+test('运行日志：保存校验并 POST /api/config/log；导出发起下载；清空经确认后 POST /api/log/clear', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const { element, click } = loadAppContext({ fetch });
+  // 回填:fillHistoryInputs 应顺带填入 runlog-max-size(status.config.log)
+  element('history-max-size').value = '64';
+  element('history-retention-days').value = '30';
+  element('runlog-max-size').value = '16';
+  // 越界拦截
+  element('runlog-max-size').value = '999';
+  await click('save-runlog');
+  assert.equal(requests.filter((req) => req.url.includes('api/config/log')).length, 0, '越界应拦截');
+  assert.equal(element('runlog-status').textContent, '日志大小上限需在 1–256 MB 之间。');
+  // 合法保存
+  element('runlog-max-size').value = '32';
+  await click('save-runlog');
+  const saves = requests.filter((req) => req.url.includes('api/config/log'));
+  assert.equal(saves.length, 1);
+  assert.deepEqual(JSON.parse(saves[0].init.body), { max_size_mb: 32 });
+  assert.match(element('runlog-status').textContent, /32 MB/);
+  // 清空:取消不发
+  const cancelled = loadAppContext({ fetch: recordingFetch(() => ({})).fetch, confirm: () => false });
+  await cancelled.click('runlog-clear');
+  assert.equal(requests.filter((req) => req.url.includes('api/log/clear')).length, 0, '取消确认不应清空');
+  // 确认后清空
+  await click('runlog-clear');
+  const clears = requests.filter((req) => req.url.includes('api/log/clear'));
+  assert.equal(clears.length, 1);
+  assert.equal(clears[0].init.method, 'POST');
+  assert.equal(element('runlog-status').textContent, '运行日志已清空。');
+});

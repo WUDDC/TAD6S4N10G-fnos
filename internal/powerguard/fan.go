@@ -201,6 +201,14 @@ func normalizeConfig(cfg *Config) bool {
 		cfg.History.ArchiveDir = ""
 		changed = true
 	}
+	if cfg.Log.MaxSizeMB == 0 {
+		// 旧配置没有 log 段：默认日志大小上限
+		cfg.Log = DefaultLogConfig()
+		changed = true
+	} else if clamped := ClampLogMaxSize(cfg.Log.MaxSizeMB); clamped != cfg.Log.MaxSizeMB {
+		cfg.Log.MaxSizeMB = clamped
+		changed = true
+	}
 	for index := range cfg.GPIO.Buttons {
 		if cfg.GPIO.Buttons[index].Actions.Short != GPIOActionNone {
 			cfg.GPIO.Buttons[index].Actions.Short = GPIOActionNone

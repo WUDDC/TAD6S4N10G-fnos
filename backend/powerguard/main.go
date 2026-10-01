@@ -191,15 +191,15 @@ func serve(args []string) error {
 		go powerguard.HistoryLoop(ctx, manager, logger, history)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath}
 		done <- server.ListenAndServe()
 	}()
-	// 日志大小清理：与历史数据库共用用户设定的大小上限（max_size_mb），超限
-	// 后内容另存 .1 并就地截断（不做按天轮转）。读取走 manager 的实时配置，
-	// 用户改上限后最迟一个检查周期生效。
+	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
+	// 超限后内容另存 .1 并就地截断。读取走 manager 的实时配置，用户改上限
+	// 后最迟一个检查周期生效。
 	if logFile != nil {
 		go powerguard.LogRotateLoop(ctx, logger, *logPath, logFile, func() int64 {
-			return manager.HistorySettings().MaxSizeMB << 20
+			return manager.LogSettings().MaxSizeMB << 20
 		})
 	}
 	go reapplyLoop(ctx, manager, logger)

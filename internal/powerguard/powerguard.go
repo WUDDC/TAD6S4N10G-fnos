@@ -64,6 +64,7 @@ type Config struct {
 	Fan            FanConfig         `json:"fan"`
 	GPIO           GPIOConfig        `json:"gpio"`
 	History        HistoryConfig     `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
+	Log            LogConfig         `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
 	UIPrefs        UIPrefsConfig     `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
@@ -73,6 +74,34 @@ type Config struct {
 // 替换各自配置，混进去的界面偏好会被误覆盖。零值表示未设置。
 type UIPrefsConfig struct {
 	HistoryRangeHours float64 `json:"history_range_hours,omitempty"` // 历史温度时间范围档位（小时）
+}
+
+// LogConfig 运行日志的大小设置：与历史数据库大小上限解耦。日志体量小，
+// 阈值应小而灵敏——共用大上限会让清理在 1024M 档形同虚设（刷屏时日志
+// 可堆到 2×上限才收敛）。
+type LogConfig struct {
+	MaxSizeMB int64 `json:"max_size_mb"`
+}
+
+const (
+	logDefaultMaxSizeMB = 16
+	logMinMaxSizeMB     = 1
+	logMaxMaxSizeMB     = 256
+)
+
+func DefaultLogConfig() LogConfig {
+	return LogConfig{MaxSizeMB: logDefaultMaxSizeMB}
+}
+
+// ClampLogMaxSize 把日志大小上限限制在合理区间，配置文件里的非法值静默归位。
+func ClampLogMaxSize(maxSizeMB int64) int64 {
+	if maxSizeMB < logMinMaxSizeMB {
+		return logMinMaxSizeMB
+	}
+	if maxSizeMB > logMaxMaxSizeMB {
+		return logMaxMaxSizeMB
+	}
+	return maxSizeMB
 }
 
 // ClampUIHistoryRangeHours 界面档位只做范围钳制（0.5 小时–30 天），
@@ -212,7 +241,7 @@ func DefaultConfig(profile Profile) Config {
 	return Config{
 		Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2,
 		ReapplySeconds: 30, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(),
-		History: DefaultHistoryConfig(),
+		History: DefaultHistoryConfig(), Log: DefaultLogConfig(),
 	}
 }
 
@@ -262,6 +291,38 @@ func (m *Manager) HistorySettings() HistoryConfig {
 		return DefaultHistoryConfig()
 	}
 	return cfg.History
+}
+
+// SaveLogConfig 只保存运行日志的大小设置，不触碰其它配置；非法值由
+// normalizeConfig 静默钳制。轮转循环每 10 分钟读一次实时值，保存后最迟
+// 一个周期生效。
+func (m *Manager) SaveLogConfig(logCfg LogConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.Log = logCfg
+	normalizeConfig(&cfg)
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
+// LogSettings 供日志轮转循环读取大小上限；读文件失败按默认值降级。
+func (m *Manager) LogSettings() LogConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return DefaultLogConfig()
+	}
+	return cfg.Log
 }
 
 func (m *Manager) CPUModel() (string, error) {

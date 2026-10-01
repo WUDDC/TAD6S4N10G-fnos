@@ -2260,6 +2260,11 @@ function fillHistoryInputs(history = {}) {
   $('history-archive-dir').value = history.archive_dir || '';
   updateHistoryRangeAvailability(retentionDays);
   updateHistoryDisabledNotice(enabled);
+  // 运行日志大小在 render() 的 status 上下文里单独回填（见 syncRunLogInputs）
+}
+
+function syncRunLogInputs(status = {}) {
+  $('runlog-max-size').value = Number(status.config?.log?.max_size_mb) || 16;
 }
 
 function updateHistoryDisabledNotice(enabled) {
@@ -2337,6 +2342,55 @@ $('history-clear').addEventListener('click', async () => {
     showMessage('历史数据库已清空。', false, 'message-history');
   } catch (error) {
     showMessage(`清空失败：${error.message}`, true, 'message-history');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// ---- 运行日志：独立大小设置、导出与清空 ----
+
+function runlogMessage(message, error = false) {
+  showMessage(message, error, 'runlog-status');
+}
+
+$('save-runlog').addEventListener('click', async () => {
+  const input = $('runlog-max-size');
+  if (!input.reportValidity()) return;
+  const maxSize = Number(input.value);
+  if (!Number.isFinite(maxSize) || maxSize < 1 || maxSize > 256) {
+    runlogMessage('日志大小上限需在 1–256 MB 之间。', true);
+    return;
+  }
+  setBusy(true);
+  try {
+    render(await request('api/config/log', { method: 'POST', body: JSON.stringify({ max_size_mb: maxSize }) }), true);
+    runlogMessage(`日志大小上限已保存为 ${maxSize} MB；超过后自动截断并保留一代备份。`);
+  } catch (error) {
+    runlogMessage(`保存失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('runlog-export').addEventListener('click', () => {
+  const stamp = new Date().toISOString().slice(0, 10);
+  const link = document.createElement('a');
+  link.href = baseUrl('api/log/export');
+  link.download = `tad-module-log-${stamp}.txt`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  runlogMessage('日志下载已开始。');
+});
+
+$('runlog-clear').addEventListener('click', async () => {
+  if (!window.confirm('清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？')) return;
+  setBusy(true);
+  try {
+    await request('api/log/clear', { method: 'POST', body: '{}' });
+    runlogMessage('运行日志已清空。');
+  } catch (error) {
+    runlogMessage(`清空失败：${error.message}`, true);
   } finally {
     setBusy(false);
   }
@@ -2463,6 +2517,7 @@ function render(status, keepInputs = false) {
     fillGPIOInputs(status.config?.gpio);
     applyBackendHistoryRange(status.config?.ui_prefs); // 后端档位先采纳，保留天数钳制随后生效
     fillHistoryInputs(status.config?.history);
+    syncRunLogInputs(status);
   }
   CURVE_KINDS.forEach(renderFanChart);
 }

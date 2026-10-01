@@ -423,6 +423,28 @@
             <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 保留天数与大小上限约束，超限后从最旧的一天开始删除。</p>
           </section>
 
+          <section class="card debug-panel" aria-labelledby="runlog-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="runlog-heading">运行日志</h2>
+                <p>守护进程的文本诊断日志（/var/log/tank/tad-module.log），正常情况下近乎空白；超过大小上限会自动截断并保留一代备份。</p>
+              </div>
+            </div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>日志大小上限</span>
+                <div class="input-wrap"><input id="runlog-max-size" type="number" min="1" max="256" step="1" value="16" inputmode="numeric"><b>MB</b></div>
+                <small>范围 1–256 MB，默认 16 MB；与历史数据库大小上限相互独立</small>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="save-runlog" type="button" class="primary">保存日志设置</button>
+              <button id="runlog-export" type="button">导出日志</button>
+              <button id="runlog-clear" type="button" class="danger">清空日志</button>
+            </div>
+            <p id="runlog-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
           <section class="card debug-panel" aria-labelledby="sensor-names-heading">
             <div class="panel-heading">
               <div>

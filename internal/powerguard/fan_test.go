@@ -195,7 +195,7 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 }
 
 func TestNormalizeConfigPreservesExplicitlyDisabledStorageMonitoring(t *testing.T) {
-	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
+	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(), Log: DefaultLogConfig()}
 	cfg.Fan.HDDSlotIDs = []string{}
 	cfg.Fan.NVMeSlotIDs = []string{}
 	cfg.History = HistoryConfig{Enabled: false, MaxSizeMB: 32, RetentionDays: historyDefaultRetentionDays}
