@@ -285,41 +285,80 @@ test('历史时间格式：本地 HH:MM 两位补零', () => {
   assert.equal(historyFormatClock(ts), '09:05');
 });
 
-test('历史范围标签：分钟/小时/天数三态文案', () => {
+test('历史范围标签：分钟 / 小时+分钟 / 整小时 / 天数文案', () => {
   const historyRangeLabel = resolve('historyRangeLabel');
   assert.equal(historyRangeLabel(0.5), '30 分钟');
   assert.equal(historyRangeLabel(1), '1 小时');
-  assert.equal(historyRangeLabel(1.5), '1.5 小时');
-  assert.equal(historyRangeLabel(2.5), '2.5 小时');
+  assert.equal(historyRangeLabel(1.5), '1 小时 30 分');
+  assert.equal(historyRangeLabel(1.75), '1 小时 45 分');
+  assert.equal(historyRangeLabel(2), '2 小时');
   assert.equal(historyRangeLabel(6), '6 小时');
   assert.equal(historyRangeLabel(24), '24 小时');
   assert.equal(historyRangeLabel(168), '7 天');
   assert.equal(historyRangeLabel(720), '30 天');
 });
 
-test('历史范围钳制：吸附到六档位，7/30 天按钮档保留，非法值回默认', () => {
+test('历史范围钳制：无极区 1 分钟粒度，>2h 吸附最近挡位，7/30 天保留，非法值回默认', () => {
   const normalizeHistoryRangeHours = resolve('normalizeHistoryRangeHours');
-  const historyHoursToStopIndex = resolve('historyHoursToStopIndex');
-  const historyStopToHours = resolve('historyStopToHours');
-  assert.equal(normalizeHistoryRangeHours(2.3), 2, '档位外的旧值吸附到最近档');
-  assert.equal(normalizeHistoryRangeHours(2.5), 2, '旧版半小时值吸附到最近档');
-  assert.equal(normalizeHistoryRangeHours(4), 2, '2 与 6 正中间时吸附到较小档');
+  // 无极区：1 分钟粒度吸附
+  assert.equal(normalizeHistoryRangeHours(0.51), 0.5 + 1 / 60, '1 分钟内吸附到整分钟');
+  assert.equal(normalizeHistoryRangeHours(1.5), 1.5, '90 分钟正好整分');
   assert.equal(normalizeHistoryRangeHours(0.1), 0.5);
-  assert.equal(normalizeHistoryRangeHours(30), 24, '超出滑杆上限压回 24');
-  assert.equal(normalizeHistoryRangeHours(100), 24);
+  assert.equal(normalizeHistoryRangeHours(2.05), 6, '略超 2h 即属挡位区,吸附最近挡 6h');
+  // >2h 吸附最近挡位（全套挡位，与显隐无关）
+  assert.equal(normalizeHistoryRangeHours(2.5), 6, '2–6h 之间吸附到 6h 挡');
+  assert.equal(normalizeHistoryRangeHours(4), 6);
+  assert.equal(normalizeHistoryRangeHours(30), 24, '24–168h 之间吸附到 24h 挡');
+  assert.equal(normalizeHistoryRangeHours(200), 168, '7–30 天之间吸附到 7 天挡');
   assert.equal(normalizeHistoryRangeHours(-5), 0.5);
-  assert.equal(normalizeHistoryRangeHours(168), 168, '7 天按钮档原样保留');
-  assert.equal(normalizeHistoryRangeHours(720), 720, '30 天按钮档原样保留');
-  assert.equal(normalizeHistoryRangeHours(NaN), 0.5, '非法值回落默认 30 分钟档');
+  assert.equal(normalizeHistoryRangeHours(168), 168, '7 天挡原样保留');
+  assert.equal(normalizeHistoryRangeHours(720), 720, '30 天挡原样保留');
+  assert.equal(normalizeHistoryRangeHours(NaN), 0.5, '非法值回落默认 30 分钟');
   assert.equal(normalizeHistoryRangeHours('abc'), 0.5);
-  // 档位序号 ↔ 小时的双向换算（滑杆 value 就是档位序号）
-  for (let index = 0; index < 6; index++) {
-    assert.equal(historyHoursToStopIndex(historyStopToHours(index)), index, `档位 ${index} 换算往返一致`);
+});
+
+test('滑杆双段换算：无极区 1 分钟粒度往返一致；挡位段吸附与停靠位', () => {
+  const historyPosToHours = resolve('historyPosToHours');
+  const historyHoursToPos = resolve('historyHoursToPos');
+  // 无极区端点与中间整分钟往返
+  for (const minutes of [30, 45, 61, 89, 90, 120]) {
+    const hours = minutes / 60;
+    assert.equal(historyPosToHours(historyHoursToPos(hours)), hours, `${minutes} 分钟往返一致`);
   }
-  assert.equal(historyStopToHours(0), 0.5);
-  assert.equal(historyStopToHours(5), 24);
-  assert.equal(historyStopToHours(99), 24, '越界序号钳到尾档');
-  assert.equal(historyStopToHours(-3), 0.5, '负序号钳到首档');
+  // 位置→小时:无极区按 1 分钟粒度
+  assert.equal(historyPosToHours(0), 0.5);
+  assert.equal(historyPosToHours(300), 2, '无极区末端是 2h');
+  // 挡位段:落入即吸附
+  assert.equal(historyPosToHours(301), 6, '无极区之后立刻是 6h 挡');
+  assert.equal(historyPosToHours(370), 6, '6h 停靠位');
+  assert.equal(historyPosToHours(510), 12, '12h 停靠位');
+  assert.equal(historyPosToHours(930), 720, '30 天停靠位');
+  assert.equal(historyPosToHours(9999), 720, '越界钳到尾挡');
+  // 挡位小时→位置:停靠位
+  assert.equal(historyHoursToPos(6), 370);
+  assert.equal(historyHoursToPos(12), 510);
+  assert.equal(historyHoursToPos(24), 650);
+  assert.equal(historyHoursToPos(168), 790);
+  assert.equal(historyHoursToPos(720), 930);
+});
+
+test('渲染抽稀：≤2h 全精度，>2h 5 抽 1，>6h 15 抽 1；保留末点且不断口', () => {
+  const historyDecimationStride = resolve('historyDecimationStride');
+  const historyThinByStride = resolve('historyThinByStride');
+  assert.equal(historyDecimationStride(0.5), 1);
+  assert.equal(historyDecimationStride(2), 1, '2h 无极区端点仍全精度');
+  assert.equal(historyDecimationStride(2.5), 5, '>2h 即 5 抽 1');
+  assert.equal(historyDecimationStride(6), 5, '6h 恰好不大于 6,仍 5 抽 1');
+  assert.equal(historyDecimationStride(6.5), 15, '>6h 为 15 抽 1');
+  assert.equal(historyDecimationStride(12), 15);
+  assert.equal(historyDecimationStride(24), 15);
+  assert.equal(historyDecimationStride(720), 15);
+  const samples = Array.from({ length: 100 }, (_, i) => ({ ts: i, v: i }));
+  const five = historyThinByStride(samples, 5);
+  assert.equal(five.length, 21, '100 点 5 抽 1 → 20 点 + 末点');
+  assert.equal(five[0].ts, 0, '保留首点');
+  assert.deepEqual(five[five.length - 1], { ts: 99, v: 99 }, '保留最后一个点');
+  assert.equal(historyThinByStride(samples, 1).length, 100, 'stride 1 原样返回');
 });
 
 test('历史时间刻度：2 小时与 12 小时档固定步长 1800/10800（4–5 条网格线）', () => {

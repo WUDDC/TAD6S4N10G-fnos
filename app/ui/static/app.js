@@ -1390,36 +1390,80 @@ function saveHistoryChildSelection() {
   } catch (error) { /* 忽略写入失败 */ }
 }
 
-// ---- 时间范围：拖动条（六档位）+ 7 天/30 天按钮 ----
+// ---- 时间范围：拖动条（30分–2时无极 + 固定挡位，7天/30天并入挡位）----
 
-// 滑杆按档位取值（index → 小时），刻度均匀占位、不按实际时间比例分布：
-// 线性比例下 30分/1时/2时 会挤在左端 8% 以内，只能错行错开，观感差。
-const HISTORY_RANGE_STOPS = [0.5, 1, 2, 6, 12, 24];
+// 滑杆双段设计（用户确认）：前 30% 是 30 分钟–2 小时的无极区（按 1 分钟
+// 粒度吸附，0.3 分钟/位），后 70% 每 140 位一个固定挡位（6时/12时/24时 +
+// 按保存天数显隐的 7天/30天），拇指落入挡位段即吸附到段中心的停靠位，
+// 刻度画在停靠位上。挡位总数由 updateHistoryRangeAvailability 维护。
+const HISTORY_CONT_POSITIONS = 300; // 无极区占用的滑杆位置数（总行程的 30%）
+const HISTORY_STOP_SPAN = 140;      // 每个固定挡位占用的位置数
+const HISTORY_CONT_MIN_HOURS = 0.5;
+const HISTORY_CONT_MAX_HOURS = 2;
+const HISTORY_BASE_STOPS = [6, 12, 24];
+const HISTORY_ALL_STOPS = [6, 12, 24, 168, 720];
 
-// 档位序号（滑杆 value）→ 小时；非法输入钳到首尾档。
-function historyStopToHours(stopIndex) {
-  const index = Math.round(clamp(Number(stopIndex) || 0, 0, HISTORY_RANGE_STOPS.length - 1));
-  return HISTORY_RANGE_STOPS[index];
+// 当前滑杆上的固定挡位数量（3=仅基础挡；保存天数 ≥7 加 7 天，≥30 加 30 天）
+let historySliderStopCount = HISTORY_ALL_STOPS.length;
+
+function historyStopsFor(stopCount) {
+  return HISTORY_ALL_STOPS.slice(0, clamp(Math.round(stopCount) || HISTORY_ALL_STOPS.length, 3, HISTORY_ALL_STOPS.length));
 }
 
-// 小时 → 最近的档位序号；旧 localStorage 里的半小时值（如 2.5）吸附到最近档。
-function historyHoursToStopIndex(hours) {
+// 挡位序号 → 拇指停靠位（挡位段中心）
+function historyStopCenterPos(stopIndex) {
+  return HISTORY_CONT_POSITIONS + stopIndex * HISTORY_STOP_SPAN + HISTORY_STOP_SPAN / 2;
+}
+
+// 滑杆位置 → 小时。无极区按 1 分钟粒度吸附；挡位区整段吸附到对应挡位。
+function historyPosToHours(pos) {
+  const max = HISTORY_CONT_POSITIONS + historySliderStopCount * HISTORY_STOP_SPAN;
+  const position = Math.round(clamp(Number(pos) || 0, 0, max));
+  if (position <= HISTORY_CONT_POSITIONS) {
+    const minutes = Math.round(HISTORY_CONT_MIN_HOURS * 60 + (position / HISTORY_CONT_POSITIONS) * (HISTORY_CONT_MAX_HOURS - HISTORY_CONT_MIN_HOURS) * 60);
+    return minutes / 60;
+  }
+  const stops = historyStopsFor(historySliderStopCount);
+  const index = Math.min(stops.length - 1, Math.floor((position - HISTORY_CONT_POSITIONS - 1) / HISTORY_STOP_SPAN));
+  return stops[index];
+}
+
+// 小时 → 滑杆位置。无极区反解到吸附位（1 分钟粒度往返一致）；挡位取停靠位。
+function historyHoursToPos(hours) {
+  const value = Number(hours);
+  if (!Number.isFinite(value)) return 0;
+  if (value <= HISTORY_CONT_MAX_HOURS) {
+    const minutes = clamp(value, HISTORY_CONT_MIN_HOURS, HISTORY_CONT_MAX_HOURS) * 60;
+    return Math.round((minutes - HISTORY_CONT_MIN_HOURS * 60) / ((HISTORY_CONT_MAX_HOURS - HISTORY_CONT_MIN_HOURS) * 60 / HISTORY_CONT_POSITIONS));
+  }
+  const stops = historyStopsFor(historySliderStopCount);
   let best = 0;
   let bestDelta = Infinity;
-  HISTORY_RANGE_STOPS.forEach((stop, index) => {
-    const delta = Math.abs(stop - hours);
+  stops.forEach((stop, index) => {
+    const delta = Math.abs(stop - value);
     if (delta < bestDelta) { best = index; bestDelta = delta; }
   });
-  return best;
+  return historyStopCenterPos(best);
 }
 
-// 范围值钳制到合法档位：7 天/30 天按钮档原样保留，其余吸附到最近档位；
-// 旧版本残留或手改的 localStorage 值不会弄坏图表。
+// 范围值钳制到合法值：7 天/30 天原样保留；≤2 小时按 1 分钟粒度钳进无极区；
+// 2 小时以上的旧值（含旧版半小时值）吸附到最近固定挡位。这里用全套挡位，
+// 与保存天数显隐无关——超出保留期的值由 updateHistoryRangeAvailability 回落。
 function normalizeHistoryRangeHours(hours) {
   const value = Number(hours);
   if (Number.isFinite(value) && (value === 168 || value === 720)) return value;
   if (!Number.isFinite(value)) return HISTORY_DEFAULT_HOURS;
-  return historyStopToHours(historyHoursToStopIndex(clamp(value, 0.5, 24)));
+  if (value <= HISTORY_CONT_MAX_HOURS) {
+    const minutes = clamp(value, HISTORY_CONT_MIN_HOURS, HISTORY_CONT_MAX_HOURS) * 60;
+    return Math.round(minutes) / 60;
+  }
+  let best = HISTORY_BASE_STOPS[0];
+  let bestDelta = Infinity;
+  HISTORY_ALL_STOPS.forEach((stop) => {
+    const delta = Math.abs(stop - value);
+    if (delta < bestDelta) { best = stop; bestDelta = delta; }
+  });
+  return best;
 }
 
 function loadHistoryRangeHours() {
@@ -1438,12 +1482,16 @@ function saveHistoryRangeHours(hours) {
   request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify({ history_range_hours: hours }) }).catch(() => {});
 }
 
-// 范围标签：不足 1 小时显示分钟，整数小时显示 N 小时，按钮档显示 N 天。
+// 范围标签：不足 1 小时显示分钟；无极区非整小时显示"N 小时 M 分"；
+// 固定挡位显示 N 小时 / N 天。
 function historyRangeLabel(hours) {
   if (hours === 168) return '7 天';
   if (hours === 720) return '30 天';
   if (hours < 1) return `${Math.round(hours * 60)} 分钟`;
-  return `${Number.isInteger(hours) ? hours : hours.toFixed(1)} 小时`;
+  if (Number.isInteger(hours)) return `${hours} 小时`;
+  const whole = Math.floor(hours);
+  const minutes = Math.round((hours - whole) * 60);
+  return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
 }
 
 function historyChildSelectionFor(groupKey) {
@@ -1476,7 +1524,27 @@ function historyThinOut(samples, maxPoints = 480) {
   const out = [];
   for (let i = 0; i < samples.length; i += stride) out.push(samples[i]);
   const last = samples[samples.length - 1];
-  if (out[out.length - 1].ts !== last.ts) out.push(last);
+  if (out[out.length - 1] !== last) out.push(last);
+  return out;
+}
+
+// 渲染抽稀：2 小时以上的范围按 5 抽 1、6 小时以上按 15 抽 1 收敛折线点数
+// （每条曲线少一个数量级的 DOM 节点）；2 小时以内（无极区）保持全精度。
+// 必须在断口切分之后、按段执行——先抽稀会把点距拉大过断口阈值，停机断口
+// 会被误并回连续线。
+function historyDecimationStride(rangeHours) {
+  if (rangeHours > 6) return 15;
+  if (rangeHours > 2) return 5;
+  return 1;
+}
+
+// 按步长抽稀一段折线：保留第 0/stride/2×stride… 个点，且始终保留最后一个
+// 点（曲线末端反映最新状态）。
+function historyThinByStride(samples, stride) {
+  if (stride <= 1 || samples.length <= stride) return samples;
+  const out = samples.filter((_, index) => index % stride === 0);
+  const last = samples[samples.length - 1];
+  if (out[out.length - 1] !== last) out.push(last);
   return out;
 }
 
@@ -1683,7 +1751,9 @@ function historyGroupSeries(groupKey, samples, intervalSeconds) {
       return {
         id: `${groupKey}:${childID}`,
         color: historyChildColor(groupKey, childID, childIDs),
-        segments: historySplitSegments(points, intervalSeconds).map((segment) => historyThinOut(segment)),
+        segments: historySplitSegments(points, intervalSeconds)
+          .map((segment) => historyThinByStride(segment, historyDecimationStride(historyRangeHours)))
+          .map((segment) => historyThinOut(segment)),
       };
     });
 }
@@ -1944,20 +2014,16 @@ async function fetchHistory(force = false) {
   return historyCache;
 }
 
-// 把当前 historyRangeHours 同步到滑杆与按钮：7 天/30 天档滑杆拇指停在最右
-// 但数值仍按按钮档，动一下滑杆（input/change）就回到滑杆值。
+// 把当前 historyRangeHours 同步到滑杆与按钮：固定挡位停在吸附位中心，
+// 动一下滑杆（input/change）就回到滑杆值。
 function syncHistoryRangeUI() {
   const slider = $('history-range-slider');
-  const isButtonRange = historyRangeHours === 168 || historyRangeHours === 720;
   if (slider) {
-    slider.value = isButtonRange ? HISTORY_RANGE_STOPS.length - 1 : historyHoursToStopIndex(historyRangeHours);
+    slider.value = String(historyHoursToPos(historyRangeHours));
     slider.setAttribute('aria-valuetext', historyRangeLabel(historyRangeHours));
   }
   const label = $('history-range-value');
   if (label) label.textContent = historyRangeLabel(historyRangeHours);
-  document.querySelectorAll('.history-range-btn').forEach((button) => {
-    button.classList.toggle('active', Number(button.dataset.range) === historyRangeHours);
-  });
 }
 
 function setHistoryRange(hours) {
@@ -1987,14 +2053,23 @@ function applyBackendHistoryRange(prefs) {
   fetchHistory(true);
 }
 
-// 保留天数收窄可查窗口：7 天/30 天按钮超出保留期时隐藏（服务端也会钳制
-// range，这里避免点了拿到一段空数据）；当前记忆的范围越界则回落到默认档（30 分钟）。
+// 保留天数收窄可查窗口：7 天/30 天挡位按保存天数显隐（小于 7 天两个都不
+// 显示，7–29 天只显示 7 天），滑杆 max 随挡位数变化；当前记忆的范围超出
+// 保留期则回落到默认档（30 分钟）。
 function updateHistoryRangeAvailability(retentionDays) {
   const days = Math.round(Number(retentionDays) || 30);
-  document.querySelectorAll('.history-range-btn').forEach((button) => {
-    const hours = Number(button.dataset.range);
-    button.hidden = hours > days * 24;
-  });
+  historySliderStopCount = 3 + (days >= 7 ? 1 : 0) + (days >= 30 ? 1 : 0);
+  const slider = $('history-range-slider');
+  if (slider) slider.max = String(HISTORY_CONT_POSITIONS + historySliderStopCount * HISTORY_STOP_SPAN);
+  const ticks = document.querySelector('.history-range-ticks');
+  if (ticks) {
+    ticks.classList.remove('layout-5', 'layout-6', 'layout-7');
+    ticks.classList.add(`layout-${historySliderStopCount + 2}`); // 30分/2时 两个恒显刻度 + 挡位数
+    const weekTick = ticks.querySelector('[data-tick="7d"]');
+    const monthTick = ticks.querySelector('[data-tick="30d"]');
+    if (weekTick) weekTick.hidden = days < 7;
+    if (monthTick) monthTick.hidden = days < 30;
+  }
   if (historyRangeHours > days * 24) setHistoryRange(HISTORY_DEFAULT_HOURS);
 }
 
@@ -2002,21 +2077,13 @@ function setupHistoryPanel() {
   const slider = $('history-range-slider');
   if (slider) {
     // 拖动中只实时刷新标签，松手（change）才取数，避免半路连续请求；
-    // 滑杆 value 是档位序号，取数前先换成小时。
+    // 滑杆位置经双段映射换成小时（无极区 1 分钟粒度 / 挡位区整段吸附）。
     slider.addEventListener('input', () => {
       const label = $('history-range-value');
-      if (label) label.textContent = historyRangeLabel(historyStopToHours(parseFloat(slider.value)));
-      document.querySelectorAll('.history-range-btn').forEach((button) => button.classList.remove('active'));
+      if (label) label.textContent = historyRangeLabel(historyPosToHours(parseFloat(slider.value)));
     });
-    slider.addEventListener('change', () => setHistoryRange(historyStopToHours(parseFloat(slider.value))));
+    slider.addEventListener('change', () => setHistoryRange(historyPosToHours(parseFloat(slider.value))));
   }
-  document.querySelectorAll('.history-range-btn').forEach((button) => {
-    button.addEventListener('click', () => {
-      const hours = Number(button.dataset.range);
-      if (!hours) return;
-      setHistoryRange(hours);
-    });
-  });
   syncHistoryRangeUI(); // 应用 localStorage 记忆的范围
   setupHistoryCursor();
 }

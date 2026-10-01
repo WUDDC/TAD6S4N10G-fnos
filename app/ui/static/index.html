@@ -248,18 +248,17 @@
               <div class="history-range" role="group" aria-label="时间范围">
                 <div class="history-range-slider">
                   <output id="history-range-value" class="history-range-value" for="history-range-slider">30 分钟</output>
-                  <input id="history-range-slider" class="history-range-input" type="range" min="0" max="5" step="1" value="0" aria-label="历史时间范围档位：30 分钟、1 小时、2 小时、6 小时、12 小时、24 小时">
-                  <div class="history-range-ticks" aria-hidden="true">
-                    <span class="history-range-tick" data-stop="0">30分</span>
-                    <span class="history-range-tick" data-stop="1">1时</span>
-                    <span class="history-range-tick" data-stop="2">2时</span>
-                    <span class="history-range-tick" data-stop="3">6时</span>
-                    <span class="history-range-tick" data-stop="4">12时</span>
-                    <span class="history-range-tick" data-stop="5">24时</span>
+                  <input id="history-range-slider" class="history-range-input" type="range" min="0" max="1000" step="1" value="0" aria-label="历史时间范围：30 分钟到 2 小时无极调节（1 分钟粒度），之后为 6 小时、12 小时、24 小时、7 天、30 天固定挡位，7 天与 30 天按保存天数显隐">
+                  <div class="history-range-ticks layout-7" aria-hidden="true">
+                    <span class="history-range-tick" data-tick="cont-min">30分</span>
+                    <span class="history-range-tick" data-tick="cont-max">2时</span>
+                    <span class="history-range-tick" data-tick="6h">6时</span>
+                    <span class="history-range-tick" data-tick="12h">12时</span>
+                    <span class="history-range-tick" data-tick="24h">24时</span>
+                    <span class="history-range-tick" data-tick="7d">7天</span>
+                    <span class="history-range-tick" data-tick="30d">30天</span>
                   </div>
                 </div>
-                <button type="button" class="history-range-btn" data-range="168">7 天</button>
-                <button type="button" class="history-range-btn" data-range="720">30 天</button>
               </div>
             </div>
             <div id="history-legend" class="history-legend"></div>

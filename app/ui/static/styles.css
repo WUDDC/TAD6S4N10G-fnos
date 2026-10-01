@@ -1224,8 +1224,8 @@ body.modal-open { overflow: hidden; }
   accent-color: var(--primary);
   cursor: pointer;
 }
-/* 刻度按档位均匀占位（每档 20%），不按实际时间比例分布——滑杆本身
-   就是六档位取值，刻度与拇指停靠位严格对齐，单行即可放下 */
+/* 刻度摆放在各挡位的吸附位上（百分比 = 吸附位/滑杆行程），拇指停靠位与
+   刻度严格对齐；layout-N 由 JS 按保存天数切换（7天/30天 挡位显隐） */
 .history-range-ticks {
   position: relative;
   height: 18px;
@@ -1234,7 +1234,7 @@ body.modal-open { overflow: hidden; }
   line-height: 1.2;
   color: var(--muted);
 }
-.history-range-tick { position: absolute; top: 0; white-space: nowrap; }
+.history-range-tick { position: absolute; top: 0; white-space: nowrap; transform: translateX(-50%); text-align: center; }
 .history-range-tick::before {
   content: '';
   display: block;
@@ -1243,34 +1243,27 @@ body.modal-open { overflow: hidden; }
   margin: 0 auto 2px;
   background: var(--line-strong);
 }
-.history-range-tick[data-stop] { transform: translateX(-50%); text-align: center; }
-.history-range-tick[data-stop="0"] { left: 0; transform: none; text-align: left; }
-.history-range-tick[data-stop="1"] { left: 20%; }
-.history-range-tick[data-stop="2"] { left: 40%; }
-.history-range-tick[data-stop="3"] { left: 60%; }
-.history-range-tick[data-stop="4"] { left: 80%; }
-.history-range-tick[data-stop="5"] { left: 100%; transform: translateX(-100%); text-align: right; }
-.history-range-tick[data-stop="0"]::before { margin-left: 0; }
-.history-range-tick[data-stop="5"]::before { margin-right: 0; }
-.history-range-btn {
-  flex: 0 0 auto;
-  white-space: nowrap;
-  padding: 4px 12px;
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.4;
-  cursor: pointer;
-}
-.history-range-btn:hover { border-color: var(--primary); color: var(--primary); }
-.history-range-btn.active {
-  border-color: var(--primary);
-  background: var(--primary-soft);
-  color: var(--primary);
-  font-weight: 650;
-}
+.history-range-tick[data-tick="cont-min"] { left: 0; transform: none; text-align: left; }
+.history-range-tick[data-tick="cont-min"]::before { margin-left: 0; }
+/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=1000（无极区 300 + 5×140），
+   挡位停靠位 = 300 + i×140 + 70 → 370/510/650/790/930 */
+.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 30%; }
+.history-range-ticks.layout-7 [data-tick="6h"] { left: 37%; }
+.history-range-ticks.layout-7 [data-tick="12h"] { left: 51%; }
+.history-range-ticks.layout-7 [data-tick="24h"] { left: 65%; }
+.history-range-ticks.layout-7 [data-tick="7d"] { left: 79%; }
+.history-range-ticks.layout-7 [data-tick="30d"] { left: 93%; }
+/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=860，停靠位 370/510/650/790 */
+.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 34.9%; }
+.history-range-ticks.layout-6 [data-tick="6h"] { left: 43%; }
+.history-range-ticks.layout-6 [data-tick="12h"] { left: 59.3%; }
+.history-range-ticks.layout-6 [data-tick="24h"] { left: 75.6%; }
+.history-range-ticks.layout-6 [data-tick="7d"] { left: 91.9%; }
+/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=720，停靠位 370/510/650 */
+.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 41.7%; }
+.history-range-ticks.layout-5 [data-tick="6h"] { left: 51.4%; }
+.history-range-ticks.layout-5 [data-tick="12h"] { left: 70.8%; }
+.history-range-ticks.layout-5 [data-tick="24h"] { left: 90.3%; }
 @media (max-width: 599px) {
   .history-range { width: 100%; }
   .history-range-slider { flex: 1 1 100%; width: 100%; min-width: 0; }
