@@ -2476,6 +2476,80 @@ $('runlog-clear').addEventListener('click', async () => {
   }
 });
 
+// ---- 长期记录保存位置：内置目录浏览（浏览器拿不到 NAS 绝对路径，
+// 目录导航只能由服务端 /api/fs/dirs 提供） ----
+
+let fsPickerPath = '/vol1';
+
+function fsPickerJoin(base, name) {
+  return `${base === '/' ? '' : base}/${name}`;
+}
+
+function fsPickerParent(path) {
+  if (path === '/') return null;
+  const cut = path.lastIndexOf('/');
+  return cut <= 0 ? '/' : path.slice(0, cut);
+}
+
+function setFsPickerPath(path) {
+  fsPickerPath = path;
+  $('fs-picker-path').textContent = path;
+  $('fs-picker-up').disabled = fsPickerParent(path) === null;
+}
+
+async function loadFsPickerDirs(path) {
+  const list = $('fs-picker-list');
+  const status = $('fs-picker-status');
+  list.replaceChildren();
+  status.textContent = '正在读取…';
+  try {
+    const data = await request(`api/fs/dirs?path=${encodeURIComponent(path)}`);
+    setFsPickerPath(data.path);
+    status.textContent = data.dirs.length ? '' : '此目录下没有子目录。';
+    data.dirs.forEach((name) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.className = 'fs-picker-item';
+      item.setAttribute('role', 'option');
+      item.textContent = name;
+      item.addEventListener('click', () => {
+        loadFsPickerDirs(fsPickerJoin(fsPickerPath, name));
+      });
+      list.append(item);
+    });
+  } catch (error) {
+    status.textContent = `读取失败：${error.message}`;
+  }
+}
+
+function openFsPicker() {
+  const initial = $('history-archive-dir').value.trim() || '/vol1';
+  $('fs-picker').hidden = false;
+  document.body.classList.add('modal-open');
+  loadFsPickerDirs(initial);
+}
+
+function closeFsPicker() {
+  $('fs-picker').hidden = true;
+  document.body.classList.remove('modal-open');
+}
+
+$('history-archive-browse').addEventListener('click', openFsPicker);
+$('fs-picker-up').addEventListener('click', () => {
+  const parent = fsPickerParent(fsPickerPath);
+  if (parent !== null) loadFsPickerDirs(parent);
+});
+$('fs-picker-choose').addEventListener('click', () => {
+  $('history-archive-dir').value = fsPickerPath;
+  closeFsPicker();
+});
+document.querySelectorAll('#fs-picker [data-picker-close]').forEach((el) => {
+  el.addEventListener('click', closeFsPicker);
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !$('fs-picker').hidden) closeFsPicker();
+});
+
 function renderFanRPMs(fanStatus = {}) {
   const target = $('fan-rpm-list');
   const fans = connectedFans(fanStatus, 4);

@@ -401,11 +401,14 @@
             </div>
             <div class="history-archive">
               <label class="toggle history-archive-toggle"><input id="history-archive-enabled" type="checkbox"><span></span>启用长期记录</label>
-              <label class="field history-archive-dir">
+              <div class="field history-archive-dir">
                 <span>长期记录保存位置</span>
-                <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
+                <div class="history-archive-row">
+                  <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
+                  <button id="history-archive-browse" type="button">浏览</button>
+                </div>
                 <small>开启后数据先在系统盘缓存，按月归档写入到保存位置，HDD 仅在归档时单次写入，文件数量不限制</small>
-              </label>
+              </div>
             </div>
             <div class="actions history-actions">
               <button id="save-history" type="button" class="primary">保存历史设置</button>
@@ -504,6 +507,22 @@
       <h3 id="app-modal-title">详细信息</h3>
       <p id="app-modal-body"></p>
       <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
+    </div>
+  </div>
+  <div id="fs-picker" class="fs-picker" hidden>
+    <div class="fs-picker-backdrop" data-picker-close></div>
+    <div class="fs-picker-dialog" role="dialog" aria-modal="true" aria-labelledby="fs-picker-title">
+      <h3 id="fs-picker-title">选择保存位置</h3>
+      <div class="fs-picker-bar">
+        <button id="fs-picker-up" type="button" aria-label="上一级目录" title="上一级目录">↑</button>
+        <code id="fs-picker-path" class="fs-picker-path">/vol1</code>
+      </div>
+      <div id="fs-picker-list" class="fs-picker-list" role="listbox" aria-label="目录列表"></div>
+      <p id="fs-picker-status" class="fs-picker-status" role="status" aria-live="polite"></p>
+      <div class="actions">
+        <button id="fs-picker-cancel" type="button" data-picker-close>取消</button>
+        <button id="fs-picker-choose" type="button" class="primary">选择当前目录</button>
+      </div>
     </div>
   </div>
   <script src="app.js?v=0.10.19" defer></script>

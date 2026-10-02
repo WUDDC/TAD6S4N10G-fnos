@@ -1996,3 +1996,74 @@ button.danger {
 [data-theme="dark"] .curve-slot-option.storage-warning { border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .status-table .storage-present td:nth-child(2) { color: #6cc0e8; }
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }
+
+/* ---- 长期记录保存位置：内置目录选择器 ---- */
+.history-archive-row { display: flex; gap: 8px; align-items: stretch; }
+.history-archive-row .text-input { flex: 1 1 auto; min-width: 0; }
+.history-archive-row button { flex: 0 0 auto; }
+.fs-picker {
+  position: fixed;
+  inset: 0;
+  z-index: 210;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+.fs-picker[hidden] { display: none !important; }
+.fs-picker-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(31, 35, 41, .42);
+}
+.fs-picker-dialog {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  gap: 10px;
+  width: min(480px, 100%);
+  padding: 18px 18px 16px;
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: 0 18px 48px rgba(15, 18, 22, .28);
+}
+.fs-picker-dialog h3 { margin: 0; font-size: 15px; }
+.fs-picker-bar { display: flex; gap: 8px; align-items: center; }
+.fs-picker-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* 长路径靠右截断,保留最深的层级可见 */
+  text-align: left;
+  font-size: 12px;
+  padding: 6px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-secondary);
+}
+.fs-picker-list {
+  display: grid;
+  gap: 4px;
+  max-height: min(46vh, 320px);
+  overflow: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 6px;
+  min-height: 96px;
+}
+.fs-picker-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.fs-picker-item:hover { background: var(--primary-soft, rgba(63, 111, 245, .12)); }
+.fs-picker-status { margin: 0; font-size: 12px; color: var(--muted); }
