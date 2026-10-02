@@ -2476,79 +2476,60 @@ $('runlog-clear').addEventListener('click', async () => {
   }
 });
 
-// ---- 长期记录保存位置：内置目录浏览（浏览器拿不到 NAS 绝对路径，
-// 目录导航只能由服务端 /api/fs/dirs 提供） ----
+// ---- 长期记录保存位置：官方系统目录选择器（fnOS 应用 SDK pickSharedFile）----
 
-let fsPickerPath = '/vol1';
+// SDK 单例：动态 import vendor 的 @trimjs/web-app ESM 构建，ready() 握手
+// 超时 8 秒防卡死；失败后下次点击重新初始化。
+let fsSdkPromise = null;
 
-function fsPickerJoin(base, name) {
-  return `${base === '/' ? '' : base}/${name}`;
-}
-
-function fsPickerParent(path) {
-  if (path === '/') return null;
-  const cut = path.lastIndexOf('/');
-  return cut <= 0 ? '/' : path.slice(0, cut);
-}
-
-function setFsPickerPath(path) {
-  fsPickerPath = path;
-  $('fs-picker-path').textContent = path;
-  $('fs-picker-up').disabled = fsPickerParent(path) === null;
-}
-
-async function loadFsPickerDirs(path) {
-  const list = $('fs-picker-list');
-  const status = $('fs-picker-status');
-  list.replaceChildren();
-  status.textContent = '正在读取…';
-  try {
-    const data = await request(`api/fs/dirs?path=${encodeURIComponent(path)}`);
-    setFsPickerPath(data.path);
-    status.textContent = data.dirs.length ? '' : '此目录下没有子目录。';
-    data.dirs.forEach((name) => {
-      const item = document.createElement('button');
-      item.type = 'button';
-      item.className = 'fs-picker-item';
-      item.setAttribute('role', 'option');
-      item.textContent = name;
-      item.addEventListener('click', () => {
-        loadFsPickerDirs(fsPickerJoin(fsPickerPath, name));
-      });
-      list.append(item);
+function getFsSdk() {
+  if (!fsSdkPromise) {
+    fsSdkPromise = (async () => {
+      const mod = await import('./fnos-web-app.js');
+      const sdk = new mod.TrimApp();
+      await Promise.race([
+        sdk.ready(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('初始化超时')), 8000)),
+      ]);
+      return sdk;
+    })().catch((error) => {
+      fsSdkPromise = null;
+      throw error;
     });
+  }
+  return fsSdkPromise;
+}
+
+async function browseArchiveDir() {
+  const button = $('history-archive-browse');
+  button.disabled = true;
+  try {
+    const sdk = await getFsSdk();
+    if (sdk.isStandaloneWeb) {
+      showMessage('请在 fnOS 桌面内打开本插件后再选择目录，独立浏览器无法调起系统选择器。', true, 'message-history');
+      return;
+    }
+    const result = await sdk.pickSharedFile({
+      title: '选择长期记录保存位置',
+      okText: '选择此目录',
+      sidebarGroup: ['myFiles', 'otherShare', 'favorites', 'external'],
+    });
+    if (result && result.code !== 0) {
+      showMessage(`目录选择失败：${result.msg || '未知错误'}`, true, 'message-history');
+      return;
+    }
+    if (Array.isArray(result?.data) && result.data.length) {
+      // 共享授权目录仅单选，取第一个路径回填
+      $('history-archive-dir').value = result.data[0];
+    }
   } catch (error) {
-    status.textContent = `读取失败：${error.message}`;
+    showMessage(`系统目录选择器不可用：${error.message}。可直接手动输入路径；该功能需要 fnOS 1.2.0401 及以上版本。`, true, 'message-history');
+  } finally {
+    button.disabled = false;
   }
 }
 
-function openFsPicker() {
-  const initial = $('history-archive-dir').value.trim() || '/vol1';
-  $('fs-picker').hidden = false;
-  document.body.classList.add('modal-open');
-  loadFsPickerDirs(initial);
-}
-
-function closeFsPicker() {
-  $('fs-picker').hidden = true;
-  document.body.classList.remove('modal-open');
-}
-
-$('history-archive-browse').addEventListener('click', openFsPicker);
-$('fs-picker-up').addEventListener('click', () => {
-  const parent = fsPickerParent(fsPickerPath);
-  if (parent !== null) loadFsPickerDirs(parent);
-});
-$('fs-picker-choose').addEventListener('click', () => {
-  $('history-archive-dir').value = fsPickerPath;
-  closeFsPicker();
-});
-document.querySelectorAll('#fs-picker [data-picker-close]').forEach((el) => {
-  el.addEventListener('click', closeFsPicker);
-});
-document.addEventListener('keydown', (event) => {
-  if (event.key === 'Escape' && !$('fs-picker').hidden) closeFsPicker();
-});
+$('history-archive-browse').addEventListener('click', browseArchiveDir);
 
 function renderFanRPMs(fanStatus = {}) {
   const target = $('fan-rpm-list');

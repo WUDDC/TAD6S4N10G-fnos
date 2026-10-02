@@ -12,7 +12,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -99,7 +98,6 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/log", s.handleLogConfig)
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
 	mux.HandleFunc("/api/log/export", s.handleLogExport)
-	mux.HandleFunc("/api/fs/dirs", s.handleFsDirs)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -425,41 +423,6 @@ func (s *Server) handleLogExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-// handleFsDirs 列出指定路径下的子目录（只读、仅目录名、管理员）：长期记录
-// 保存位置的"浏览"对话框用。浏览器拿不到 NAS 的绝对路径，目录导航只能由
-// 服务端提供。绝不返回文件内容，隐藏目录（.开头）过滤。
-func (s *Server) handleFsDirs(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w)
-		return
-	}
-	if !isAdmin(r) {
-		writeError(w, http.StatusForbidden, "仅管理员可以浏览目录")
-		return
-	}
-	path := filepath.Clean(strings.TrimSpace(r.URL.Query().Get("path")))
-	if path == "" || path == "." {
-		path = "/vol1" // fnOS 存储盘挂载点作为默认起点
-	}
-	if !filepath.IsAbs(path) {
-		writeError(w, http.StatusBadRequest, "路径必须是绝对路径")
-		return
-	}
-	entries, err := os.ReadDir(path)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "读取目录失败: "+err.Error())
-		return
-	}
-	dirs := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") {
-			dirs = append(dirs, entry.Name())
-		}
-	}
-	sort.Strings(dirs)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "path": path, "dirs": dirs})
 }
 
 // handleHistoryClear 清空历史数据库：四张表全删 + VACUUM 回收空间，
