@@ -404,7 +404,7 @@
               <label class="field history-archive-dir">
                 <span>长期记录保存位置</span>
                 <input id="history-archive-dir" class="text-input" type="text" placeholder="/vol1/1000/长期记录" autocomplete="off" spellcheck="false">
-                <small>开启后，旧数据先在系统盘缓冲，攒够约 42 MB 或跨月后一次性按月归档（文件名 tad-history-年月.db）到保存位置，HDD 平时可持续休眠；文件数量不限；保存时会校验目录可写</small>
+                <small>开启后数据先在系统盘缓存，按月归档写入到保存位置，HDD 仅在归档时单次写入，文件数量不限制</small>
               </label>
             </div>
             <div class="actions history-actions">
