@@ -99,7 +99,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
 	mux.HandleFunc("/api/log/export", s.handleLogExport)
 	mux.HandleFunc("/api/fans/debug", s.handleFansDebug)
-	mux.HandleFunc("/api/fans/debug/enable", s.handleFansDebugEnable)
+	mux.HandleFunc("/api/fans/debug/takeover", s.handleFansDebugTakeover)
 	mux.HandleFunc("/api/fans/debug/pwm", s.handleFansDebugPWM)
 	mux.HandleFunc("/api/fans/debug/auto", s.handleFansDebugAuto)
 	mux.HandleFunc("/api/fans/debug/auto/stop", s.handleFansDebugAutoStop)
@@ -445,52 +445,53 @@ func (s *Server) handleFansDebug(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugEnable 开/关调试模式。关闭时立即恢复曲线控制。
-func (s *Server) handleFansDebugEnable(w http.ResponseWriter, r *http.Request) {
+// handleFansDebugTakeover 接管/释放单个风扇：接管后脱离一切曲线控制。
+func (s *Server) handleFansDebugTakeover(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
 	}
 	var payload struct {
-		Enabled bool `json:"enabled"`
+		ID    string `json:"id"`
+		Taken bool   `json:"taken"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SetFanDebugMode(payload.Enabled); err != nil {
-		writeError(w, http.StatusInternalServerError, "切换调试模式失败: "+err.Error())
-		return
-	}
-	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
-}
-
-// handleFansDebugPWM 手动设定全部风扇的目标转速（百分比）。
-func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
-	if !s.authorizeConfigRequest(w, r) {
-		return
-	}
-	var payload struct {
-		Percent int `json:"percent"`
-	}
-	if err := decodeConfigRequest(r, &payload); err != nil {
-		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
-		return
-	}
-	if err := s.Manager.SetFanDebugPercent(payload.Percent); err != nil {
+	if err := s.Manager.SetFanDebugTakeover(payload.ID, payload.Taken); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAuto 启动递增测试：从基准转速起,每 interval 秒递增 step,
-// 到 100% 自动停止。
+// handleFansDebugPWM 设定单个被接管风扇的调试转速（百分比）。
+func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		ID      string `json:"id"`
+		Percent int    `json:"percent"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanDebugPercent(payload.ID, payload.Percent); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugAuto 自动递增测试：全部被接管风扇以各自的手动转速为基础,
+// 每 interval 秒统一 +step,到 100% 自动停止。
 func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
 	}
 	var payload struct {
-		BasePercent     int `json:"base_percent"`
 		StepPercent     int `json:"step_percent"`
 		IntervalSeconds int `json:"interval_seconds"`
 	}
@@ -498,7 +499,7 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.StartFanDebugAuto(payload.BasePercent, payload.StepPercent, payload.IntervalSeconds); err != nil {
+	if err := s.Manager.StartFanDebugAuto(payload.StepPercent, payload.IntervalSeconds); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

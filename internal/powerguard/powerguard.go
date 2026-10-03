@@ -212,8 +212,7 @@ type Manager struct {
 	fanLastTemp   float64
 
 	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
-	fanDebugActive    bool
-	fanDebugPercent   int
+	fanDebugTakenOver map[string]int // 被调试接管的风扇 ID → 调试转速(%);接管的风扇不受任何曲线控制
 	fanDebugEmergency bool
 	fanDebugLastError string
 	fanDebugAuto      *fanDebugAutoTest

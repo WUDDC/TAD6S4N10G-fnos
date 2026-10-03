@@ -435,10 +435,10 @@ func (m *Manager) ApplyFanCurrent() error {
 	if err != nil {
 		return m.setFanFailureLocked(err)
 	}
-	// 风扇调试模式：暂停曲线对手动转速的覆盖。紧急温度兜底仍然生效——
-	// CPU 超过紧急温度时强制所有风扇 100%,并在调试状态里标记覆盖。
-	if m.fanDebugActive {
-		return m.applyFanDebugEmergencyLocked(cfg.Fan)
+	// 风扇调试接管：被接管的风扇脱离一切曲线控制(applyFanLocked 中锁定),
+	// 未接管的风扇照常受曲线控制。紧急温度兜底覆盖所有风扇(含被接管)。
+	if err := m.applyFanDebugEmergencyLocked(cfg.Fan); err != nil {
+		return err
 	}
 	if !cfg.Fan.Enabled {
 		m.fanLastError = ""
@@ -462,10 +462,15 @@ func (m *Manager) setFanFailureLocked(cause error) error {
 	return err
 }
 
-// applyFanDebugEmergencyLocked 调试模式下的紧急满速兜底：CPU（coretemp 最大
-// 值）超过紧急温度时强制所有风扇 100% 并标记覆盖;磁盘温度不参与兜底判定
-// （读盘会唤醒休眠盘,且 CPU 温度是最直接的安全指标）。未超温时清除标记。
+// applyFanDebugEmergencyLocked 有风扇被调试接管时的紧急满速兜底：CPU
+// （coretemp 最大值）超过紧急温度时强制全部风扇 100% 并标记覆盖（调试转速
+// 被覆盖,状态里显著提示）;磁盘温度不参与兜底判定（读盘会唤醒休眠盘）。
+// 无接管时清除标记并放行常规曲线控制。
 func (m *Manager) applyFanDebugEmergencyLocked(cfg FanConfig) error {
+	if len(m.fanDebugTakenOver) == 0 {
+		m.fanDebugEmergency = false
+		return nil
+	}
 	temperature, err := m.controlTemperature()
 	if err == nil && temperature >= cfg.EmergencyTempC {
 		fans, ferr := m.DiscoverFans()
@@ -473,8 +478,8 @@ func (m *Manager) applyFanDebugEmergencyLocked(cfg FanConfig) error {
 			return ferr
 		}
 		var errs []error
-		for _, fan := range fans {
-			if err := setFanPWM(fan, 100); err != nil {
+		for i := range fans {
+			if err := setFanPWM(fans[i], 100); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -529,6 +534,9 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	var errs []error
 	for id, sources := range selected {
 		fan := byID[id]
+		if _, taken := m.fanDebugTakenOver[id]; taken {
+			continue // 被调试接管:脱离曲线控制,由调试接口锁定转速
+		}
 		if fan.RPM <= 0 {
 			errs = append(errs, fmt.Errorf("fan %s reports no valid RPM", id), setFanPWM(fan, 100))
 			continue
@@ -899,7 +907,7 @@ func jsonUnmarshalStrict(data []byte, value any) error {
 	return decoder.Decode(value)
 }
 
-// ---- 风扇调试控制（调试页，须勾选显示） ----
+// ---- 风扇调试控制（调试页勾选显示；接管粒度为单个风扇） ----
 
 func clampInt(value, low, high int) int {
 	if value < low {
@@ -911,76 +919,83 @@ func clampInt(value, low, high int) int {
 	return value
 }
 
-// 风扇调试模式：暂停温控曲线循环对手动转速的覆盖（ApplyFanCurrent 提前返回），
-// 转速完全由调试接口驱动；CPU 超过紧急温度时仍强制全速兜底。运行时状态不落
-// 盘——守护进程重启即恢复曲线控制，这是安全的默认行为。
 type fanDebugAutoTest struct {
 	stop     chan struct{}
-	base     int
 	step     int
 	interval time.Duration
-	current  int
+	current  int // 当前统一递增到的百分比
 	running  bool
 }
 
-// SetFanDebugMode 开/关调试模式。关闭时停止自动测试并立即恢复曲线控制。
-func (m *Manager) SetFanDebugMode(enabled bool) error {
+// SetFanDebugTakeover 接管/释放单个风扇：接管后该风扇脱离一切温控曲线
+// （曲线目标不再写入），转速仅由调试接口驱动；释放后立即回到曲线控制。
+// 接管瞬间捕获 BIOS 原始状态，供插件停止/卸载时恢复。
+func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	m.mu.Lock()
-	m.fanDebugActive = enabled
-	if enabled {
-		m.fanDebugPercent = clampInt(m.fanDebugPercent, 0, 100)
-	} else {
-		m.stopFanDebugAutoLocked()
-		m.fanDebugPercent = 0
-		m.fanDebugEmergency = false
-		m.fanDebugLastError = ""
+	defer m.mu.Unlock()
+	fans, err := m.DiscoverFans()
+	if err != nil {
+		return err
 	}
-	m.mu.Unlock()
-	if !enabled {
-		// 恢复曲线控制（ApplyFanCurrent 自行加锁）
-		return m.ApplyFanCurrent()
+	var target *FanDevice
+	for i := range fans {
+		if fans[i].ID == id {
+			target = &fans[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("fan %s was not found", id)
+	}
+	if m.fanDebugTakenOver == nil {
+		m.fanDebugTakenOver = map[string]int{}
+	}
+	if taken {
+		if _, ok := m.fanDebugTakenOver[id]; !ok {
+			if err := m.captureOriginalFanLocked(*target); err != nil {
+				return err
+			}
+		}
+		// 从当前转速无缝接管，避免转速跳变
+		m.fanDebugTakenOver[id] = pwmToPercent(target.PWM)
+	} else {
+		delete(m.fanDebugTakenOver, id)
 	}
 	return nil
 }
 
-// SetFanDebugPercent 手动设定全部风扇的目标转速（百分比）。调试模式未开启
-// 时拒绝。0 转风扇（未接或停转）同样写入 PWM，便于测试接线。
-func (m *Manager) SetFanDebugPercent(percent int) error {
+// SetFanDebugPercent 设定单个被接管风扇的调试转速（百分比）。
+func (m *Manager) SetFanDebugPercent(id string, percent int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.fanDebugActive {
-		return errors.New("风扇调试模式未开启")
+	if _, ok := m.fanDebugTakenOver[id]; !ok {
+		return fmt.Errorf("风扇 %s 未被接管", id)
 	}
 	percent = clampInt(percent, 0, 100)
 	fans, err := m.DiscoverFans()
 	if err != nil {
 		return err
 	}
-	var errs []error
-	for _, fan := range fans {
-		if err := setFanPWM(fan, percent); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", fan.ID, err))
+	for i := range fans {
+		if fans[i].ID != id {
+			continue
 		}
+		if err := setFanPWM(fans[i], percent); err != nil {
+			return err
+		}
+		m.fanDebugTakenOver[id] = percent
+		return nil
 	}
-	m.fanDebugPercent = percent
-	if len(errs) > 0 {
-		m.fanDebugLastError = errors.Join(errs...).Error()
-		return errors.Join(errs...)
-	}
-	m.fanDebugLastError = ""
-	return nil
+	return fmt.Errorf("fan %s was not found", id)
 }
 
-// StartFanDebugAuto 启动递增测试：以 base 为起点、每 interval 秒递增 step，
-// 到 100% 自动停止（停在 100%）。重复启动会先停掉上一轮。
-func (m *Manager) StartFanDebugAuto(base, step, intervalSeconds int) error {
+// StartFanDebugAuto 自动递增测试：全部被接管风扇以各自的手动转速为基础，
+// 每 interval 秒统一 +step，到 100% 自动停止（停在 100%）。
+func (m *Manager) StartFanDebugAuto(step, intervalSeconds int) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.fanDebugActive {
-		return errors.New("风扇调试模式未开启")
-	}
-	if base < 0 || base > 100 {
-		return fmt.Errorf("起始转速需在 0–100 之间")
+	if len(m.fanDebugTakenOver) == 0 {
+		return errors.New("请先接管至少一个风扇")
 	}
 	if step < 1 || step > 90 {
 		return fmt.Errorf("递增转速需在 1–90 之间")
@@ -990,44 +1005,50 @@ func (m *Manager) StartFanDebugAuto(base, step, intervalSeconds int) error {
 	}
 	m.stopFanDebugAutoLocked()
 	stop := make(chan struct{})
+	current := 0
+	for _, percent := range m.fanDebugTakenOver {
+		if percent > current {
+			current = percent
+		}
+	}
 	m.fanDebugAuto = &fanDebugAutoTest{
 		stop:     stop,
-		base:     base,
 		step:     step,
 		interval: time.Duration(intervalSeconds) * time.Second,
-		current:  base,
+		current:  current,
 		running:  true,
 	}
-	go m.runFanDebugAuto(stop, base, step, m.fanDebugAuto.interval)
+	go m.runFanDebugAuto(stop, step, m.fanDebugAuto.interval)
 	return nil
 }
 
-// runFanDebugAuto 递增循环：写当前转速、睡 interval、递增；到 100% 收尾。
-// 调试模式被关闭（或守护进程退出）时循环退出。
-func (m *Manager) runFanDebugAuto(stop chan struct{}, percent, step int, interval time.Duration) {
+// runFanDebugAuto 递增循环：每轮把全部被接管风扇统一写到当前递增值,
+// 睡 interval 后 +step;到 100% 写满速并结束(调试模式被关闭时循环退出)。
+func (m *Manager) runFanDebugAuto(stop chan struct{}, step int, interval time.Duration) {
 	for {
 		m.mu.Lock()
-		if !m.fanDebugActive {
+		if len(m.fanDebugTakenOver) == 0 {
 			m.mu.Unlock()
 			return
 		}
-		fans, err := m.DiscoverFans()
-		if err == nil {
+		fans, ferr := m.DiscoverFans()
+		if ferr == nil {
 			var errs []error
-			for _, fan := range fans {
-				if err := setFanPWM(fan, percent); err != nil {
-					errs = append(errs, fmt.Errorf("%s: %w", fan.ID, err))
+			for id, percent := range m.fanDebugTakenOver {
+				for i := range fans {
+					if fans[i].ID == id {
+						if err := setFanPWM(fans[i], percent); err != nil {
+							errs = append(errs, fmt.Errorf("%s: %w", id, err))
+						}
+						break
+					}
 				}
 			}
-			m.fanDebugPercent = percent
 			if len(errs) > 0 {
 				m.fanDebugLastError = errors.Join(errs...).Error()
 			} else {
 				m.fanDebugLastError = ""
 			}
-		}
-		if auto := m.fanDebugAuto; auto != nil {
-			auto.current = percent
 		}
 		m.mu.Unlock()
 
@@ -1036,24 +1057,47 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}, percent, step int, interva
 			return
 		case <-time.After(interval):
 		}
-		percent += step
-		if percent < 100 {
-			continue
-		}
-		// 到 100%：写满速并结束自动测试（停在 100%，等用户关闭调试模式）
+
 		m.mu.Lock()
-		if fullFans, ferr := m.DiscoverFans(); ferr == nil {
-			for _, fan := range fullFans {
-				_ = setFanPWM(fan, 100)
-			}
-			m.fanDebugPercent = 100
+		if len(m.fanDebugTakenOver) == 0 {
+			m.mu.Unlock()
+			return
 		}
+		current := 0
 		if auto := m.fanDebugAuto; auto != nil {
-			auto.current = 100
-			auto.running = false
+			current = auto.current + step
+			if current > 100 {
+				current = 100
+			}
+			auto.current = current
+			if current >= 100 {
+				auto.running = false
+			}
+		}
+		// 统一递增:全部被接管风扇写入当前递增值
+		for id := range m.fanDebugTakenOver {
+			m.fanDebugTakenOver[id] = current
+		}
+		if fans, ferr := m.DiscoverFans(); ferr == nil {
+			var errs []error
+			for id, percent := range m.fanDebugTakenOver {
+				for i := range fans {
+					if fans[i].ID == id {
+						if err := setFanPWM(fans[i], percent); err != nil {
+							errs = append(errs, fmt.Errorf("%s: %w", id, err))
+						}
+						break
+					}
+				}
+			}
+			if len(errs) > 0 {
+				m.fanDebugLastError = errors.Join(errs...).Error()
+			}
 		}
 		m.mu.Unlock()
-		return
+		if current >= 100 {
+			return
+		}
 	}
 }
 
@@ -1073,20 +1117,19 @@ func (m *Manager) StopFanDebugAuto() {
 }
 
 type FanDebugFan struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	Channel    int    `json:"channel"`
-	RPM        int64  `json:"rpm"`
-	PWMPercent int    `json:"pwm_percent"`
-	Mode       int64  `json:"mode"`
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Channel      int    `json:"channel"`
+	RPM          int64  `json:"rpm"`
+	PWMPercent   int    `json:"pwm_percent"`
+	Mode         int64  `json:"mode"`
+	TakenOver    bool   `json:"taken_over"`
+	DebugPercent int    `json:"debug_percent,omitempty"`
 }
 
 type FanDebugState struct {
-	Active       bool          `json:"active"`
-	Percent      int           `json:"percent"`
 	Emergency    bool          `json:"emergency"`
 	AutoRunning  bool          `json:"auto_running"`
-	AutoBase     int           `json:"auto_base,omitempty"`
 	AutoStep     int           `json:"auto_step,omitempty"`
 	AutoInterval int           `json:"auto_interval_seconds,omitempty"`
 	AutoCurrent  int           `json:"auto_current,omitempty"`
@@ -1094,20 +1137,17 @@ type FanDebugState struct {
 	Fans         []FanDebugFan `json:"fans"`
 }
 
-// FanDebugState 汇总调试状态与全部已发现风扇（含 0 转通道）。
+// FanDebugState 汇总调试状态与全部已发现风扇（按接口枚举，0 转也列出）。
 func (m *Manager) FanDebugState() FanDebugState {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	state := FanDebugState{
-		Active:    m.fanDebugActive,
-		Percent:   m.fanDebugPercent,
 		Emergency: m.fanDebugEmergency,
 		LastError: m.fanDebugLastError,
 		Fans:      []FanDebugFan{},
 	}
 	if auto := m.fanDebugAuto; auto != nil {
 		state.AutoRunning = auto.running
-		state.AutoBase = auto.base
 		state.AutoStep = auto.step
 		state.AutoInterval = int(auto.interval / time.Second)
 		state.AutoCurrent = auto.current
@@ -1118,14 +1158,19 @@ func (m *Manager) FanDebugState() FanDebugState {
 		return state
 	}
 	for _, fan := range fans {
-		state.Fans = append(state.Fans, FanDebugFan{
+		item := FanDebugFan{
 			ID:         fan.ID,
 			Name:       fan.Name,
 			Channel:    fan.Channel,
 			RPM:        fan.RPM,
 			PWMPercent: pwmToPercent(fan.PWM),
 			Mode:       fan.Mode,
-		})
+		}
+		if percent, ok := m.fanDebugTakenOver[fan.ID]; ok {
+			item.TakenOver = true
+			item.DebugPercent = percent
+		}
+		state.Fans = append(state.Fans, item)
 	}
 	return state
 }
