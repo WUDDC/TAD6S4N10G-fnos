@@ -362,6 +362,16 @@ small {
   border-radius: var(--radius-sm);
   background: var(--surface);
 }
+/* 数字输入框限宽：网格列是 1fr 会把输入框连同边框拉到数百像素宽，
+   数字只需 3-5 位。限宽加在外框上（含单位标签一起收拢）；
+   文本输入不限，保持原有填满行为。:has() 不支持时回退为旧的全宽外观 */
+.input-wrap > input[type="number"] { max-width: 150px; }
+.input-wrap:has(> input[type="number"]) {
+  width: fit-content;
+  min-width: 150px;
+  max-width: 230px;
+  min-height: 38px;
+}
 
 input[type="number"] {
   min-width: 0;
@@ -1196,9 +1206,13 @@ body.modal-open { overflow: hidden; }
   margin-top: 10px;
 }
 .history-actions { margin-top: 12px; }
-/* 长期记录：开关与保存位置（绝对路径文本框）整行排布 */
+/* 长期记录：开关与保存位置（绝对路径文本框）；路径框限宽 520px——
+   路径虽长但输入框内可横向滚动，通栏宽视觉失衡 */
 .history-archive { display: grid; gap: 8px; margin-top: 12px; }
 .history-archive-dir input { width: 100%; }
+/* 浏览按钮禁止收缩与换行,否则被 width:100% 的输入框挤成竖排文字 */
+.history-archive-row button { flex: 0 0 auto; white-space: nowrap; }
+.history-archive-row { display: flex; gap: 8px; align-items: stretch; max-width: 520px; }
 .history-limit-notice { margin-top: 10px; }
 .history-disabled-notice { color: var(--warning, #b8860b); }
 .history-range { display: inline-flex; flex-wrap: wrap; align-items: center; max-width: 100%; gap: 6px; }
@@ -1997,3 +2011,18 @@ button.danger {
 [data-theme="dark"] .status-table .storage-present td:nth-child(2) { color: #6cc0e8; }
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }
 
+
+/* ---- 风扇调试控制（开关在调试页“历史温度与风扇控制”卡片标题行） ---- */
+
+/* ---- 风扇调试:接管勾选列、行内调试转速与每风扇递增参数 ---- */
+.fan-debug-table .fan-debug-pwm-input,
+.fan-debug-table .fan-debug-auto-input {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+}
+.fan-debug-table .fan-debug-auto-cell { white-space: nowrap; }
