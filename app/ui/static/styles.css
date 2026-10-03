@@ -2015,6 +2015,8 @@ button.danger {
 /* ---- 风扇调试控制（开关在调试页“历史温度与风扇控制”卡片标题行） ---- */
 
 /* ---- 风扇调试:接管勾选列、行内调试转速与每风扇递增参数 ---- */
+/* 列宽按内容自适应(fixed 会把 9 列强制等分,勾选/通道列浪费大量空间) */
+.fan-debug-table { table-layout: auto; }
 .fan-debug-table .fan-debug-pwm-input,
 .fan-debug-table .fan-debug-auto-input,
 .fan-debug-table .fan-debug-unit {
