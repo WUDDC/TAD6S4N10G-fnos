@@ -282,16 +282,6 @@
               </table>
             </div>
             <p class="notice">勾选"接管"后该风扇脱离温控曲线，仅受行内调试转速控制；取消勾选立即恢复曲线。自动递增测试：全部被接管风扇以各自的手动转速为基础，每过一个间隔统一增加一次转速，到 100% 自动停止。</p>
-            <div class="field-grid history-settings">
-              <label class="field">
-                <span>每次递增</span>
-                <div class="input-wrap"><input id="fan-debug-auto-step" type="number" min="1" max="90" step="1" value="5" inputmode="numeric"><b>%</b></div>
-              </label>
-              <label class="field">
-                <span>递增间隔</span>
-                <div class="input-wrap"><input id="fan-debug-auto-interval" type="number" min="1" max="120" step="1" value="10" inputmode="numeric"><b>秒</b></div>
-              </label>
-            </div>
             <div class="actions history-actions">
               <button id="fan-debug-auto-start" type="button" class="primary">开始自动递增</button>
               <button id="fan-debug-auto-stop" type="button">停止自动测试</button>
