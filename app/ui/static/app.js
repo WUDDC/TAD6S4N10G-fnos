@@ -2497,6 +2497,9 @@ function applyFanDebugVisible() {
   if (visible) startFanDebugPoll(); else stopFanDebugPoll();
 }
 
+// 页面加载即按记忆的偏好恢复显隐(勾选过则卡片直接可见)
+applyFanDebugVisible();
+
 function startFanDebugPoll() {
   if (fanDebugPollTimer) return;
   const poll = async () => {
