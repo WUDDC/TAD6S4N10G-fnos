@@ -362,6 +362,9 @@ small {
   border-radius: var(--radius-sm);
   background: var(--surface);
 }
+/* 数字输入框限宽：网格列是 1fr 会把输入框拉到数百像素宽，
+   数字只需 3-5 位；文本输入不限，保持原有填满行为 */
+.input-wrap > input[type="number"] { max-width: 150px; }
 
 input[type="number"] {
   min-width: 0;
