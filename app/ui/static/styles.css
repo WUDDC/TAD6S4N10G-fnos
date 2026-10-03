@@ -2013,3 +2013,16 @@ button.danger {
 
 
 /* ---- 风扇调试控制（开关在调试页“历史温度与风扇控制”卡片标题行） ---- */
+
+/* ---- 风扇调试:接管勾选列、行内调试转速与每风扇递增参数 ---- */
+.fan-debug-table .fan-debug-pwm-input,
+.fan-debug-table .fan-debug-auto-input {
+  width: 64px;
+  padding: 4px 6px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+}
+.fan-debug-table .fan-debug-auto-cell { white-space: nowrap; }
