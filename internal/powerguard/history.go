@@ -2,6 +2,8 @@ package powerguard
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -242,20 +244,26 @@ func (s *HistoryStore) ExportSQLite(ctx context.Context, w io.Writer) error {
 func (s *HistoryStore) WriteCSV(ctx context.Context, w io.Writer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.writeCSVLocked(ctx, w, 0, math.MaxInt64)
+}
 
+// writeCSVLocked 是 WriteCSV 的范围版（调用方须已持锁）：只导出 [lo, hi) 的
+// 采样，列头发现限定在同一范围内——归档单个月份时，只有该月出现过的 ID 才
+// 成列。lo=0、hi=math.MaxInt64 即全库，行为与 WriteCSV 一致。
+func (s *HistoryStore) writeCSVLocked(ctx context.Context, w io.Writer, lo, hi int64) error {
 	// 列发现：DISTINCT 走复合主键索引，只读 ID 列不取数据；JOIN history
-	// 保证"出现过在主表里的 ID"才成列（孤儿子行不成列，旧实现同样不可见）。
-	fans, err := s.distinctStrings(ctx, `SELECT DISTINCT f.fan_id FROM history_fans f JOIN history h ON h.ts = f.ts ORDER BY f.fan_id`)
+	// 保证"出现过在主表里的 ID"才成列（孤儿子行不成列，旧行为同样不可见）。
+	fans, err := s.distinctStrings(ctx, `SELECT DISTINCT f.fan_id FROM history_fans f JOIN history h ON h.ts = f.ts WHERE f.ts >= ? AND f.ts < ? ORDER BY f.fan_id`, lo, hi)
 	if err != nil {
 		return err
 	}
-	disks, err := s.distinctStrings(ctx, `SELECT DISTINCT d.slot_id FROM history_slots d JOIN history h ON h.ts = d.ts ORDER BY d.slot_id`)
+	disks, err := s.distinctStrings(ctx, `SELECT DISTINCT d.slot_id FROM history_slots d JOIN history h ON h.ts = d.ts WHERE d.ts >= ? AND d.ts < ? ORDER BY d.slot_id`, lo, hi)
 	if err != nil {
 		return err
 	}
 	type csvSensorPair struct{ group, key string }
 	var sensors []csvSensorPair
-	sensorRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT s.grp, s.key FROM history_sensors s JOIN history h ON h.ts = s.ts ORDER BY s.grp, s.key`)
+	sensorRows, err := s.db.QueryContext(ctx, `SELECT DISTINCT s.grp, s.key FROM history_sensors s JOIN history h ON h.ts = s.ts WHERE s.ts >= ? AND s.ts < ? ORDER BY s.grp, s.key`, lo, hi)
 	if err != nil {
 		return err
 	}
@@ -307,22 +315,22 @@ func (s *HistoryStore) WriteCSV(ctx context.Context, w io.Writer) error {
 
 	// 四个 ts 有序游标。子表游标落后于主表时（孤儿子行，历史库理论上不该有，
 	// 但老库的 PRAGMA foreign_keys 是连接级的、无法完全排除）直接跳过。
-	mainRows, err := s.db.QueryContext(ctx, `SELECT ts, cpu_c, hdd_c, nvme_c FROM history ORDER BY ts`)
+	mainRows, err := s.db.QueryContext(ctx, `SELECT ts, cpu_c, hdd_c, nvme_c FROM history WHERE ts >= ? AND ts < ? ORDER BY ts`, lo, hi)
 	if err != nil {
 		return err
 	}
 	defer mainRows.Close()
-	fanRows, err := s.db.QueryContext(ctx, `SELECT ts, fan_id, rpm, pwm_percent FROM history_fans ORDER BY ts, fan_id`)
+	fanRows, err := s.db.QueryContext(ctx, `SELECT ts, fan_id, rpm, pwm_percent FROM history_fans WHERE ts >= ? AND ts < ? ORDER BY ts, fan_id`, lo, hi)
 	if err != nil {
 		return err
 	}
 	defer fanRows.Close()
-	slotRows, err := s.db.QueryContext(ctx, `SELECT ts, slot_id, temperature_c FROM history_slots ORDER BY ts, slot_id`)
+	slotRows, err := s.db.QueryContext(ctx, `SELECT ts, slot_id, temperature_c FROM history_slots WHERE ts >= ? AND ts < ? ORDER BY ts, slot_id`, lo, hi)
 	if err != nil {
 		return err
 	}
 	defer slotRows.Close()
-	sensorDataRows, err := s.db.QueryContext(ctx, `SELECT ts, grp, key, c FROM history_sensors ORDER BY ts, grp, key`)
+	sensorDataRows, err := s.db.QueryContext(ctx, `SELECT ts, grp, key, c FROM history_sensors WHERE ts >= ? AND ts < ? ORDER BY ts, grp, key`, lo, hi)
 	if err != nil {
 		return err
 	}
@@ -654,8 +662,11 @@ func (s *HistoryStore) archiveForDelete(lo, hi int64) error {
 }
 
 // archiveBetween 把 [lo, hi) 的采样按自然月（本地时区）归档到用户目录：
-// 一个月一个 SQLite 文件（tad-history-202609.db），文件名天然唯一且可按
-// 年月识别；文件数量不限制。
+// 一个月一个压缩 CSV 文件（tad-history-202609.csv.gz），文件名天然唯一且可按
+// 年月识别；文件数量不限制。CSV 格式与 /api/history/export.csv 的宽表完全
+// 一致（Excel 可直接打开）；gzip 压缩后满配约 1.4MB/月，对比 SQLite 月文件
+// 的 ~50MB 缩减约 35 倍——宽表同一列的值逐行重复、格式一致，gzip 的窗口
+// 跨行匹配效率极高，文本化即拿到列压缩的大部分收益。
 func (s *HistoryStore) archiveBetween(lo, hi int64) error {
 	if err := os.MkdirAll(s.archiveDir, 0o755); err != nil {
 		return fmt.Errorf("create archive dir: %w", err)
@@ -679,7 +690,7 @@ func (s *HistoryStore) archiveBetween(lo, hi int64) error {
 		if mLo >= mHi {
 			continue
 		}
-		path := filepath.Join(s.archiveDir, fmt.Sprintf("tad-history-%s.db", month))
+		path := filepath.Join(s.archiveDir, fmt.Sprintf("tad-history-%s.csv.gz", month))
 		if err := s.archiveMonthRange(path, mLo, mHi); err != nil {
 			return fmt.Errorf("archive %s: %w", month, err)
 		}
@@ -709,53 +720,245 @@ func monthBounds(month string) (int64, int64, error) {
 	return lo.Unix(), lo.AddDate(0, 1, 0).Unix(), nil
 }
 
-// archiveMonthRange 把 [lo, hi) 的采样复制进归档文件（ATTACH + INSERT SELECT，
-// 数据不经过 Go 进程）。INSERT OR REPLACE 幂等：归档成功但主库删除失败的重跑
-// 不会产生重复。归档文件不带外键，四张表插入顺序无关。
-// ATTACH 是连接级状态：用 sql.Conn 钉住同一条连接，事务提交后再 DETACH
-// （带写锁的事务里 DETACH 会报 locked）；defer 兜底清理，连接归还池子时
-// 一定不带残留的 arch。
+// archiveMonthRange 把 [lo, hi) 的采样写成月度归档文件（宽表 CSV + gzip，
+// 复用 writeCSVLocked 的流式导出）。先写同目录临时文件再 rename：进程中断
+// 最多留下一个待清理的临时文件，不会出现半截归档。
 func (s *HistoryStore) archiveMonthRange(path string, lo, hi int64) error {
-	conn, err := s.db.Conn(context.Background())
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".tad-archive-*.csv.gz.tmp")
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp archive: %w", err)
 	}
-	defer conn.Close()
-	escaped := strings.ReplaceAll(path, "'", "''")
-	// 上一轮 DETACH 失败可能留下同名的 arch：先试着摘掉（不存在则报错，忽略）
-	_, _ = conn.ExecContext(context.Background(), `DETACH DATABASE arch`)
-	if _, err := conn.ExecContext(context.Background(), `ATTACH DATABASE '`+escaped+`' AS arch`); err != nil {
-		return fmt.Errorf("attach: %w", err)
-	}
+	tmpName := tmp.Name()
+	complete := false
 	defer func() {
-		_, _ = conn.ExecContext(context.Background(), `DETACH DATABASE arch`)
+		if !complete {
+			tmp.Close()
+			os.Remove(tmpName)
+		}
 	}()
-	tx, err := conn.BeginTx(context.Background(), nil)
+	// BestCompression：归档一个月才写一次、满配整月也就 1~2 秒（低端 ARM
+	// 实测量级），换约 10% 的体积缩减值得。
+	gz, err := gzip.NewWriterLevel(tmp, gzip.BestCompression)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	for _, ddl := range []string{
-		`CREATE TABLE IF NOT EXISTS arch.history (ts INTEGER PRIMARY KEY, cpu_c REAL NOT NULL DEFAULT 0, hdd_c REAL NOT NULL DEFAULT 0, nvme_c REAL NOT NULL DEFAULT 0)`,
-		`CREATE TABLE IF NOT EXISTS arch.history_fans (ts INTEGER NOT NULL, fan_id TEXT NOT NULL, rpm INTEGER NOT NULL DEFAULT 0, pwm_percent INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ts, fan_id))`,
-		`CREATE TABLE IF NOT EXISTS arch.history_slots (ts INTEGER NOT NULL, slot_id TEXT NOT NULL, temperature_c REAL NOT NULL DEFAULT 0, PRIMARY KEY (ts, slot_id))`,
-		`CREATE TABLE IF NOT EXISTS arch.history_sensors (ts INTEGER NOT NULL, grp TEXT NOT NULL, key TEXT NOT NULL, c REAL NOT NULL DEFAULT 0, PRIMARY KEY (ts, grp, key))`,
-	} {
-		if _, err := tx.Exec(ddl); err != nil {
-			return fmt.Errorf("schema: %w", err)
+	if err := s.writeArchiveMonthCSV(gz, path, lo, hi); err != nil {
+		return fmt.Errorf("write archive csv: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("close gzip: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close archive file: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename archive: %w", err)
+	}
+	complete = true
+	return nil
+}
+
+// writeArchiveMonthCSV 往 gz 写 [lo, hi) 的宽表 CSV。同一自然月可能被多次
+// 冲刷（首轮水位建立、跨月、大小清理提前冲刷都会在月内留下接缝），目标文件
+// 已存在时读出旧内容按 ts 归并去重（同 ts 保留新值）后与新数据合并重写：
+// 月文件始终保持"一个自然月一个文件、Excel 直接可开"，重跑幂等语义与旧
+// SQLite 方案的 INSERT OR REPLACE 一致，不会因覆盖写丢掉先前的批次。
+func (s *HistoryStore) writeArchiveMonthCSV(gz *gzip.Writer, path string, lo, hi int64) error {
+	oldHeader, oldRows, err := readArchiveCSVFile(path)
+	if err != nil {
+		return err
+	}
+	if oldHeader == nil {
+		return s.writeCSVLocked(context.Background(), gz, lo, hi)
+	}
+	// 新数据先流式生成到内存缓冲（满配一个月未压缩 ~7MB），再与旧行归并。
+	var newBuf bytes.Buffer
+	if err := s.writeCSVLocked(context.Background(), &newBuf, lo, hi); err != nil {
+		return err
+	}
+	newReader := csv.NewReader(strings.NewReader(strings.TrimPrefix(newBuf.String(), "\ufeff")))
+	newHeader, err := newReader.Read()
+	if err != nil {
+		return err
+	}
+	header := mergeCSVHeaders(oldHeader, newHeader)
+	oldMap := mapCSVColumns(oldHeader, header)
+	newMap := mapCSVColumns(newHeader, header)
+	w := csv.NewWriter(gz)
+	if err := w.Write(header); err != nil {
+		return err
+	}
+	writeRow := func(row []string, mapping []int) error {
+		out := make([]string, len(header))
+		for j, v := range row {
+			if j < len(mapping) {
+				if k := mapping[j]; k >= 0 {
+					out[k] = v
+				}
+			}
+		}
+		return w.Write(out)
+	}
+	rowTS := func(row []string) (int64, error) {
+		if len(row) == 0 {
+			return 0, fmt.Errorf("archive row without ts column")
+		}
+		return strconv.ParseInt(row[0], 10, 64)
+	}
+	// 双流归并：旧行（内存）与新增行（流式）都按 ts 升序（水位递增保证），
+	// 同 ts 保留新值。
+	pending, pendingOK := make([]string, 0), false
+	advance := func() error {
+		row, err := newReader.Read()
+		if err == io.EOF {
+			pendingOK = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		pending, pendingOK = row, true
+		return nil
+	}
+	if err := advance(); err != nil {
+		return err
+	}
+	oldPos := 0
+	for oldPos < len(oldRows) || pendingOK {
+		switch {
+		case oldPos >= len(oldRows):
+			if err := writeRow(pending, newMap); err != nil {
+				return err
+			}
+			if err := advance(); err != nil {
+				return err
+			}
+		case !pendingOK:
+			if err := writeRow(oldRows[oldPos], oldMap); err != nil {
+				return err
+			}
+			oldPos++
+		default:
+			oldTS, err := rowTS(oldRows[oldPos])
+			if err != nil {
+				return err
+			}
+			newTS, err := rowTS(pending)
+			if err != nil {
+				return err
+			}
+			switch {
+			case oldTS < newTS:
+				if err := writeRow(oldRows[oldPos], oldMap); err != nil {
+					return err
+				}
+				oldPos++
+			case oldTS > newTS:
+				if err := writeRow(pending, newMap); err != nil {
+					return err
+				}
+				if err := advance(); err != nil {
+					return err
+				}
+			default: // 同 ts：保留新值，旧行跳过（重跑幂等）
+				if err := writeRow(pending, newMap); err != nil {
+					return err
+				}
+				if err := advance(); err != nil {
+					return err
+				}
+				oldPos++
+			}
 		}
 	}
-	for _, copy := range []string{
-		`INSERT OR REPLACE INTO arch.history (ts, cpu_c, hdd_c, nvme_c) SELECT ts, cpu_c, hdd_c, nvme_c FROM main.history WHERE ts >= ? AND ts < ?`,
-		`INSERT OR REPLACE INTO arch.history_fans (ts, fan_id, rpm, pwm_percent) SELECT f.ts, f.fan_id, f.rpm, f.pwm_percent FROM main.history_fans f WHERE f.ts >= ? AND f.ts < ?`,
-		`INSERT OR REPLACE INTO arch.history_slots (ts, slot_id, temperature_c) SELECT d.ts, d.slot_id, d.temperature_c FROM main.history_slots d WHERE d.ts >= ? AND d.ts < ?`,
-		`INSERT OR REPLACE INTO arch.history_sensors (ts, grp, key, c) SELECT s.ts, s.grp, s.key, s.c FROM main.history_sensors s WHERE s.ts >= ? AND s.ts < ?`,
-	} {
-		if _, err := tx.Exec(copy, lo, hi); err != nil {
-			return fmt.Errorf("copy: %w", err)
+	w.Flush()
+	return w.Error()
+}
+
+// readArchiveCSVFile 读已有月归档的表头与数据行；文件不存在返回 (nil, nil, nil)。
+func readArchiveCSVFile(path string) ([]string, [][]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, nil
+		}
+		return nil, nil, err
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer zr.Close()
+	records, err := csv.NewReader(zr).ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(records) == 0 {
+		return nil, nil, nil
+	}
+	header := records[0]
+	header[0] = strings.TrimPrefix(header[0], "\ufeff")
+	return header, records[1:], nil
+}
+
+// mergeCSVHeaders 合并两份宽表列头（并集）：固定列不会新增，旧列头原序保留，
+// 新增列按所属组（fan/disk/sensor）追加到旧列头对应组区间的末尾。
+func mergeCSVHeaders(oldHeader, newHeader []string) []string {
+	inOld := make(map[string]bool, len(oldHeader))
+	for _, h := range oldHeader {
+		inOld[h] = true
+	}
+	headerGroup := func(h string) int {
+		switch {
+		case strings.HasPrefix(h, "fan_"):
+			return 0
+		case strings.HasPrefix(h, "disk_"):
+			return 1
+		case strings.HasPrefix(h, "sensor_"):
+			return 2
+		default:
+			return -1 // 固定列（ts/time/聚合温度）
 		}
 	}
-	return tx.Commit()
+	var extra [3][]string
+	for _, h := range newHeader {
+		if !inOld[h] {
+			if g := headerGroup(h); g >= 0 {
+				extra[g] = append(extra[g], h)
+			}
+		}
+	}
+	merged := append([]string(nil), oldHeader...)
+	for g := 0; g < 3; g++ {
+		if len(extra[g]) == 0 {
+			continue
+		}
+		pos := len(merged)
+		for i, h := range merged {
+			if headerGroup(h) == g {
+				pos = i + 1
+			}
+		}
+		merged = append(merged, make([]string, len(extra[g]))...)
+		copy(merged[pos+len(extra[g]):], merged[pos:])
+		copy(merged[pos:pos+len(extra[g])], extra[g])
+	}
+	return merged
+}
+
+// mapCSVColumns 给出 from 每一列在 to 布局中的目标下标（缺失为 -1），
+// 供行数据按列名重排。
+func mapCSVColumns(from, to []string) []int {
+	index := make(map[string]int, len(to))
+	for i, h := range to {
+		index[h] = i
+	}
+	mapping := make([]int, len(from))
+	for j, h := range from {
+		mapping[j] = index[h]
+	}
+	return mapping
 }
 
 // dbSizeBytes 统计主库与 WAL 文件大小；文件不存在按 0 处理。
