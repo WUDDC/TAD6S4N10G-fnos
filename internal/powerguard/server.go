@@ -471,14 +471,15 @@ func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		ID      string `json:"id"`
-		Percent int    `json:"percent"`
+		ID    string `json:"id"`
+		Value int    `json:"value"`
+		Unit  string `json:"unit"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SetFanDebugPercent(payload.ID, payload.Percent); err != nil {
+	if err := s.Manager.SetFanDebugValue(payload.ID, payload.Value, payload.Unit); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

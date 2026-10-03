@@ -578,10 +578,14 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 }
 
 func setFanPWM(fan FanDevice, percent int) error {
-	if percent < 0 || percent > 100 {
-		return fmt.Errorf("invalid fan PWM percent %d", percent)
+	return setFanPWMRaw(fan, percentToPWM(percent))
+}
+
+// setFanPWMRaw 直接按原始占空比(0–255)写入;百分比调用方先换算。
+func setFanPWMRaw(fan FanDevice, raw int) error {
+	if raw < 0 || raw > 255 {
+		return fmt.Errorf("invalid fan PWM raw %d", raw)
 	}
-	raw := percentToPWM(percent)
 	currentPWM, err := readInt(fan.PWMPath)
 	if err != nil {
 		return fmt.Errorf("read pwm%d: %w", fan.Channel, err)
@@ -920,10 +924,11 @@ func clampInt(value, low, high int) int {
 }
 
 type fanDebugAutoEntry struct {
-	Step     int
-	Interval int // 秒
+	Step     int    // 每次递增量(单位随 Unit)
+	Interval int    // 秒
+	Unit     string // "percent"(转速%) 或 "pwm"(原始占空比)
 	LastRamp time.Time
-	Done     bool // 已到 100%
+	Done     bool // 已到该单位上限
 }
 
 type fanDebugAutoTest struct {
@@ -955,6 +960,9 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	if m.fanDebugTakenOver == nil {
 		m.fanDebugTakenOver = map[string]int{}
 	}
+	if m.fanDebugUnits == nil {
+		m.fanDebugUnits = map[string]string{}
+	}
 	if taken {
 		if _, ok := m.fanDebugTakenOver[id]; !ok {
 			if err := m.captureOriginalFanLocked(*target); err != nil {
@@ -969,29 +977,54 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	return nil
 }
 
-// SetFanDebugPercent 设定单个被接管风扇的调试转速（百分比）。
-func (m *Manager) SetFanDebugPercent(id string, percent int) error {
+// fanDebugUnitMax 返回单位对应的调试值上限:pwm 0–255,percent 0–100。
+func fanDebugUnitMax(unit string) int {
+	if unit == "pwm" {
+		return 255
+	}
+	return 100
+}
+
+// SetFanDebugValue 设定单个被接管风扇的调试转速。value 的单位由 unit 决定:
+// "percent" 为转速百分比(0–100),"pwm" 为原始占空比(0–255)。value 存储与
+// 自动递增都按该单位进行。
+func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
+	if unit != "percent" && unit != "pwm" {
+		return fmt.Errorf("未知的调节单位 %q", unit)
+	}
+	value = clampInt(value, 0, fanDebugUnitMax(unit))
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.fanDebugTakenOver[id]; !ok {
 		return fmt.Errorf("风扇 %s 未被接管", id)
 	}
-	percent = clampInt(percent, 0, 100)
 	fans, err := m.DiscoverFans()
 	if err != nil {
 		return err
 	}
+	raw := value
+	if unit == "pwm" {
+		raw = value
+	} else {
+		raw = percentToPWM(value)
+	}
+	var errs []error
 	for i := range fans {
 		if fans[i].ID != id {
 			continue
 		}
-		if err := setFanPWM(fans[i], percent); err != nil {
-			return err
+		if err := setFanPWMRaw(fans[i], raw); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", fans[i].ID, err))
 		}
-		m.fanDebugTakenOver[id] = percent
-		return nil
 	}
-	return fmt.Errorf("fan %s was not found", id)
+	m.fanDebugTakenOver[id] = value
+	m.fanDebugUnits[id] = unit
+	if len(errs) > 0 {
+		m.fanDebugLastError = errors.Join(errs...).Error()
+		return errors.Join(errs...)
+	}
+	m.fanDebugLastError = ""
+	return nil
 }
 
 // StartFanDebugAuto 启动自动递增：每个风扇以各自的手动转速为基础,按各自的
@@ -1064,21 +1097,25 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				allDone = false
 				continue
 			}
-			percent := m.fanDebugTakenOver[id] + entry.Step
-			if percent > 100 {
-				percent = 100
+			value := m.fanDebugTakenOver[id] + entry.Step
+			if value > fanDebugUnitMax(entry.Unit) {
+				value = fanDebugUnitMax(entry.Unit)
+			}
+			raw := value
+			if entry.Unit != "pwm" {
+				raw = percentToPWM(value)
 			}
 			for i := range fans {
 				if fans[i].ID == id {
-					if err := setFanPWM(fans[i], percent); err != nil {
+					if err := setFanPWMRaw(fans[i], raw); err != nil {
 						errs = append(errs, fmt.Errorf("%s: %w", id, err))
 					}
 					break
 				}
 			}
-			m.fanDebugTakenOver[id] = percent
+			m.fanDebugTakenOver[id] = value
 			entry.LastRamp = now
-			if percent >= 100 {
+			if value >= fanDebugUnitMax(entry.Unit) {
 				entry.Done = true
 			} else {
 				allDone = false

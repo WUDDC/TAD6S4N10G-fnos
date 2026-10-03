@@ -1948,7 +1948,7 @@ func TestFanDebugTakeoverAndPercent(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 未接管时手动设置被拒绝
-	if err := manager.SetFanDebugPercent("it8613:hwmon3:fan1", 50); err == nil {
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err == nil {
 		t.Fatal("percent set must fail when the fan is not taken over")
 	}
 	// 接管 fan1:从当前转速无缝接管(102 → 40%),fan2 不受影响
@@ -1958,7 +1958,7 @@ func TestFanDebugTakeoverAndPercent(t *testing.T) {
 	if got := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; got != 63 {
 		t.Fatalf("takeover should start at curve-applied percent (63 for 45C), got %d", got)
 	}
-	if err := manager.SetFanDebugPercent("it8613:hwmon3:fan1", 50); err != nil {
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := os.ReadFile(pwm1); strings.TrimSpace(string(got)) != "128" {
@@ -1994,7 +1994,7 @@ func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.SetFanDebugPercent("it8613:hwmon3:fan1", 20); err != nil {
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 20, "percent"); err != nil {
 		t.Fatal(err)
 	}
 	// 基准=手动 20%,每秒 +60%:20 → 80 → 100 停
@@ -2041,10 +2041,10 @@ func TestFanDebugAutoPerFanIndependence(t *testing.T) {
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan2", true); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.SetFanDebugPercent("it8613:hwmon3:fan1", 20); err != nil {
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 20, "percent"); err != nil {
 		t.Fatal(err)
 	}
-	if err := manager.SetFanDebugPercent("it8613:hwmon3:fan2", 50); err != nil {
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan2", 50, "percent"); err != nil {
 		t.Fatal(err)
 	}
 	entries := map[string]fanDebugAutoEntry{
@@ -2130,7 +2130,7 @@ func TestHandleFansDebugEndpoints(t *testing.T) {
 	if rec := call(http.MethodPost, "/api/fans/debug/takeover", `{"id":"it8613:hwmon3:fan1","taken":true}`, true); rec.Code != http.StatusOK {
 		t.Fatalf("takeover status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := call(http.MethodPost, "/api/fans/debug/pwm", `{"id":"it8613:hwmon3:fan1","percent":77}`, true); rec.Code != http.StatusOK {
+	if rec := call(http.MethodPost, "/api/fans/debug/pwm", `{"id":"it8613:hwmon3:fan1","value":77,"unit":"percent"}`, true); rec.Code != http.StatusOK {
 		t.Fatalf("pwm status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if got := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; got != 77 {
