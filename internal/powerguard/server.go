@@ -492,14 +492,21 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		StepPercent     int `json:"step_percent"`
-		IntervalSeconds int `json:"interval_seconds"`
+		Fans []struct {
+			ID       string `json:"id"`
+			Step     int    `json:"step"`
+			Interval int    `json:"interval"`
+		} `json:"fans"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.StartFanDebugAuto(payload.StepPercent, payload.IntervalSeconds); err != nil {
+	entries := make(map[string]fanDebugAutoEntry, len(payload.Fans))
+	for _, fan := range payload.Fans {
+		entries[fan.ID] = fanDebugAutoEntry{Step: fan.Step, Interval: fan.Interval}
+	}
+	if err := s.Manager.StartFanDebugAuto(entries); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

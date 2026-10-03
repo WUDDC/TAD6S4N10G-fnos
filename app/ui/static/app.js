@@ -2570,9 +2570,9 @@ function renderFanDebug(state) {
   if (state.emergency) {
     fanDebugStatus('⚠ CPU 超过紧急温度，已强制全部风扇 100%（覆盖调试转速）', true);
   } else if (state.auto_running) {
-    fanDebugStatus(`自动递增进行中：当前 ${state.auto_current}%（每 ${state.auto_interval_seconds} 秒 +${state.auto_step}%，到 100% 自动停止）`);
+    fanDebugStatus(`自动递增进行中：各风扇按各自的递增值与间隔推进，到 100% 自动完成。`);
   }
-  $('fan-debug-auto-start').disabled = state.auto_running || !(state.fans || []).some((fan) => fan.taken_over);
+  $('fan-debug-auto-start').disabled = state.auto_running || !(state.fans || []).some((fan) => fan.taken_over && !fan.auto_done);
   $('fan-debug-auto-stop').disabled = !state.auto_running;
 }
 
@@ -2593,15 +2593,29 @@ $('fan-debug-active').addEventListener('change', async () => {
 });
 
 $('fan-debug-auto-start').addEventListener('click', async () => {
-  const step = Number($('fan-debug-auto-step').value);
-  const interval = Number($('fan-debug-auto-interval').value);
+  const payloadFans = [];
+  document.querySelectorAll('#fan-debug-body tr').forEach((tr) => {
+    const box = tr.querySelector('input[type=checkbox]');
+    if (!box?.checked) return;
+    const stepInput = tr.querySelector('.fan-debug-auto-input[data-kind="step"]');
+    const intervalInput = tr.querySelector('.fan-debug-auto-input[data-kind="interval"]');
+    payloadFans.push({
+      id: box.dataset.fanId,
+      step: Number(stepInput?.value) || 5,
+      interval: Number(intervalInput?.value) || 10,
+    });
+  });
+  if (!payloadFans.length) {
+    fanDebugStatus('没有可启动递增的风扇(需先接管且未完成)。', true);
+    return;
+  }
   setBusy(true);
   try {
     renderFanDebug(await request('api/fans/debug/auto', {
       method: 'POST',
-      body: JSON.stringify({ step_percent: step, interval_seconds: interval }),
+      body: JSON.stringify({ fans: payloadFans }),
     }));
-    fanDebugStatus(`自动递增已开始：每 ${interval} 秒 +${step}%，到 100% 自动停止。`);
+    fanDebugStatus(`自动递增已开始：${payloadFans.map((f) => f.id.split(':').pop()).join('、')} 按各自参数递增，到 100% 自动完成。`);
   } catch (error) {
     fanDebugStatus(`自动测试启动失败：${error.message}`, true);
   } finally {
