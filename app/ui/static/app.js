@@ -2521,12 +2521,83 @@ function fanDebugStatus(message, error = false) {
   showMessage(message, error, 'fan-debug-status');
 }
 
-// 渲染调试状态;只在有话要说时改状态行(自动测试进度/紧急覆盖/未启用提示)
+// 汇总状态行文案:紧急覆盖优先,其次列出正在递增/已完成的风扇;无事可说返回 null
+function fanDebugStatusInfo(state) {
+  if (state.emergency) {
+    return { error: true, text: '⚠ CPU 超过紧急温度，已强制全部风扇 100%（覆盖调试转速）' };
+  }
+  const fans = state.fans || [];
+  const label = (fan) => fan.name || fan.id;
+  const running = fans.filter((fan) => fan.auto_running).map(label);
+  if (running.length) {
+    return { text: `自动递增进行中：${running.join('、')} 按各自的递增值与间隔独立推进，到上限自动完成并保持。` };
+  }
+  const done = fans.filter((fan) => fan.auto_done).map(label);
+  if (done.length) {
+    return { text: `已完成自动递增：${done.join('、')} 已停在上限；重新打开行内开关可从 0 重跑。` };
+  }
+  return null;
+}
+
+function applyFanDebugStatus(state) {
+  const info = fanDebugStatusInfo(state);
+  if (info) fanDebugStatus(info.text, Boolean(info.error));
+  else fanDebugStatus('');
+}
+
+// 风扇调试单位表:转速 RPM 按 2000 RPM=100% 线性换算;PWM 原始值不带符号
+const FAN_DEBUG_UNITS = [
+  { value: 'rpm', label: '转速 RPM', max: 2000, suffix: 'RPM' },
+  { value: 'percent', label: '百分比 %', max: 100, suffix: '%' },
+  { value: 'pwm', label: 'PWM', max: 255, suffix: '' },
+];
+
+function fanDebugUnit(value) {
+  return FAN_DEBUG_UNITS.find((unit) => unit.value === value) || FAN_DEBUG_UNITS[1];
+}
+
+// 单位间线性换算(按各自上限等比):50% ↔ 128 PWM ↔ 1000 RPM
+function convertDebugValue(value, fromUnit, toUnit) {
+  return Math.round((value * fanDebugUnit(toUnit).max) / fanDebugUnit(fromUnit).max);
+}
+
+// 调试值输入框 + 单位后缀;unitDef 形如 FAN_DEBUG_UNITS 项({max, suffix})。
+// 外层包 inline-flex 容器:td 不能直接设 flex(会脱离 table-cell 布局,列错位)。
+function buildFanDebugInput(unitDef, className, kind, fanId, ariaLabel) {
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = kind === 'interval' ? '1' : '0';
+  input.max = String(unitDef.max);
+  input.step = '1';
+  input.inputMode = 'numeric';
+  input.className = className;
+  input.dataset.fanId = fanId;
+  input.dataset.kind = kind;
+  input.setAttribute('aria-label', ariaLabel);
+  const wrap = document.createElement('span');
+  wrap.className = 'fan-debug-inline';
+  wrap.append(input);
+  if (unitDef.suffix) {
+    const mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    mark.textContent = unitDef.suffix;
+    wrap.append(mark);
+  }
+  return { input, wrap };
+}
+
+// 渲染调试状态;每行一个自动测试滑动开关,各风扇独立启停互不影响
 function renderFanDebug(state) {
   const body = $('fan-debug-body');
+  // 正在行内编辑数字/单位时不重绘表格,避免 2 秒轮询打断输入(状态行照常更新)
+  const active = document.activeElement;
+  if (active && body.contains(active) && (active.type === 'number' || active.tagName === 'SELECT')) {
+    applyFanDebugStatus(state);
+    return;
+  }
   const pending = {};
-  body.querySelectorAll('input[data-fan-id]').forEach((input) => {
-    pending[input.dataset.fanId] = input.value;
+  body.querySelectorAll('input[data-fan-id][data-kind], select[data-fan-id][data-kind]').forEach((field) => {
+    pending[field.dataset.fanId + ':' + field.dataset.kind] = field.value;
   });
   body.replaceChildren();
   (state.fans || []).forEach((fan) => {
@@ -2540,7 +2611,9 @@ function renderFanDebug(state) {
     takeBox.addEventListener('change', () => applyFanTakeover(fan.id, takeBox.checked));
     takeCell.append(takeBox);
     const name = document.createElement('td');
-    name.textContent = `${fan.name}（通道 ${fan.channel}）`;
+    name.textContent = fan.name;
+    const channel = document.createElement('td');
+    channel.textContent = fan.channel;
     const rpm = document.createElement('td');
     rpm.textContent = `${fan.rpm} RPM`;
     const pwm = document.createElement('td');
@@ -2548,95 +2621,108 @@ function renderFanDebug(state) {
     const mode = document.createElement('td');
     mode.textContent = fan.mode === 1 ? '手动' : fan.mode === 0 ? '全速' : `自动(${fan.mode})`;
     const debugCell = document.createElement('td');
+    debugCell.className = 'fan-debug-pwm-cell';
+    const stepCell = document.createElement('td');
+    stepCell.className = 'fan-debug-step-cell';
+    const intervalCell = document.createElement('td');
+    intervalCell.className = 'fan-debug-step-cell';
+    const autoCell = document.createElement('td');
+    autoCell.className = 'fan-debug-auto-cell';
     if (fan.taken_over) {
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.min = '0';
-      input.max = '100';
-      input.step = '1';
-      input.inputMode = 'numeric';
-      input.className = 'fan-debug-pwm-input';
-      input.dataset.fanId = fan.id;
-      input.value = pending[fan.id] ?? String(fan.debug_percent ?? 0);
-      input.setAttribute('aria-label', `调试转速 ${fan.id}`);
+      const unit = document.createElement('select');
+      unit.className = 'fan-debug-unit';
+      unit.dataset.fanId = fan.id;
+      unit.dataset.kind = 'unit';
+      for (const def of FAN_DEBUG_UNITS) {
+        const option = document.createElement('option');
+        option.value = def.value;
+        option.textContent = def.label;
+        unit.append(option);
+      }
+      unit.value = pending[fan.id + ':unit'] ?? fan.debug_unit ?? 'percent';
+      // 自动递增进行中/已完成时输入框跟随后端实际值,避免停留在旧的手动值
+      const followsAuto = fan.auto_running || fan.auto_done;
+      const debugUnit = fanDebugUnit(unit.value);
+      const debugWrap = buildFanDebugInput(debugUnit, 'fan-debug-pwm-input', 'pwm', fan.id, `调试转速 ${fan.id}`);
+      const input = debugWrap.input;
+      input.value = (followsAuto ? String(fan.debug_percent ?? 0) : pending[fan.id + ':pwm']) ?? String(fan.debug_percent ?? 0);
       const apply = document.createElement('button');
       apply.type = 'button';
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
-      apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value)));
-      debugCell.className = 'fan-debug-pwm-cell';
-      debugCell.append(input, apply);
+      apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
+      let prevUnit = unit.value;
+      unit.addEventListener('change', () => {
+        const to = fanDebugUnit(unit.value);
+        const from = fanDebugUnit(prevUnit);
+        // 输入框与递增值按比例换算到新单位(RPM/%/PWM 上限等比)
+        const v = Number(input.value);
+        if (Number.isFinite(v)) {
+          input.value = String(convertDebugValue(v, from.value, to.value));
+        }
+        const s = Number(stepInput.value);
+        if (Number.isFinite(s) && s > 0) {
+          stepInput.value = String(convertDebugValue(s, from.value, to.value));
+        }
+        input.max = String(to.max);
+        stepInput.max = String(to.max);
+        setCellSuffix(debugCell, to.suffix);
+        setCellSuffix(stepCell, to.suffix);
+        prevUnit = unit.value;
+        // 同步后端:基准值按新单位存储(同物理输出,只是换算存储),递增/完成判定跟随新单位
+        if (Number.isFinite(v)) {
+          applyFanDebugPWM(fan.id, Number(input.value), unit.value, `单位已切换为${to.label}，已按新单位同步调试值。`);
+        }
+      });
+      const stepWrap = buildFanDebugInput(debugUnit, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
+      const stepInput = stepWrap.input;
+      stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
+      const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
+      const intervalInput = intervalWrap.input;
+      intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
+      debugCell.append(unit, debugWrap.wrap, apply);
+      stepCell.append(stepWrap.wrap);
+      intervalCell.append(intervalWrap.wrap);
+      // 自动测试滑动开关:开=按该行步进/间隔/单位从当前调试值递增;到上限自动弹回并标记完成
+      const autoToggle = document.createElement('label');
+      autoToggle.className = 'toggle fan-debug-auto-toggle';
+      const autoBox = document.createElement('input');
+      autoBox.type = 'checkbox';
+      autoBox.dataset.fanId = fan.id;
+      autoBox.checked = fan.auto_running;
+      autoBox.setAttribute('aria-label', `${fan.id} 自动递增测试${fan.auto_done ? '（已完成，重新打开可从 0 重跑）' : ''}`);
+      autoBox.addEventListener('change', () => applyFanDebugAuto(fan.id, autoBox.checked, Number(stepInput.value) || 5, Number(intervalInput.value) || 10, unit.value));
+      autoToggle.append(autoBox, document.createElement('span'));
+      autoCell.append(autoToggle);
+      if (fan.auto_done) {
+        const done = document.createElement('span');
+        done.className = 'fan-debug-done';
+        done.textContent = '✓ 已完成';
+        autoCell.append(done);
+      }
     }
-    row.append(takeCell, name, rpm, pwm, mode, debugCell);
+    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell, autoCell);
     body.append(row);
   });
-  if (state.emergency) {
-    fanDebugStatus('⚠ CPU 超过紧急温度，已强制全部风扇 100%（覆盖调试转速）', true);
-  } else if (state.auto_running) {
-    fanDebugStatus(`自动递增进行中：各风扇按各自的递增值与间隔推进，到 100% 自动完成。`);
+  applyFanDebugStatus(state);
+}
+
+// 替换单元格里输入框后面的单位后缀(RPM/%/秒;空串=移除)
+function setCellSuffix(cell, text) {
+  let mark = cell.querySelector('.fan-debug-suffix');
+  if (!text) {
+    if (mark) mark.remove();
+    return;
   }
-  $('fan-debug-auto-start').disabled = state.auto_running || !(state.fans || []).some((fan) => fan.taken_over && !fan.auto_done);
-  $('fan-debug-auto-stop').disabled = !state.auto_running;
+  if (!mark) {
+    mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    cell.append(mark);
+  }
+  mark.textContent = text;
 }
 
 $('fan-debug-visible').addEventListener('change', () => setFanDebugVisible($('fan-debug-visible').checked));
-
-$('fan-debug-active').addEventListener('change', async () => {
-  const enabled = $('fan-debug-active').checked;
-  setBusy(true);
-  try {
-    renderFanDebug(await request('api/fans/debug/enable', { method: 'POST', body: JSON.stringify({ enabled }) }));
-    if (!enabled) fanDebugStatus('调试模式已关闭，温控曲线已恢复。');
-  } catch (error) {
-    $('fan-debug-active').checked = enabled; // 恢复开关为失败前状态再由下次轮询校正
-    fanDebugStatus(`切换调试模式失败：${error.message}`, true);
-  } finally {
-    setBusy(false);
-  }
-});
-
-$('fan-debug-auto-start').addEventListener('click', async () => {
-  const payloadFans = [];
-  document.querySelectorAll('#fan-debug-body tr').forEach((tr) => {
-    const box = tr.querySelector('input[type=checkbox]');
-    if (!box?.checked) return;
-    const stepInput = tr.querySelector('.fan-debug-auto-input[data-kind="step"]');
-    const intervalInput = tr.querySelector('.fan-debug-auto-input[data-kind="interval"]');
-    payloadFans.push({
-      id: box.dataset.fanId,
-      step: Number(stepInput?.value) || 5,
-      interval: Number(intervalInput?.value) || 10,
-    });
-  });
-  if (!payloadFans.length) {
-    fanDebugStatus('没有可启动递增的风扇(需先接管且未完成)。', true);
-    return;
-  }
-  setBusy(true);
-  try {
-    renderFanDebug(await request('api/fans/debug/auto', {
-      method: 'POST',
-      body: JSON.stringify({ fans: payloadFans }),
-    }));
-    fanDebugStatus(`自动递增已开始：${payloadFans.map((f) => f.id.split(':').pop()).join('、')} 按各自参数递增，到 100% 自动完成。`);
-  } catch (error) {
-    fanDebugStatus(`自动测试启动失败：${error.message}`, true);
-  } finally {
-    setBusy(false);
-  }
-});
-
-$('fan-debug-auto-stop').addEventListener('click', async () => {
-  setBusy(true);
-  try {
-    renderFanDebug(await request('api/fans/debug/auto/stop', { method: 'POST', body: '{}' }));
-    fanDebugStatus('自动递增已停止，保持当前转速。');
-  } catch (error) {
-    fanDebugStatus(`停止失败：${error.message}`, true);
-  } finally {
-    setBusy(false);
-  }
-});
 
 // ---- 长期记录保存位置：官方系统目录选择器（fnOS 应用 SDK pickSharedFile）----
 
@@ -2706,15 +2792,35 @@ async function applyFanTakeover(id, taken) {
   }
 }
 
-async function applyFanDebugPWM(id, percent) {
-  if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-    fanDebugStatus(`调试转速需在 0–100 之间。`, true);
+// 单风扇自动递增的开/关:开=以当前调试值为基准,按该行步进/间隔/单位递增;
+// 关=停在当前转速(参数保留,重新打开原样继续)。各风扇互不影响。
+async function applyFanDebugAuto(id, running, step, interval, unit) {
+  const label = id.split(':').pop();
+  setBusy(true);
+  try {
+    const state = running
+      ? await request('api/fans/debug/auto', { method: 'POST', body: JSON.stringify({ fans: [{ id, step, interval, unit }] }) })
+      : await request('api/fans/debug/auto/stop', { method: 'POST', body: JSON.stringify({ id }) });
+    renderFanDebug(state);
+    fanDebugStatus(running ? `${label} 自动递增已开始。` : `${label} 自动递增已停止，保持当前转速。`);
+  } catch (error) {
+    fanDebugStatus(`自动递增切换失败：${error.message}`, true);
+    startFanDebugPoll(); // 立即轮询校正开关状态
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function applyFanDebugPWM(id, value, unit, successMessage) {
+  const def = fanDebugUnit(unit);
+  if (!Number.isFinite(value) || value < 0 || value > def.max) {
+    fanDebugStatus(`调试值需在 0–${def.max} 之间。`, true);
     return;
   }
   setBusy(true);
   try {
-    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, percent }) }));
-    fanDebugStatus(`已应用 ${id} 转速 ${percent}%。`);
+    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, value, unit }) }));
+    fanDebugStatus(successMessage || `已应用 ${id} ${def.label} ${value}。`);
   } catch (error) {
     fanDebugStatus(`应用失败：${error.message}`, true);
   } finally {

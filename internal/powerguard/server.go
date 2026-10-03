@@ -471,22 +471,23 @@ func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		ID      string `json:"id"`
-		Percent int    `json:"percent"`
+		ID    string `json:"id"`
+		Value int    `json:"value"`
+		Unit  string `json:"unit"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SetFanDebugPercent(payload.ID, payload.Percent); err != nil {
+	if err := s.Manager.SetFanDebugValue(payload.ID, payload.Value, payload.Unit); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAuto 自动递增测试：全部被接管风扇以各自的手动转速为基础,
-// 每 interval 秒统一 +step,到 100% 自动停止。
+// handleFansDebugAuto 按风扇启动自动递增:fans 列表逐个开启,每台风扇以各自的
+// 手动转速为基准,按各自 step/interval/unit 递增到单位上限自动完成。
 func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
@@ -496,29 +497,38 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 			ID       string `json:"id"`
 			Step     int    `json:"step"`
 			Interval int    `json:"interval"`
+			Unit     string `json:"unit"`
 		} `json:"fans"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	entries := make(map[string]fanDebugAutoEntry, len(payload.Fans))
 	for _, fan := range payload.Fans {
-		entries[fan.ID] = fanDebugAutoEntry{Step: fan.Step, Interval: fan.Interval}
-	}
-	if err := s.Manager.StartFanDebugAuto(entries); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		if err := s.Manager.SetFanDebugAuto(fan.ID, true, fan.Step, fan.Interval, fan.Unit); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAutoStop 停止自动递增测试,保持当前转速。
+// handleFansDebugAutoStop 停止单个风扇的自动递增,保持当前转速,参数保留。
 func (s *Server) handleFansDebugAutoStop(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
 	}
-	s.Manager.StopFanDebugAuto()
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanDebugAuto(payload.ID, false, 0, 0, ""); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 

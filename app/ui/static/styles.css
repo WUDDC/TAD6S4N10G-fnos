@@ -2015,8 +2015,11 @@ button.danger {
 /* ---- 风扇调试控制（开关在调试页“历史温度与风扇控制”卡片标题行） ---- */
 
 /* ---- 风扇调试:接管勾选列、行内调试转速与每风扇递增参数 ---- */
+/* 列宽按内容自适应(fixed 会把 9 列强制等分,勾选/通道列浪费大量空间) */
+.fan-debug-table { table-layout: auto; }
 .fan-debug-table .fan-debug-pwm-input,
-.fan-debug-table .fan-debug-auto-input {
+.fan-debug-table .fan-debug-auto-input,
+.fan-debug-table .fan-debug-unit {
   width: 64px;
   padding: 4px 6px;
   border: 1px solid var(--line-strong);
@@ -2026,3 +2029,27 @@ button.danger {
   font-size: 12px;
 }
 .fan-debug-table .fan-debug-auto-cell { white-space: nowrap; }
+/* 调试转速/递增/间隔单元格:输入框 + 单位后缀(RPM/%/秒)横排。
+   td 不能直接 display:flex——会脱离 table-cell 布局导致整列堆叠,只对内层容器用 inline-flex */
+.fan-debug-table .fan-debug-pwm-cell,
+.fan-debug-table .fan-debug-step-cell { white-space: nowrap; }
+.fan-debug-table .fan-debug-inline {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  vertical-align: middle;
+}
+.fan-debug-table .fan-debug-inline > * { flex: 0 0 auto; }
+.fan-debug-table .fan-debug-suffix {
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+/* 自动测试单元格:滑动开关 + 完成标记横排 */
+.fan-debug-table .fan-debug-auto-cell .fan-debug-done {
+  margin-left: 6px;
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}

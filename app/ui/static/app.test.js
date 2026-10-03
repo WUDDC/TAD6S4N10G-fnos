@@ -636,3 +636,60 @@ test('运行日志：保存校验并 POST /api/config/log；导出发起下载�
   assert.equal(clears[0].init.method, 'POST');
   assert.equal(element('runlog-status').textContent, '运行日志已清空。');
 });
+
+test('fanDebugStatusInfo：紧急覆盖优先，其次列出递增中/已完成风扇，无事返回 null', () => {
+  const info = resolve('fanDebugStatusInfo');
+  const fans = (overrides = []) => [
+    { id: 'it8613:hwmon3:fan1', name: 'fan1' },
+    { id: 'it8613:hwmon3:fan2', name: 'fan2' },
+    ...[],
+  ].map((fan) => {
+    const patch = overrides.find((item) => item.id === fan.id) || {};
+    return { ...fan, ...patch };
+  });
+  // 紧急温度覆盖最优先
+  const emergency = info({ emergency: true, fans: fans([{ id: 'it8613:hwmon3:fan1', auto_running: true }]) });
+  assert.equal(emergency.error, true);
+  assert.match(emergency.text, /紧急温度/);
+  // 递增中:列出风扇名
+  const running = info({ fans: fans([
+    { id: 'it8613:hwmon3:fan1', auto_running: true },
+    { id: 'it8613:hwmon3:fan2', auto_running: true },
+  ]) });
+  assert.equal(running.error, undefined);
+  assert.match(running.text, /fan1、fan2/);
+  assert.match(running.text, /独立推进/);
+  // 全部停了但有人跑完:完成提示
+  const done = info({ fans: fans([{ id: 'it8613:hwmon3:fan1', auto_done: true }]) });
+  assert.match(done.text, /已完成自动递增：fan1/);
+  // 什么都没有:null(清空状态行)
+  assert.equal(info({ fans: fans() }), null);
+  assert.equal(info({}), null);
+});
+
+test('applyFanDebugAuto：开=按风扇 POST fans 数组；关=POST auto/stop 单 id', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ fans: [] }));
+  const { resolve: fn } = loadAppContext({ fetch });
+  await fn('applyFanDebugAuto')('it8613:hwmon3:fan1', true, 10, 5, 'pwm');
+  const start = requests.filter((req) => req.url.includes('api/fans/debug/auto'));
+  assert.equal(start.length, 1);
+  assert.equal(start[0].init.method, 'POST');
+  assert.deepEqual(JSON.parse(start[0].init.body), { fans: [{ id: 'it8613:hwmon3:fan1', step: 10, interval: 5, unit: 'pwm' }] });
+  await fn('applyFanDebugAuto')('it8613:hwmon3:fan1', false, 0, 0, '');
+  const stops = requests.filter((req) => req.url.includes('api/fans/debug/auto/stop'));
+  assert.equal(stops.length, 1);
+  assert.deepEqual(JSON.parse(stops[0].init.body), { id: 'it8613:hwmon3:fan1' });
+});
+
+test('风扇调试单位表:三种单位(RPM/%/PWM)、后缀与线性换算契约', () => {
+  const units = resolve('FAN_DEBUG_UNITS');
+  assert.equal(units.map((unit) => unit.value).join(','), 'rpm,percent,pwm');
+  assert.equal(units.map((unit) => unit.suffix).join('|'), 'RPM|%|', 'PWM 不带符号');
+  assert.equal(units.map((unit) => unit.max).join(','), '2000,100,255');
+  const convert = resolve('convertDebugValue');
+  assert.equal(convert(50, 'percent', 'pwm'), 128);
+  assert.equal(convert(128, 'pwm', 'percent'), 50);
+  assert.equal(convert(50, 'percent', 'rpm'), 1000);
+  assert.equal(convert(1000, 'rpm', 'percent'), 50);
+  assert.equal(convert(2000, 'rpm', 'pwm'), 255);
+});

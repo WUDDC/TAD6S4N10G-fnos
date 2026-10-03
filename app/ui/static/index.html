@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.19">
+  <link rel="stylesheet" href="styles.css?v=0.10.19-t5-t5">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -271,31 +271,16 @@
             <div class="panel-heading">
               <div>
                 <h2 id="fan-debug-heading">风扇调试</h2>
-                <p>手动设定转速与递增测试。调试期间温控曲线暂停（CPU 超过紧急温度时仍强制全速兜底）；结束后请关闭调试模式恢复自动控制。</p>
+                <p>逐风扇手动设定转速与独立的自动递增测试。勾选接管的风扇脱离温控曲线、仅受行内调试值控制（CPU 超过紧急温度时仍强制全速兜底）；未接管的风扇照常受曲线控制，可与调试中的风扇并存。</p>
               </div>
-              <label class="toggle"><input id="fan-debug-active" type="checkbox"><span></span>启用调试模式</label>
             </div>
             <div class="table-scroll">
               <table class="status-table fan-debug-table">
-                <thead><tr><th>接管</th><th>风扇</th><th>通道</th><th>当前转速</th><th>当前 PWM</th><th>模式</th><th>调试转速</th><th>每次递增 %</th><th>递增间隔 秒</th></tr></thead>
+                <thead><tr><th>接管</th><th>风扇</th><th>通道</th><th>当前转速</th><th>当前 PWM</th><th>模式</th><th>调试转速</th><th>每次递增</th><th>递增间隔</th><th>自动测试</th></tr></thead>
                 <tbody id="fan-debug-body"></tbody>
               </table>
             </div>
-            <p class="notice">勾选"接管"后该风扇脱离温控曲线，仅受行内调试转速控制；取消勾选立即恢复曲线。自动递增测试：全部被接管风扇以各自的手动转速为基础，每过一个间隔统一增加一次转速，到 100% 自动停止。</p>
-            <div class="field-grid history-settings">
-              <label class="field">
-                <span>每次递增</span>
-                <div class="input-wrap"><input id="fan-debug-auto-step" type="number" min="1" max="90" step="1" value="5" inputmode="numeric"><b>%</b></div>
-              </label>
-              <label class="field">
-                <span>递增间隔</span>
-                <div class="input-wrap"><input id="fan-debug-auto-interval" type="number" min="1" max="120" step="1" value="10" inputmode="numeric"><b>秒</b></div>
-              </label>
-            </div>
-            <div class="actions history-actions">
-              <button id="fan-debug-auto-start" type="button" class="primary">开始自动递增</button>
-              <button id="fan-debug-auto-stop" type="button">停止自动测试</button>
-            </div>
+            <p class="notice">勾选“接管”后该风扇脱离温控曲线，仅受行内调试转速控制；取消勾选立即恢复曲线并结束该风扇的自动测试。调试值支持三种单位：转速 RPM（按 2000 RPM=100% 线性换算，实际转速以“当前转速”读数为准）、百分比 %（0–100）、PWM（0–255 原始占空比，不带符号），切换单位时数值自动换算并同步。行内“自动测试”滑动开关按风扇独立启停：开启后从当前调试转速起，按该行的递增值与间隔推进，到所选单位上限自动完成并保持；再次开启会从 0 重跑。一个风扇递增期间，其他风扇可照常手动调试。</p>
             <p id="fan-debug-status" class="message" role="status" aria-live="polite"></p>
           </section>
 
@@ -542,6 +527,6 @@
       <button id="app-modal-close" type="button" class="primary" data-modal-close>关闭</button>
     </div>
   </div>
-  <script src="app.js?v=0.10.19-t2" defer></script>
+  <script src="app.js?v=0.10.19-t5-t5" defer></script>
 </body>
 </html>
