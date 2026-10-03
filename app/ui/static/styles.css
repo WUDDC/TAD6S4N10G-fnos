@@ -2016,7 +2016,8 @@ button.danger {
 
 /* ---- 风扇调试:接管勾选列、行内调试转速与每风扇递增参数 ---- */
 .fan-debug-table .fan-debug-pwm-input,
-.fan-debug-table .fan-debug-auto-input {
+.fan-debug-table .fan-debug-auto-input,
+.fan-debug-table .fan-debug-unit {
   width: 64px;
   padding: 4px 6px;
   border: 1px solid var(--line-strong);
@@ -2026,3 +2027,11 @@ button.danger {
   font-size: 12px;
 }
 .fan-debug-table .fan-debug-auto-cell { white-space: nowrap; }
+/* 调试转速单元格:单位下拉 + 数值 + 应用 横排一行 */
+.fan-debug-table .fan-debug-pwm-cell {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  white-space: nowrap;
+}
+.fan-debug-table .fan-debug-pwm-cell > * { flex: 0 0 auto; }
