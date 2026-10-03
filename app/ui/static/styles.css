@@ -1998,5 +1998,4 @@ button.danger {
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }
 
 
-/* ---- 风扇调试控制（调试页勾选显示） ---- */
-.fan-debug-toggle-row { margin: 2px 0 12px; }
+/* ---- 风扇调试控制（开关在调试页“历史温度与风扇控制”卡片标题行） ---- */

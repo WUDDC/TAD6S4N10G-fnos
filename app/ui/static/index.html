@@ -243,7 +243,7 @@
             <div class="panel-heading">
               <div>
                 <h2 id="history-heading">历史温度</h2>
-                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化；采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度设定”。</p>
+                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化；采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度与风扇控制”。</p>
               </div>
               <div class="history-range" role="group" aria-label="时间范围">
                 <div class="history-range-slider">
@@ -265,7 +265,7 @@
             <svg id="history-chart" class="curve-chart history-chart" viewBox="0 0 640 260" role="img" aria-label="温度与风扇转速历史曲线"></svg>
             <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
             <p id="history-status" class="inline-status"></p>
-            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度设定”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
+            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度与风扇控制”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温。</p>
           </section>
           <section class="card debug-panel" id="fan-debug-card" aria-labelledby="fan-debug-heading" hidden>
             <div class="panel-heading">
@@ -413,9 +413,10 @@
           <section class="card debug-panel" aria-labelledby="history-settings-heading">
             <div class="panel-heading">
               <div>
-                <h2 id="history-settings-heading">历史温度设定</h2>
-                <p>采样开关、数据库大小上限与保存天数，以及历史数据的导出与清空；曲线与时间范围在“风扇控制”页的历史温度卡片。</p>
+                <h2 id="history-settings-heading">历史温度与风扇控制</h2>
+                <p>采样开关、数据库大小上限与保存天数，以及历史数据的导出与清空；曲线与时间范围在“风扇控制”页的历史温度卡片。风扇调试控制在“风扇控制”页，用下方开关启用。</p>
               </div>
+              <label class="toggle"><input id="fan-debug-visible" type="checkbox"><span></span>启用风扇调试</label>
             </div>
             <label class="toggle history-toggle"><input id="history-enabled" type="checkbox"><span></span>启用历史记录</label>
             <div id="history-disabled-notice" class="inline-status history-disabled-notice" hidden>历史记录已停用：后台不再写入新采样，已保存的数据仍会按保留期与大小上限继续清理。</div>
@@ -492,9 +493,6 @@
             </div>
             <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史温度页一次即可列出全部传感器。</p>
           </section>
-            <div class="fan-debug-toggle-row">
-              <label class="toggle"><input id="fan-debug-visible" type="checkbox"><span></span>在风扇控制页显示风扇调试控制</label>
-            </div>
         </section>
 
         <section id="panel-about" class="tab-panel" role="tabpanel" aria-labelledby="tab-about" hidden>
