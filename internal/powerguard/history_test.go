@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -2145,6 +2146,99 @@ func TestFanDebugValidation(t *testing.T) {
 	if err := manager.StartFanDebugAutoBatch(entries); err == nil {
 		t.Fatal("auto test without taken-over fans should fail")
 	}
+	// rpm 单位的边界:步进 0 与超 2000 均拒绝
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 0, 10, "rpm"); err == nil {
+		t.Fatal("rpm step 0 should fail")
+	}
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 2001, 10, "rpm"); err == nil {
+		t.Fatal("rpm step 2001 should fail")
+	}
+}
+
+// rpm 单位:1000 RPM 按 2000=100% 换算写硬件;递增到 rpm 上限完成并写满 PWM。
+func TestFanDebugRpmUnit(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 1000, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	pwm1, err := os.ReadFile(filepath.Join(hwmon, "pwm1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1000 RPM = 50% → percentToPWM(50)
+	if got, want := strings.TrimSpace(string(pwm1)), fmt.Sprintf("%d", percentToPWM(50)); got != want {
+		t.Fatalf("1000 rpm should write pwm %s (50%%), got %s", want, got)
+	}
+	state := manager.FanDebugState()
+	if fan := state.Fans[0]; fan.DebugUnit != "rpm" || fan.DebugPercent != 1000 {
+		t.Fatalf("state should keep rpm value 1000, got %+v", fan)
+	}
+	// 递增到 rpm 上限(2000)完成:1900 + 200/秒 → 约 1 秒内到顶
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 1900, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 200, 1, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for state = manager.FanDebugState(); !state.Fans[0].AutoDone; state = manager.FanDebugState() {
+		if time.Now().After(deadline) {
+			t.Fatalf("rpm ramp should finish at 2000 rpm, got %+v", state.Fans[0])
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if state.Fans[0].DebugPercent != 2000 {
+		t.Fatalf("done value should be 2000 rpm, got %+v", state.Fans[0])
+	}
+	pwm1, err = os.ReadFile(filepath.Join(hwmon, "pwm1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(pwm1)) != "255" {
+		t.Fatalf("2000 rpm should write pwm 255, got %s", strings.TrimSpace(string(pwm1)))
+	}
+	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0, "")
+}
+
+// 递增中切换单位:基准与递增判定跟随新单位(1000 RPM=50% 时切 percent,继续按 % 递增)。
+func TestFanDebugUnitSwitchMidRamp(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 1000, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 200, 1, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	// 递增进行中把单位(与等比基准值)切到 percent:1000 RPM → 50%
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(2600 * time.Millisecond)
+	state := manager.FanDebugState()
+	fan := state.Fans[0]
+	if fan.AutoDone || fan.DebugUnit != "percent" {
+		t.Fatalf("ramp should continue in percent after unit switch, got %+v", fan)
+	}
+	// 50% + 200 rpm 换算步进(切单位时前端会把步进换算成 10%)×2 秒 ≈ 70%
+	if fan.DebugPercent <= 50 || fan.DebugPercent >= 100 {
+		t.Fatalf("ramp should progress from 50%% in percent unit, got %d", fan.DebugPercent)
+	}
+	pwm1, err := os.ReadFile(filepath.Join(hwmon, "pwm1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(pwm1)); got == "0" {
+		t.Fatalf("pwm should keep ramping after unit switch, got %s", got)
+	}
+	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0, "")
 }
 
 func TestHandleFansDebugEndpoints(t *testing.T) {

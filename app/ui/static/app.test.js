@@ -680,3 +680,16 @@ test('applyFanDebugAuto：开=按风扇 POST fans 数组；关=POST auto/stop �
   assert.equal(stops.length, 1);
   assert.deepEqual(JSON.parse(stops[0].init.body), { id: 'it8613:hwmon3:fan1' });
 });
+
+test('风扇调试单位表:三种单位(RPM/%/PWM)、后缀与线性换算契约', () => {
+  const units = resolve('FAN_DEBUG_UNITS');
+  assert.equal(units.map((unit) => unit.value).join(','), 'rpm,percent,pwm');
+  assert.equal(units.map((unit) => unit.suffix).join('|'), 'RPM|%|', 'PWM 不带符号');
+  assert.equal(units.map((unit) => unit.max).join(','), '2000,100,255');
+  const convert = resolve('convertDebugValue');
+  assert.equal(convert(50, 'percent', 'pwm'), 128);
+  assert.equal(convert(128, 'pwm', 'percent'), 50);
+  assert.equal(convert(50, 'percent', 'rpm'), 1000);
+  assert.equal(convert(1000, 'rpm', 'percent'), 50);
+  assert.equal(convert(2000, 'rpm', 'pwm'), 255);
+});

@@ -987,14 +987,28 @@ func fanDebugUnitMax(unit string) int {
 	if unit == "pwm" {
 		return 255
 	}
+	if unit == "rpm" {
+		return 2000
+	}
 	return 100
 }
 
-// SetFanDebugValue 设定单个被接管风扇的调试转速。value 的单位由 unit 决定:
-// "percent" 为转速百分比(0–100),"pwm" 为原始占空比(0–255)。value 存储与
-// 自动递增都按该单位进行。
+// fanDebugRaw 把单位值换算为写入硬件的原始 PWM。rpm 按 2000 RPM=100% 线性换算。
+func fanDebugRaw(unit string, value int) int {
+	if unit == "pwm" {
+		return value
+	}
+	if unit == "rpm" {
+		return percentToPWM((value + 10) / 20)
+	}
+	return percentToPWM(value)
+}
+
+// SetFanDebugValue 设定单个被接管风扇的调试值。value 的单位由 unit 决定:
+// "rpm" 为转速(0–2000,按 2000=100% 换算),"percent" 为百分比(0–100),
+// "pwm" 为原始占空比(0–255)。value 存储与自动递增都按该单位进行。
 func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
-	if unit != "percent" && unit != "pwm" {
+	if unit != "percent" && unit != "pwm" && unit != "rpm" {
 		return fmt.Errorf("未知的调节单位 %q", unit)
 	}
 	value = clampInt(value, 0, fanDebugUnitMax(unit))
@@ -1007,12 +1021,7 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	if err != nil {
 		return err
 	}
-	raw := value
-	if unit == "pwm" {
-		raw = value
-	} else {
-		raw = percentToPWM(value)
-	}
+	raw := fanDebugRaw(unit, value)
 	var errs []error
 	for i := range fans {
 		if fans[i].ID != id {
@@ -1023,7 +1032,24 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 		}
 	}
 	m.fanDebugTakenOver[id] = value
+	oldUnit := m.fanDebugUnits[id]
 	m.fanDebugUnits[id] = unit
+	// 递增条目在跑时同步单位并把步进等比换算(200 RPM → 10%),递增循环以 fanDebugUnits 为准
+	if m.fanDebugAuto != nil {
+		if entry, ok := m.fanDebugAuto.entries[id]; ok {
+			if oldUnit == "" {
+				oldUnit = entry.Unit
+			}
+			if oldUnit != "" && oldUnit != unit && fanDebugUnitMax(oldUnit) > 0 {
+				entry.Step = entry.Step * fanDebugUnitMax(unit) / fanDebugUnitMax(oldUnit)
+				if entry.Step < 1 {
+					entry.Step = 1
+				}
+			}
+			entry.Unit = unit
+			m.fanDebugAuto.entries[id] = entry
+		}
+	}
 	if len(errs) > 0 {
 		m.fanDebugLastError = errors.Join(errs...).Error()
 		return errors.Join(errs...)
@@ -1045,7 +1071,7 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 	if m.fanDebugAuto.entries == nil {
 		m.fanDebugAuto.entries = map[string]fanDebugAutoEntry{}
 	}
-	if unit != "pwm" {
+	if unit != "pwm" && unit != "rpm" {
 		unit = "percent"
 	}
 	// 关闭总是允许(幂等);开启要求风扇已接管且参数在该单位范围内
@@ -1124,14 +1150,15 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 					anyRunning = true
 					continue
 				}
+				unit := m.fanDebugUnits[id]
+				if unit == "" {
+					unit = entry.Unit
+				}
 				value := m.fanDebugTakenOver[id] + entry.Step
-				if value > fanDebugUnitMax(entry.Unit) {
-					value = fanDebugUnitMax(entry.Unit)
+				if value > fanDebugUnitMax(unit) {
+					value = fanDebugUnitMax(unit)
 				}
-				raw := value
-				if entry.Unit != "pwm" {
-					raw = percentToPWM(value)
-				}
+				raw := fanDebugRaw(unit, value)
 				for i := range fans {
 					if fans[i].ID == id {
 						if err := setFanPWMRaw(fans[i], raw); err != nil {
@@ -1142,7 +1169,7 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				}
 				m.fanDebugTakenOver[id] = value
 				entry.LastRamp = now
-				if value >= fanDebugUnitMax(entry.Unit) {
+				if value >= fanDebugUnitMax(unit) {
 					entry.Done = true
 					entry.Running = false
 				} else {

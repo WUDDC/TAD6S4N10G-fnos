@@ -2545,6 +2545,47 @@ function applyFanDebugStatus(state) {
   else fanDebugStatus('');
 }
 
+// 风扇调试单位表:转速 RPM 按 2000 RPM=100% 线性换算;PWM 原始值不带符号
+const FAN_DEBUG_UNITS = [
+  { value: 'rpm', label: '转速 RPM', max: 2000, suffix: 'RPM' },
+  { value: 'percent', label: '百分比 %', max: 100, suffix: '%' },
+  { value: 'pwm', label: 'PWM', max: 255, suffix: '' },
+];
+
+function fanDebugUnit(value) {
+  return FAN_DEBUG_UNITS.find((unit) => unit.value === value) || FAN_DEBUG_UNITS[1];
+}
+
+// 单位间线性换算(按各自上限等比):50% ↔ 128 PWM ↔ 1000 RPM
+function convertDebugValue(value, fromUnit, toUnit) {
+  return Math.round((value * fanDebugUnit(toUnit).max) / fanDebugUnit(fromUnit).max);
+}
+
+// 调试值输入框 + 单位后缀;unitDef 形如 FAN_DEBUG_UNITS 项({max, suffix})。
+// 外层包 inline-flex 容器:td 不能直接设 flex(会脱离 table-cell 布局,列错位)。
+function buildFanDebugInput(unitDef, className, kind, fanId, ariaLabel) {
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = kind === 'interval' ? '1' : '0';
+  input.max = String(unitDef.max);
+  input.step = '1';
+  input.inputMode = 'numeric';
+  input.className = className;
+  input.dataset.fanId = fanId;
+  input.dataset.kind = kind;
+  input.setAttribute('aria-label', ariaLabel);
+  const wrap = document.createElement('span');
+  wrap.className = 'fan-debug-inline';
+  wrap.append(input);
+  if (unitDef.suffix) {
+    const mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    mark.textContent = unitDef.suffix;
+    wrap.append(mark);
+  }
+  return { input, wrap };
+}
+
 // 渲染调试状态;每行一个自动测试滑动开关,各风扇独立启停互不影响
 function renderFanDebug(state) {
   const body = $('fan-debug-body');
@@ -2582,7 +2623,9 @@ function renderFanDebug(state) {
     const debugCell = document.createElement('td');
     debugCell.className = 'fan-debug-pwm-cell';
     const stepCell = document.createElement('td');
+    stepCell.className = 'fan-debug-step-cell';
     const intervalCell = document.createElement('td');
+    intervalCell.className = 'fan-debug-step-cell';
     const autoCell = document.createElement('td');
     autoCell.className = 'fan-debug-auto-cell';
     if (fan.taken_over) {
@@ -2590,67 +2633,56 @@ function renderFanDebug(state) {
       unit.className = 'fan-debug-unit';
       unit.dataset.fanId = fan.id;
       unit.dataset.kind = 'unit';
-      for (const pair of [['percent', '转速 %'], ['pwm', 'PWM']]) {
+      for (const def of FAN_DEBUG_UNITS) {
         const option = document.createElement('option');
-        option.value = pair[0];
-        option.textContent = pair[1];
+        option.value = def.value;
+        option.textContent = def.label;
         unit.append(option);
       }
       unit.value = pending[fan.id + ':unit'] ?? fan.debug_unit ?? 'percent';
-      const input = document.createElement('input');
-      input.type = 'number';
-      input.min = '0';
-      input.max = unit.value === 'pwm' ? '255' : '100';
-      input.step = '1';
-      input.inputMode = 'numeric';
-      input.className = 'fan-debug-pwm-input';
-      input.dataset.fanId = fan.id;
-      input.dataset.kind = 'pwm';
-      input.value = pending[fan.id + ':pwm'] ?? String(fan.debug_percent ?? 0);
-      input.setAttribute('aria-label', `调试转速 ${fan.id}`);
-      unit.addEventListener('change', () => {
-        input.max = unit.value === 'pwm' ? '255' : '100';
-        stepInput.max = input.max;
-        // 切换单位时按比例换算已填的非零值（50% ↔ 128）
-        const v = Number(input.value);
-        if (Number.isFinite(v) && v > 0) {
-          input.value = String(Math.round(unit.value === 'pwm' ? (v * 255) / 100 : (v * 100) / 255));
-        }
-        const s = Number(stepInput.value);
-        if (Number.isFinite(s) && s > 0) {
-          stepInput.value = String(Math.round(unit.value === 'pwm' ? (s * 255) / 100 : (s * 100) / 255));
-        }
-      });
+      // 自动递增进行中/已完成时输入框跟随后端实际值,避免停留在旧的手动值
+      const followsAuto = fan.auto_running || fan.auto_done;
+      const debugUnit = fanDebugUnit(unit.value);
+      const debugWrap = buildFanDebugInput(debugUnit, 'fan-debug-pwm-input', 'pwm', fan.id, `调试转速 ${fan.id}`);
+      const input = debugWrap.input;
+      input.value = (followsAuto ? String(fan.debug_percent ?? 0) : pending[fan.id + ':pwm']) ?? String(fan.debug_percent ?? 0);
       const apply = document.createElement('button');
       apply.type = 'button';
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
       apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
-      const stepInput = document.createElement('input');
-      stepInput.type = 'number';
-      stepInput.min = '1';
-      stepInput.max = unit.value === 'pwm' ? '255' : '100';
-      stepInput.step = '1';
-      stepInput.inputMode = 'numeric';
-      stepInput.className = 'fan-debug-auto-input';
-      stepInput.dataset.fanId = fan.id;
-      stepInput.dataset.kind = 'step';
+      let prevUnit = unit.value;
+      unit.addEventListener('change', () => {
+        const to = fanDebugUnit(unit.value);
+        const from = fanDebugUnit(prevUnit);
+        // 输入框与递增值按比例换算到新单位(RPM/%/PWM 上限等比)
+        const v = Number(input.value);
+        if (Number.isFinite(v)) {
+          input.value = String(convertDebugValue(v, from.value, to.value));
+        }
+        const s = Number(stepInput.value);
+        if (Number.isFinite(s) && s > 0) {
+          stepInput.value = String(convertDebugValue(s, from.value, to.value));
+        }
+        input.max = String(to.max);
+        stepInput.max = String(to.max);
+        setCellSuffix(debugCell, to.suffix);
+        setCellSuffix(stepCell, to.suffix);
+        prevUnit = unit.value;
+        // 同步后端:基准值按新单位存储(同物理输出,只是换算存储),递增/完成判定跟随新单位
+        if (Number.isFinite(v)) {
+          applyFanDebugPWM(fan.id, Number(input.value), unit.value, `单位已切换为${to.label}，已按新单位同步调试值。`);
+        }
+      });
+      const stepWrap = buildFanDebugInput(debugUnit, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
+      const stepInput = stepWrap.input;
       stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
-      stepInput.setAttribute('aria-label', `递增转速 ${fan.id}`);
-      const intervalInput = document.createElement('input');
-      intervalInput.type = 'number';
-      intervalInput.min = '1';
-      intervalInput.max = '120';
-      intervalInput.step = '1';
-      intervalInput.inputMode = 'numeric';
-      intervalInput.className = 'fan-debug-auto-input';
-      intervalInput.dataset.fanId = fan.id;
-      intervalInput.dataset.kind = 'interval';
+      const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
+      const intervalInput = intervalWrap.input;
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
-      intervalInput.setAttribute('aria-label', `递增间隔 ${fan.id}`);
-      debugCell.append(unit, input, apply);
-      stepCell.append(stepInput);
-      intervalCell.append(intervalInput);
+      debugCell.append(unit, debugWrap.wrap, apply);
+      stepCell.append(stepWrap.wrap);
+      intervalCell.append(intervalWrap.wrap);
       // 自动测试滑动开关:开=按该行步进/间隔/单位从当前调试值递增;到上限自动弹回并标记完成
       const autoToggle = document.createElement('label');
       autoToggle.className = 'toggle fan-debug-auto-toggle';
@@ -2673,6 +2705,21 @@ function renderFanDebug(state) {
     body.append(row);
   });
   applyFanDebugStatus(state);
+}
+
+// 替换单元格里输入框后面的单位后缀(RPM/%/秒;空串=移除)
+function setCellSuffix(cell, text) {
+  let mark = cell.querySelector('.fan-debug-suffix');
+  if (!text) {
+    if (mark) mark.remove();
+    return;
+  }
+  if (!mark) {
+    mark = document.createElement('span');
+    mark.className = 'fan-debug-suffix';
+    cell.append(mark);
+  }
+  mark.textContent = text;
 }
 
 $('fan-debug-visible').addEventListener('change', () => setFanDebugVisible($('fan-debug-visible').checked));
@@ -2764,16 +2811,16 @@ async function applyFanDebugAuto(id, running, step, interval, unit) {
   }
 }
 
-async function applyFanDebugPWM(id, value, unit) {
-  const max = unit === 'pwm' ? 255 : 100;
-  if (!Number.isFinite(value) || value < 0 || value > max) {
-    fanDebugStatus(`调试值需在 0–${max} 之间。`, true);
+async function applyFanDebugPWM(id, value, unit, successMessage) {
+  const def = fanDebugUnit(unit);
+  if (!Number.isFinite(value) || value < 0 || value > def.max) {
+    fanDebugStatus(`调试值需在 0–${def.max} 之间。`, true);
     return;
   }
   setBusy(true);
   try {
     renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, value, unit }) }));
-    fanDebugStatus(`已应用 ${id} ${unit === 'pwm' ? 'PWM' : '转速'} ${value}。`);
+    fanDebugStatus(successMessage || `已应用 ${id} ${def.label} ${value}。`);
   } catch (error) {
     fanDebugStatus(`应用失败：${error.message}`, true);
   } finally {
