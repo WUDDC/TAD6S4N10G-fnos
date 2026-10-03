@@ -1206,9 +1206,11 @@ body.modal-open { overflow: hidden; }
   margin-top: 10px;
 }
 .history-actions { margin-top: 12px; }
-/* 长期记录：开关与保存位置（绝对路径文本框）整行排布 */
+/* 长期记录：开关与保存位置（绝对路径文本框）；路径框限宽 520px——
+   路径虽长但输入框内可横向滚动，通栏宽视觉失衡 */
 .history-archive { display: grid; gap: 8px; margin-top: 12px; }
 .history-archive-dir input { width: 100%; }
+.history-archive-row { display: flex; gap: 8px; align-items: stretch; max-width: 520px; }
 .history-limit-notice { margin-top: 10px; }
 .history-disabled-notice { color: var(--warning, #b8860b); }
 .history-range { display: inline-flex; flex-wrap: wrap; align-items: center; max-width: 100%; gap: 6px; }
