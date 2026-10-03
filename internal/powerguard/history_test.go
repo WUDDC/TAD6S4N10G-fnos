@@ -1998,18 +1998,15 @@ func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 基准=手动 20%,每秒 +60%:20 → 80 → 100 停
-	entries := map[string]fanDebugAutoEntry{
-		"it8613:hwmon3:fan1": {Step: 60, Interval: 1},
-	}
-	if err := manager.StartFanDebugAuto(entries); err != nil {
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 60, 1); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2600 * time.Millisecond)
 	state := manager.FanDebugState()
-	if state.AutoRunning {
+	fan := state.Fans[0]
+	if fan.AutoRunning {
 		t.Fatal("auto test should finish after reaching 100%")
 	}
-	fan := state.Fans[0]
 	if fan.AutoDone != true || fan.PWMPercent != 100 {
 		t.Fatalf("fan should be done at 100%%, got %+v", fan)
 	}
@@ -2021,14 +2018,12 @@ func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
 		t.Fatalf("final pwm should be 255 (100%%), got %s", pwm1)
 	}
 	// 手动停止:运行中的测试可停
-	if err := manager.StartFanDebugAuto(map[string]fanDebugAutoEntry{
-		"it8613:hwmon3:fan1": {Step: 90, Interval: 1},
-	}); err != nil {
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 90, 1); err != nil {
 		t.Fatal(err)
 	}
-	manager.StopFanDebugAuto()
-	if manager.fanDebugAuto != nil {
-		t.Fatal("stop should clear the auto test")
+	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0)
+	if manager.fanDebugAuto.entries["it8613:hwmon3:fan1"].Running {
+		t.Fatal("stop should clear running flag")
 	}
 }
 
@@ -2051,7 +2046,7 @@ func TestFanDebugAutoPerFanIndependence(t *testing.T) {
 		"it8613:hwmon3:fan1": {Step: 60, Interval: 1},
 		"it8613:hwmon3:fan2": {Step: 5, Interval: 1},
 	}
-	if err := manager.StartFanDebugAuto(entries); err != nil {
+	if err := manager.StartFanDebugAutoBatch(entries); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2600 * time.Millisecond)
@@ -2069,6 +2064,8 @@ func TestFanDebugAutoPerFanIndependence(t *testing.T) {
 		t.Fatalf("slow fan should still be ramping (step 5/s), got %+v", f2)
 	}
 }
+
+// 参数校验:步进 0/超上限、未接管风扇的条目均应拒绝。
 func TestFanDebugValidation(t *testing.T) {
 	manager := newFanDebugTestManager(t)
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
@@ -2078,16 +2075,16 @@ func TestFanDebugValidation(t *testing.T) {
 		id   string
 		step int
 	}{
-		{"it8613:hwmon3:fan1", 0}, {"it8613:hwmon3:fan1", 91},
+		{"it8613:hwmon3:fan1", 0}, {"it8613:hwmon3:fan1", 101},
 	} {
 		entries := map[string]fanDebugAutoEntry{test.id: {Step: test.step, Interval: 10}}
-		if err := manager.StartFanDebugAuto(entries); err == nil {
-			t.Fatalf("StartFanDebugAuto(step=%d) should fail", test.step)
+		if err := manager.StartFanDebugAutoBatch(entries); err == nil {
+			t.Fatalf("StartFanDebugAutoBatch(step=%d) should fail", test.step)
 		}
 	}
 	// 未接管任何风扇时自动测试拒绝
 	entries := map[string]fanDebugAutoEntry{"ghost:fan9": {Step: 30, Interval: 10}}
-	if err := manager.StartFanDebugAuto(entries); err == nil {
+	if err := manager.StartFanDebugAutoBatch(entries); err == nil {
 		t.Fatal("auto test without taken-over fans should fail")
 	}
 }
@@ -2139,7 +2136,7 @@ func TestHandleFansDebugEndpoints(t *testing.T) {
 	if rec := call(http.MethodPost, "/api/fans/debug/auto", `{"fans":[{"id":"it8613:hwmon3:fan1","step":10,"interval":1}]}`, true); rec.Code != http.StatusOK {
 		t.Fatalf("auto status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if rec := call(http.MethodPost, "/api/fans/debug/auto/stop", "", true); rec.Code != http.StatusOK {
-		t.Fatalf("auto stop status=%d", rec.Code)
+	if rec := call(http.MethodPost, "/api/fans/debug/auto/stop", `{"id":"it8613:hwmon3:fan1"}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("auto stop status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
