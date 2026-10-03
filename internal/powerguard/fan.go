@@ -1160,6 +1160,7 @@ type FanDebugFan struct {
 	Mode         int64  `json:"mode"`
 	TakenOver    bool   `json:"taken_over"`
 	DebugPercent int    `json:"debug_percent,omitempty"`
+	DebugUnit    string `json:"debug_unit,omitempty"`            // 该风扇调试值的单位(percent/pwm),未设置按 percent
 	AutoStep     int    `json:"auto_step,omitempty"`             // 自动递增:每 Interval 秒 +Step
 	AutoInterval int    `json:"auto_interval_seconds,omitempty"` // 自动递增间隔(秒)
 	AutoDone     bool   `json:"auto_done,omitempty"`             // 已递增到 100%
@@ -1207,6 +1208,9 @@ func (m *Manager) FanDebugState() FanDebugState {
 				item.AutoInterval = entry.Interval
 				item.AutoDone = entry.Done
 			}
+		}
+		if unit, ok := m.fanDebugUnits[fan.ID]; ok {
+			item.DebugUnit = unit
 		}
 		if percent, ok := m.fanDebugTakenOver[fan.ID]; ok {
 			item.TakenOver = true

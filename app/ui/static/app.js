@@ -2535,7 +2535,6 @@ function renderFanDebug(state) {
     const takeBox = document.createElement('input');
     takeBox.type = 'checkbox';
     takeBox.dataset.fanId = fan.id;
-    takeBox.dataset.kind = 'take';
     takeBox.checked = fan.taken_over;
     takeBox.setAttribute('aria-label', `接管 ${fan.id}`);
     takeBox.addEventListener('change', () => applyFanTakeover(fan.id, takeBox.checked));
@@ -2551,11 +2550,13 @@ function renderFanDebug(state) {
     const mode = document.createElement('td');
     mode.textContent = fan.mode === 1 ? '手动' : fan.mode === 0 ? '全速' : `自动(${fan.mode})`;
     const debugCell = document.createElement('td');
+    const stepCell = document.createElement('td');
+    const intervalCell = document.createElement('td');
     if (fan.taken_over) {
       const unit = document.createElement('select');
       unit.className = 'fan-debug-unit';
       unit.dataset.fanId = fan.id;
-      unit.dataset.kind = 'unit';
+      unit.dataset.kind = 'auto-unit';
       for (const pair of [['percent', '转速 %'], ['pwm', 'PWM']]) {
         const option = document.createElement('option');
         option.value = pair[0];
@@ -2566,41 +2567,42 @@ function renderFanDebug(state) {
       const input = document.createElement('input');
       input.type = 'number';
       input.min = '0';
-      input.max = unit.value === 'pwm' ? '255' : '100';
+      input.max = fan.debug_unit === 'pwm' ? '255' : '100';
       input.step = '1';
       input.inputMode = 'numeric';
       input.className = 'fan-debug-pwm-input';
       input.dataset.fanId = fan.id;
-      input.dataset.kind = 'pwm';
       input.value = pending[fan.id + ':pwm'] ?? String(fan.debug_percent ?? 0);
       input.setAttribute('aria-label', `调试转速 ${fan.id}`);
       unit.addEventListener('change', () => {
+        pending[fan.id + ':unit'] = unit.value;
         input.max = unit.value === 'pwm' ? '255' : '100';
+        stepInput.max = input.max;
+        // 切换单位时按比例换算已填的非零值（50% ↔ 128）
+        const v = Number(input.value);
+        if (Number.isFinite(v) && v > 0) {
+          input.value = String(Math.round(unit.value === 'pwm' ? (v * 255) / 100 : (v * 100) / 255));
+        }
+        const s = Number(stepInput.value);
+        if (Number.isFinite(s) && s > 0) {
+          stepInput.value = String(Math.round(unit.value === 'pwm' ? (s * 255) / 100 : (s * 100) / 255));
+        }
       });
       const apply = document.createElement('button');
       apply.type = 'button';
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
       apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
-      debugCell.className = 'fan-debug-pwm-cell';
-      debugCell.append(unit, input, apply);
-    }
-    const stepCell = document.createElement('td');
-    const intervalCell = document.createElement('td');
-    if (fan.taken_over) {
       const stepInput = document.createElement('input');
       stepInput.type = 'number';
       stepInput.min = '1';
-      stepInput.max = '90';
+      stepInput.max = fan.debug_unit === 'pwm' ? '255' : '100';
       stepInput.step = '1';
       stepInput.inputMode = 'numeric';
       stepInput.className = 'fan-debug-auto-input';
       stepInput.dataset.fanId = fan.id;
-      stepInput.dataset.kind = 'step';
       stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
-      stepInput.disabled = fan.auto_done;
       stepInput.setAttribute('aria-label', `递增转速 ${fan.id}`);
-      stepCell.append(stepInput);
       const intervalInput = document.createElement('input');
       intervalInput.type = 'number';
       intervalInput.min = '1';
@@ -2609,19 +2611,13 @@ function renderFanDebug(state) {
       intervalInput.inputMode = 'numeric';
       intervalInput.className = 'fan-debug-auto-input';
       intervalInput.dataset.fanId = fan.id;
-      intervalInput.dataset.kind = 'interval';
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
-      intervalInput.disabled = fan.auto_done;
       intervalInput.setAttribute('aria-label', `递增间隔 ${fan.id}`);
+      debugCell.append(unit, input, apply);
+      stepCell.append(stepInput);
       intervalCell.append(intervalInput);
-      if (fan.auto_done) {
-        const done = document.createElement('span');
-        done.textContent = '✓';
-        done.className = 'fan-debug-done';
-        stepCell.append(done);
-      }
     }
-    row.append(takeCell, name, rpm, pwm, mode, debugCell, stepCell, intervalCell);
+    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell);
     body.append(row);
   });
   if (state.emergency) {
