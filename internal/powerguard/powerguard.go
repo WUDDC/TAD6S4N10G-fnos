@@ -63,9 +63,54 @@ type Config struct {
 	ReapplySeconds int               `json:"reapply_seconds"`
 	Fan            FanConfig         `json:"fan"`
 	GPIO           GPIOConfig        `json:"gpio"`
-	History        HistoryConfig     `json:"history"`                 // 历史图表：采样开关与数据库大小上限
+	History        HistoryConfig     `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
+	Log            LogConfig         `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	UIPrefs        UIPrefsConfig     `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+}
+
+// UIPrefsConfig 纯界面偏好，与功能配置分开存放：历史/风扇等保存接口整段
+// 替换各自配置，混进去的界面偏好会被误覆盖。零值表示未设置。
+type UIPrefsConfig struct {
+	HistoryRangeHours float64 `json:"history_range_hours,omitempty"` // 历史温度时间范围档位（小时）
+}
+
+// LogConfig 运行日志的大小设置：与历史数据库大小上限解耦。日志体量小，
+// 阈值应小而灵敏——共用大上限会让清理在 1024M 档形同虚设（刷屏时日志
+// 可堆到 2×上限才收敛）。
+type LogConfig struct {
+	MaxSizeMB int64 `json:"max_size_mb"`
+}
+
+const (
+	logDefaultMaxSizeMB = 16
+	logMinMaxSizeMB     = 1
+	logMaxMaxSizeMB     = 256
+)
+
+func DefaultLogConfig() LogConfig {
+	return LogConfig{MaxSizeMB: logDefaultMaxSizeMB}
+}
+
+// ClampLogMaxSize 把日志大小上限限制在合理区间，配置文件里的非法值静默归位。
+func ClampLogMaxSize(maxSizeMB int64) int64 {
+	if maxSizeMB < logMinMaxSizeMB {
+		return logMinMaxSizeMB
+	}
+	if maxSizeMB > logMaxMaxSizeMB {
+		return logMaxMaxSizeMB
+	}
+	return maxSizeMB
+}
+
+// ClampUIHistoryRangeHours 界面档位只做范围钳制（0.5 小时–30 天），
+// 区间外的值按未设置（0）处理；合法档位集合由前端维护，后端不感知。
+func ClampUIHistoryRangeHours(hours float64) float64 {
+	if hours < 0.5 || hours > 720 {
+		return 0
+	}
+	return hours
 }
 
 type GlobalConfig struct {
@@ -171,6 +216,7 @@ type Manager struct {
 	storageStatus StorageStatus
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
+	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
 }
 
 func DetectProfile(model string) (Profile, error) {
@@ -195,11 +241,14 @@ func DefaultConfig(profile Profile) Config {
 	return Config{
 		Enabled: true, PL1W: profile.DefaultPL1, PL2W: profile.DefaultPL2,
 		ReapplySeconds: 30, Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(),
-		History: DefaultHistoryConfig(),
+		History: DefaultHistoryConfig(), Log: DefaultLogConfig(),
 	}
 }
 
-// SaveHistoryConfig 只保存历史图表配置（采样开关与大小上限），不触碰功耗/风扇状态。
+// SaveHistoryConfig 只保存历史温度配置（采样开关、大小上限、保留天数与长期
+// 记录），不触碰功耗/风扇状态。保留期与长期记录的即时生效由 HTTP 层调用
+// SyncSettings 完成。长期记录目录在保存时验证：可创建 + 可写——配置坏了当场
+// 报错，好过运行期才发现归档一直失败。
 func (m *Manager) SaveHistoryConfig(history HistoryConfig) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -210,6 +259,21 @@ func (m *Manager) SaveHistoryConfig(history HistoryConfig) error {
 	}
 	cfg.History = history
 	normalizeConfig(&cfg)
+	if cfg.History.ArchiveEnabled {
+		dir := filepath.Clean(strings.TrimSpace(cfg.History.ArchiveDir))
+		if !filepath.IsAbs(dir) || dir == "." || dir == string(filepath.Separator) {
+			return errors.New("长期记录保存位置必须是绝对路径（如 /vol1/1000/长期记录）")
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("长期记录目录不可创建: %w", err)
+		}
+		probe := filepath.Join(dir, ".tad-archive-probe")
+		if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+			return fmt.Errorf("长期记录目录不可写: %w", err)
+		}
+		_ = os.Remove(probe)
+		cfg.History.ArchiveDir = dir
+	}
 	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
 		m.lastError = err.Error()
 		return err
@@ -227,6 +291,38 @@ func (m *Manager) HistorySettings() HistoryConfig {
 		return DefaultHistoryConfig()
 	}
 	return cfg.History
+}
+
+// SaveLogConfig 只保存运行日志的大小设置，不触碰其它配置；非法值由
+// normalizeConfig 静默钳制。轮转循环每 10 分钟读一次实时值，保存后最迟
+// 一个周期生效。
+func (m *Manager) SaveLogConfig(logCfg LogConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.Log = logCfg
+	normalizeConfig(&cfg)
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
+// LogSettings 供日志轮转循环读取大小上限；读文件失败按默认值降级。
+func (m *Manager) LogSettings() LogConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return DefaultLogConfig()
+	}
+	return cfg.Log
 }
 
 func (m *Manager) CPUModel() (string, error) {
@@ -401,6 +497,25 @@ func (m *Manager) SaveSensorSettings(names, groups map[string]string) error {
 	}
 	cfg.SensorNames = cleanedNames
 	cfg.SensorGroups = cleanedGroups
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	return nil
+}
+
+// SaveUIPrefs 只保存前端界面偏好（当前：历史温度范围档位），一次写盘；
+// 档位区间外按未设置处理，静默清零。
+func (m *Manager) SaveUIPrefs(prefs UIPrefsConfig) error {
+	prefs.HistoryRangeHours = ClampUIHistoryRangeHours(prefs.HistoryRangeHours)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	cfg.UIPrefs = prefs
 	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
 		m.lastError = err.Error()
 		return err
@@ -985,10 +1100,22 @@ var knownNICDrivers = map[string]bool{
 	"brcmfmac": true, "iwlwifi": true, "mt7921e": true, "rtw88_8822ce": true, "rtw89_pci": true,
 }
 
+// knownUSBTempDrivers：外置 USB 温度传感器在内核侧有 hwmon 驱动时注册的
+// 芯片名。主线内核目前没有 TEMPer 系列的驱动，常见的是 out-of-tree 模块
+// （如 ElementalWarrior/hwmon-temper，注册名 "temper"）。这些芯片经由
+// extraTemperatures 的通用收集路径进入历史传感器列表（标签 "temper:temp1"
+// 之类），归类固定「其它」，但改名（SensorNames）与父类归属覆盖
+// （SensorGroups）链路对它们与普通 hwmon 传感器完全一致，无需特殊处理。
+var knownUSBTempDrivers = map[string]bool{
+	"temper": true, // hwmon-temper out-of-tree 模块（PCsensor TEMPer USB stick）
+}
+
 // extraTemperatures 收集 coretemp 之外的全部 hwmon 温度（网卡、主板 Super IO、
 // ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
 // 硬盘芯片（nvme/drivetemp）除外：盘温只走槽位采样（history_slots），
 // hwmon 读数与 SATA/NVMe 组的单盘曲线重复。
+// 末尾并入无内核驱动的 USB 温度计（TEMPer 系列，key 前缀 "usb:"），同样
+// 归「其它」组，共享改名与父类归属覆盖链路。
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
@@ -1019,6 +1146,9 @@ func (m *Manager) extraTemperatures() []Temperature {
 			}
 			result = append(result, Temperature{Label: fmt.Sprintf("%s:%s", prefix, label), Celsius: float64(value) / 1000})
 		}
+	}
+	for _, reading := range m.usbTemperatureReadings() {
+		result = append(result, Temperature{Label: reading.Key, Celsius: reading.Celsius})
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
 	return result

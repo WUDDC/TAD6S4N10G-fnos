@@ -1036,9 +1036,13 @@ body.modal-open { overflow: hidden; }
 .curve-chart-nvme .curve-node-control.selected,
 .curve-chart-nvme .curve-node-label.selected { fill: #a25bd7; }
 
-/* ---- 历史图表 ---- */
+/* ---- 历史温度 ---- */
 .history-chart { cursor: default; touch-action: auto; }
-.history-crosshair-line { stroke: var(--muted); stroke-dasharray: 4 4; }
+.history-crosshair-line {
+  stroke: var(--muted);
+  stroke-dasharray: 4 4;
+  stroke-width: 1.5px; /* 配合 non-scaling-stroke：viewBox 拉伸时线宽保持 1.5 屏幕像素 */
+}
 .history-tooltip {
   position: fixed;
   z-index: 120;
@@ -1187,38 +1191,91 @@ body.modal-open { overflow: hidden; }
 }
 .history-card { margin-top: 16px; }
 .history-toggle { margin: 10px 0 0; }
-.history-size-limit {
-  display: flex;
-  align-items: flex-end;
-  gap: 10px;
+.history-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-top: 10px;
 }
-.history-size-field { margin: 0; flex: 0 1 180px; }
+.history-actions { margin-top: 12px; }
+/* 长期记录：开关与保存位置（绝对路径文本框）整行排布 */
+.history-archive { display: grid; gap: 8px; margin-top: 12px; }
+.history-archive-dir input { width: 100%; }
 .history-limit-notice { margin-top: 10px; }
 .history-disabled-notice { color: var(--warning, #b8860b); }
-@media (max-width: 599px) {
-  .history-size-limit { flex-wrap: wrap; align-items: stretch; }
-  .history-size-field { flex: 1 1 100%; }
+.history-range { display: inline-flex; flex-wrap: wrap; align-items: center; max-width: 100%; gap: 6px; }
+/* 时间范围拖动条：值标签在上、滑杆居中、刻度文字在下（半小时一格） */
+.history-range-slider {
+  display: flex;
+  flex-direction: column;
+  width: 280px;
+  min-width: 240px;
+  max-width: 100%;
 }
-.history-range { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 6px; }
-.history-range-btn {
-  flex: 0 0 auto;
+/* 值标签跟随拇指：--thumb-pct 由 JS 写入（CSS 变量，非 style 属性，CSP 安全），
+   translateX(-50%) 以标签自身宽度居中对准拇指；百分比由 JS 夹在 6%–94%，
+   标签不会溢出滑杆容器 */
+.history-range-value {
+  position: relative;
+  left: var(--thumb-pct, 92%);
+  transform: translateX(-50%);
   white-space: nowrap;
-  padding: 4px 12px;
-  border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text-secondary);
   font-size: 12px;
   line-height: 1.4;
+  font-weight: 650;
+  color: var(--text-secondary);
+}
+.history-range-input {
+  width: 100%;
+  height: 20px;
+  margin: 2px 0 0;
+  accent-color: var(--primary);
   cursor: pointer;
 }
-.history-range-btn:hover { border-color: var(--primary); color: var(--primary); }
-.history-range-btn.active {
-  border-color: var(--primary);
-  background: var(--primary-soft);
-  color: var(--primary);
-  font-weight: 650;
+/* 刻度摆放在各挡位的吸附位上（百分比 = 吸附位/滑杆行程），拇指停靠位与
+   刻度严格对齐；layout-N 由 JS 按保存天数切换（7天/30天 挡位显隐） */
+.history-range-ticks {
+  position: relative;
+  height: 18px;
+  margin: 2px 7px 0; /* 7px≈半个拇指宽：让首尾刻度对齐拇指中心的实际行程 */
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--muted);
+}
+.history-range-tick { position: absolute; top: 0; white-space: nowrap; transform: translateX(-50%); text-align: center; }
+.history-range-tick::before {
+  content: '';
+  display: block;
+  width: 1px;
+  height: 4px;
+  margin: 0 auto 2px;
+  background: var(--line-strong);
+}
+.history-range-tick[data-tick="cont-min"] { left: 0; transform: none; text-align: left; }
+.history-range-tick[data-tick="cont-min"]::before { margin-left: 0; }
+/* layout-7：挡位 6时/12时/24时/7天/30天，滑杆 max=末挡停靠位 940（无极区 400
+   + 4×120 + 60 尾段），挡位停靠位 = 400 + i×120 + 60 → 460/580/700/820/940 */
+.history-range-ticks.layout-7 [data-tick="cont-max"] { left: 42.6%; }
+.history-range-ticks.layout-7 [data-tick="6h"] { left: 48.9%; }
+.history-range-ticks.layout-7 [data-tick="12h"] { left: 61.7%; }
+.history-range-ticks.layout-7 [data-tick="24h"] { left: 74.5%; }
+.history-range-ticks.layout-7 [data-tick="7d"] { left: 87.2%; }
+.history-range-ticks.layout-7 [data-tick="30d"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-7 [data-tick="30d"]::before { margin-right: 0; }
+/* layout-6：挡位 6时/12时/24时/7天（保存天数 7–29），max=820 */
+.history-range-ticks.layout-6 [data-tick="cont-max"] { left: 48.8%; }
+.history-range-ticks.layout-6 [data-tick="6h"] { left: 56.1%; }
+.history-range-ticks.layout-6 [data-tick="12h"] { left: 70.7%; }
+.history-range-ticks.layout-6 [data-tick="24h"] { left: 85.4%; }
+.history-range-ticks.layout-6 [data-tick="7d"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-6 [data-tick="7d"]::before { margin-right: 0; }
+/* layout-5：挡位 6时/12时/24时（保存天数 <7），max=700 */
+.history-range-ticks.layout-5 [data-tick="cont-max"] { left: 57.1%; }
+.history-range-ticks.layout-5 [data-tick="6h"] { left: 65.7%; }
+.history-range-ticks.layout-5 [data-tick="12h"] { left: 82.9%; }
+.history-range-ticks.layout-5 [data-tick="24h"] { left: 100%; transform: translateX(-100%); text-align: right; }
+.history-range-ticks.layout-5 [data-tick="24h"]::before { margin-right: 0; }
+@media (max-width: 599px) {
+  .history-range { width: 100%; }
+  .history-range-slider { flex: 1 1 100%; width: 100%; min-width: 0; }
 }
 
 .curve-toolbar {
@@ -1939,3 +1996,4 @@ button.danger {
 [data-theme="dark"] .curve-slot-option.storage-warning { border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .status-table .storage-present td:nth-child(2) { color: #6cc0e8; }
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }
+

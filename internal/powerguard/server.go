@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net"
 	"net/http"
@@ -24,6 +25,7 @@ type Server struct {
 	SocketGroup string
 	Logger      *log.Logger
 	History     *HistoryStore
+	LogPath     string // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
 }
 
 const configRequestMaxBytes = 3 << 20
@@ -81,6 +83,8 @@ func (s *Server) ListenAndServe() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
+	mux.HandleFunc("/api/history/clear", s.handleHistoryClear)
+	mux.HandleFunc("/api/history/archive", s.handleHistoryArchive)
 	mux.HandleFunc("/api/history/export/sql", s.handleHistoryExportSQL)
 	mux.HandleFunc("/api/history/export/csv", s.handleHistoryExportCSV)
 	mux.HandleFunc("/api/debug/report", s.handleDebugReport)
@@ -90,6 +94,10 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
 	mux.HandleFunc("/api/config/history", s.handleHistoryConfig)
 	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
+	mux.HandleFunc("/api/config/ui-prefs", s.handleUIPrefsConfig)
+	mux.HandleFunc("/api/config/log", s.handleLogConfig)
+	mux.HandleFunc("/api/log/clear", s.handleLogClear)
+	mux.HandleFunc("/api/log/export", s.handleLogExport)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -251,6 +259,26 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.Status())
 }
 
+// handleUIPrefsConfig 保存前端界面偏好（当前：历史温度范围档位）；
+// 读取随 /api/status 的 config.ui_prefs 一起下发，无需单独 GET。
+func (s *Server) handleUIPrefsConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		HistoryRangeHours float64 `json:"history_range_hours"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
 func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
@@ -289,7 +317,129 @@ func (s *Server) handleHistoryConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 保存成功后立即同步保留期与长期记录设置并清理一次（缩短保留期当场生效），
+	// 失败只记日志：配置本身已经落盘，采样循环的下一次 PruneIfNeeded 也会跟上。
+	if s.History != nil {
+		if err := s.History.SyncSettings(s.Manager.HistorySettings()); err != nil {
+			s.Logger.Printf("history settings sync failed: %v", err)
+		}
+	}
 	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+// handleHistoryArchive 手动补一次长期记录冲刷（清空数据库前前端会先调用，
+// 让未冲刷的缓冲先落到归档盘，之后无论确认还是取消都不丢该归档的数据）。
+// 长期记录未开启时是空操作，同样返回 ok。
+func (s *Server) handleHistoryArchive(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	if s.History == nil {
+		writeError(w, http.StatusServiceUnavailable, "历史数据存储不可用")
+		return
+	}
+	flushed, err := s.History.FlushArchive(time.Now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "长期记录冲刷失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true, "flushed": flushed})
+}
+
+// handleLogConfig 保存运行日志的大小设置（与历史数据库大小上限解耦）。
+func (s *Server) handleLogConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg LogConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SaveLogConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+// handleLogClear 清空运行日志：截断主文件并删除上一代备份。显式破坏操作，
+// 由前端二次确认；未写入文件（stderr 模式）时是空操作。截断后留一条说明行。
+func (s *Server) handleLogClear(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	if s.LogPath == "" {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if err := os.Truncate(s.LogPath, 0); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		writeError(w, http.StatusInternalServerError, "清空日志失败: "+err.Error())
+		return
+	}
+	for _, suffix := range []string{".1", ".1.tmp"} {
+		if err := os.Remove(s.LogPath + suffix); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			writeError(w, http.StatusInternalServerError, "删除日志备份失败: "+err.Error())
+			return
+		}
+	}
+	s.Logger.Printf("log cleared by user")
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleLogExport 下载运行日志（上一代备份在前、当前日志在后，时间顺序天然
+// 衔接）。流式输出，不做整体加载；未写入文件时返回 404。
+func (s *Server) handleLogExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if s.LogPath == "" {
+		writeError(w, http.StatusNotFound, "日志未写入文件")
+		return
+	}
+	if _, err := os.Stat(s.LogPath); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "暂无日志文件")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "读取日志失败: "+err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="tad-module-log.txt"`)
+	w.WriteHeader(http.StatusOK)
+	for _, path := range []string{s.LogPath + ".1", s.LogPath} {
+		file, err := os.Open(path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return // 头已发出，中途失败只能断流
+		}
+		_, err = io.Copy(w, file)
+		file.Close()
+		if err != nil {
+			return
+		}
+	}
+}
+
+// handleHistoryClear 清空历史数据库：四张表全删 + VACUUM 回收空间，
+// schema 与配置保留，响应 {"ok": true}。
+func (s *Server) handleHistoryClear(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	if s.History == nil {
+		writeError(w, http.StatusServiceUnavailable, "历史数据存储不可用")
+		return
+	}
+	if err := s.History.Clear(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "清空历史数据失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {

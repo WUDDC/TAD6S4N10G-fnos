@@ -147,6 +147,7 @@ func serve(args []string) error {
 		return err
 	}
 	logger := log.Default()
+	var logFile *os.File
 	if *logPath != "" {
 		if err := os.MkdirAll(filepath.Dir(*logPath), 0o700); err != nil {
 			return err
@@ -155,7 +156,8 @@ func serve(args []string) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
+		defer func() { _ = logFile.Close() }()
+		logFile = file
 		logger = log.New(file, "", log.LstdFlags|log.LUTC)
 	}
 	manager := &powerguard.Manager{Root: *root, ConfigPath: *config, StatePath: *state, Version: version}
@@ -180,12 +182,26 @@ func serve(args []string) error {
 	}
 	if history != nil {
 		defer history.Close()
+		history.SetLogger(logger)
+		// 启动即按配置同步保留期与长期记录并清理一次（构造函数只用了默认值）
+		if err := history.SyncSettings(cfg.History); err != nil {
+			logger.Printf("history settings sync (prune/archive) failed: %v", err)
+		}
+		manager.ProbeUSBTemperatureSensors(logger)
 		go powerguard.HistoryLoop(ctx, manager, logger, history)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath}
 		done <- server.ListenAndServe()
 	}()
+	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
+	// 超限后内容另存 .1 并就地截断。读取走 manager 的实时配置，用户改上限
+	// 后最迟一个检查周期生效。
+	if logFile != nil {
+		go powerguard.LogRotateLoop(ctx, logger, *logPath, logFile, func() int64 {
+			return manager.LogSettings().MaxSizeMB << 20
+		})
+	}
 	go reapplyLoop(ctx, manager, logger)
 	go fanLoop(ctx, manager, logger)
 	go storageLoop(ctx, manager, logger)

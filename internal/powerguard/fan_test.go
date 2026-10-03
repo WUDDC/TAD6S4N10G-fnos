@@ -195,17 +195,17 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 }
 
 func TestNormalizeConfigPreservesExplicitlyDisabledStorageMonitoring(t *testing.T) {
-	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig()}
+	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(), Log: DefaultLogConfig()}
 	cfg.Fan.HDDSlotIDs = []string{}
 	cfg.Fan.NVMeSlotIDs = []string{}
-	cfg.History = HistoryConfig{Enabled: false, MaxSizeMB: 32}
+	cfg.History = HistoryConfig{Enabled: false, MaxSizeMB: 32, RetentionDays: historyDefaultRetentionDays}
 	if normalizeConfig(&cfg) {
 		t.Fatal("normalized config unexpectedly changed")
 	}
 	if len(cfg.Fan.HDDSlotIDs) != 0 || len(cfg.Fan.NVMeSlotIDs) != 0 {
 		t.Fatalf("disabled storage monitoring was re-enabled: HDD=%v NVMe=%v", cfg.Fan.HDDSlotIDs, cfg.Fan.NVMeSlotIDs)
 	}
-	if cfg.History != (HistoryConfig{Enabled: false, MaxSizeMB: 32}) {
+	if cfg.History != (HistoryConfig{Enabled: false, MaxSizeMB: 32, RetentionDays: historyDefaultRetentionDays}) {
 		t.Fatalf("explicit history settings were overwritten: %+v", cfg.History)
 	}
 }
