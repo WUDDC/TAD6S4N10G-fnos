@@ -2552,10 +2552,21 @@ function renderFanDebug(state) {
     mode.textContent = fan.mode === 1 ? '手动' : fan.mode === 0 ? '全速' : `自动(${fan.mode})`;
     const debugCell = document.createElement('td');
     if (fan.taken_over) {
+      const unit = document.createElement('select');
+      unit.className = 'fan-debug-unit';
+      unit.dataset.fanId = fan.id;
+      unit.dataset.kind = 'unit';
+      for (const pair of [['percent', '转速 %'], ['pwm', 'PWM']]) {
+        const option = document.createElement('option');
+        option.value = pair[0];
+        option.textContent = pair[1];
+        unit.append(option);
+      }
+      unit.value = pending[fan.id + ':unit'] ?? fan.debug_unit ?? 'percent';
       const input = document.createElement('input');
       input.type = 'number';
       input.min = '0';
-      input.max = '100';
+      input.max = unit.value === 'pwm' ? '255' : '100';
       input.step = '1';
       input.inputMode = 'numeric';
       input.className = 'fan-debug-pwm-input';
@@ -2563,13 +2574,16 @@ function renderFanDebug(state) {
       input.dataset.kind = 'pwm';
       input.value = pending[fan.id + ':pwm'] ?? String(fan.debug_percent ?? 0);
       input.setAttribute('aria-label', `调试转速 ${fan.id}`);
+      unit.addEventListener('change', () => {
+        input.max = unit.value === 'pwm' ? '255' : '100';
+      });
       const apply = document.createElement('button');
       apply.type = 'button';
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
-      apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value)));
+      apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
       debugCell.className = 'fan-debug-pwm-cell';
-      debugCell.append(input, apply);
+      debugCell.append(unit, input, apply);
     }
     const stepCell = document.createElement('td');
     const intervalCell = document.createElement('td');
@@ -2607,7 +2621,7 @@ function renderFanDebug(state) {
         stepCell.append(done);
       }
     }
-    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell);
+    row.append(takeCell, name, rpm, pwm, mode, debugCell, stepCell, intervalCell);
     body.append(row);
   });
   if (state.emergency) {
@@ -2642,10 +2656,12 @@ $('fan-debug-auto-start').addEventListener('click', async () => {
     if (!box?.checked) return;
     const stepInput = tr.querySelector('.fan-debug-auto-input[data-kind="step"]');
     const intervalInput = tr.querySelector('.fan-debug-auto-input[data-kind="interval"]');
+    const unitSelect = tr.querySelector('.fan-debug-unit[data-kind="auto-unit"]');
     payloadFans.push({
       id: box.dataset.fanId,
       step: Number(stepInput?.value) || 5,
       interval: Number(intervalInput?.value) || 10,
+      unit: unitSelect?.value === 'pwm' ? 'pwm' : 'percent',
     });
   });
   if (!payloadFans.length) {
@@ -2746,15 +2762,16 @@ async function applyFanTakeover(id, taken) {
   }
 }
 
-async function applyFanDebugPWM(id, percent) {
-  if (!Number.isFinite(percent) || percent < 0 || percent > 100) {
-    fanDebugStatus(`调试转速需在 0–100 之间。`, true);
+async function applyFanDebugPWM(id, value, unit) {
+  const max = unit === 'pwm' ? 255 : 100;
+  if (!Number.isFinite(value) || value < 0 || value > max) {
+    fanDebugStatus(`调试值需在 0–${max} 之间。`, true);
     return;
   }
   setBusy(true);
   try {
-    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, percent }) }));
-    fanDebugStatus(`已应用 ${id} 转速 ${percent}%。`);
+    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ id, value, unit }) }));
+    fanDebugStatus(`已应用 ${id} ${unit === 'pwm' ? 'PWM' : '转速'} ${value}。`);
   } catch (error) {
     fanDebugStatus(`应用失败：${error.message}`, true);
   } finally {
