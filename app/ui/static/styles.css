@@ -1210,6 +1210,8 @@ body.modal-open { overflow: hidden; }
    路径虽长但输入框内可横向滚动，通栏宽视觉失衡 */
 .history-archive { display: grid; gap: 8px; margin-top: 12px; }
 .history-archive-dir input { width: 100%; }
+/* 浏览按钮禁止收缩与换行,否则被 width:100% 的输入框挤成竖排文字 */
+.history-archive-row button { flex: 0 0 auto; white-space: nowrap; }
 .history-archive-row { display: flex; gap: 8px; align-items: stretch; max-width: 520px; }
 .history-limit-notice { margin-top: 10px; }
 .history-disabled-notice { color: var(--warning, #b8860b); }
