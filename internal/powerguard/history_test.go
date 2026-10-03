@@ -1998,7 +1998,7 @@ func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 基准=手动 20%,每秒 +60%:20 → 80 → 100 停
-	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 60, 1); err != nil {
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 60, 1, "percent"); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(2600 * time.Millisecond)
@@ -2017,13 +2017,68 @@ func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
 	if strings.TrimSpace(string(pwm1)) != "255" {
 		t.Fatalf("final pwm should be 255 (100%%), got %s", pwm1)
 	}
-	// 手动停止:运行中的测试可停
-	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 90, 1); err != nil {
+	// 手动停止:跑完的风扇可重新开启;停止保留步进/间隔便于原样重开
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 90, 1, "percent"); err != nil {
 		t.Fatal(err)
 	}
-	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0)
-	if manager.fanDebugAuto.entries["it8613:hwmon3:fan1"].Running {
+	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0, "")
+	entry := manager.fanDebugAuto.entries["it8613:hwmon3:fan1"]
+	if entry.Running {
 		t.Fatal("stop should clear running flag")
+	}
+	if entry.Step != 90 || entry.Interval != 1 {
+		t.Fatalf("stop should keep step/interval for restart, got %+v", entry)
+	}
+}
+
+// 跑到上限后再开:基准归零重跑,而不是开着立刻又完成。
+func TestFanDebugAutoRestartFromBottomAfterDone(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 100, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	// 基准=100(已在上限):开启应归零,下一次递增 0+60=60 继续跑
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 60, 1, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if base := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; base != 0 {
+		t.Fatalf("base at unit max should reset to 0 on restart, got %d", base)
+	}
+	state := manager.FanDebugState()
+	if !state.AutoRunning {
+		t.Fatal("restarted auto should be running")
+	}
+	if state.Fans[0].AutoDone {
+		t.Fatal("restart from bottom should not be done immediately")
+	}
+	manager.SetFanDebugAuto("it8613:hwmon3:fan1", false, 0, 0, "")
+}
+
+// 释放接管应同时终止该风扇的自动递增:条目删除、状态行不再计入。
+func TestFanDebugTakeoverReleaseStopsAuto(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 20, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugAuto("it8613:hwmon3:fan1", true, 10, 5, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", false); err != nil {
+		t.Fatal(err)
+	}
+	state := manager.FanDebugState()
+	fan := state.Fans[0]
+	if fan.AutoRunning || fan.AutoDone || fan.AutoStep != 0 {
+		t.Fatalf("release should drop the fan's auto entry, got %+v", fan)
+	}
+	if state.AutoRunning {
+		t.Fatal("state.auto_running should be false after release")
 	}
 }
 
@@ -2062,6 +2117,9 @@ func TestFanDebugAutoPerFanIndependence(t *testing.T) {
 	}
 	if f2.AutoDone == true || f2.PWMPercent <= 50 {
 		t.Fatalf("slow fan should still be ramping (step 5/s), got %+v", f2)
+	}
+	if !state.AutoRunning {
+		t.Fatal("state.auto_running should stay true while the slow fan is still ramping")
 	}
 }
 
@@ -2133,7 +2191,7 @@ func TestHandleFansDebugEndpoints(t *testing.T) {
 	if got := manager.fanDebugTakenOver["it8613:hwmon3:fan1"]; got != 77 {
 		t.Fatalf("percent=%d, want 77", got)
 	}
-	if rec := call(http.MethodPost, "/api/fans/debug/auto", `{"fans":[{"id":"it8613:hwmon3:fan1","step":10,"interval":1}]}`, true); rec.Code != http.StatusOK {
+	if rec := call(http.MethodPost, "/api/fans/debug/auto", `{"fans":[{"id":"it8613:hwmon3:fan1","step":10,"interval":1,"unit":"percent"}]}`, true); rec.Code != http.StatusOK {
 		t.Fatalf("auto status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	if rec := call(http.MethodPost, "/api/fans/debug/auto/stop", `{"id":"it8613:hwmon3:fan1"}`, true); rec.Code != http.StatusOK {

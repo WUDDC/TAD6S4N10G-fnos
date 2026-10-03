@@ -486,8 +486,8 @@ func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAuto 自动递增测试：全部被接管风扇以各自的手动转速为基础,
-// 每 interval 秒统一 +step,到 100% 自动停止。
+// handleFansDebugAuto 按风扇启动自动递增:fans 列表逐个开启,每台风扇以各自的
+// 手动转速为基准,按各自 step/interval/unit 递增到单位上限自动完成。
 func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
@@ -497,6 +497,7 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 			ID       string `json:"id"`
 			Step     int    `json:"step"`
 			Interval int    `json:"interval"`
+			Unit     string `json:"unit"`
 		} `json:"fans"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
@@ -504,7 +505,7 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, fan := range payload.Fans {
-		if err := s.Manager.SetFanDebugAuto(fan.ID, true, fan.Step, fan.Interval); err != nil {
+		if err := s.Manager.SetFanDebugAuto(fan.ID, true, fan.Step, fan.Interval, fan.Unit); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -512,7 +513,7 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAutoStop 停止单个风扇的自动递增,保持当前转速。
+// handleFansDebugAutoStop 停止单个风扇的自动递增,保持当前转速,参数保留。
 func (s *Server) handleFansDebugAutoStop(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
@@ -524,7 +525,7 @@ func (s *Server) handleFansDebugAutoStop(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SetFanDebugAuto(payload.ID, false, 0, 0); err != nil {
+	if err := s.Manager.SetFanDebugAuto(payload.ID, false, 0, 0, ""); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

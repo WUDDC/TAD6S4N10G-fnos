@@ -974,6 +974,10 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		m.fanDebugTakenOver[id] = pwmToPercent(target.PWM)
 	} else {
 		delete(m.fanDebugTakenOver, id)
+		// 释放接管同时终止该风扇的自动递增:条目删除,行内开关随之复位
+		if m.fanDebugAuto != nil {
+			delete(m.fanDebugAuto.entries, id)
+		}
 	}
 	return nil
 }
@@ -1029,9 +1033,10 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 }
 
 // SetFanDebugAuto 单风扇自动递增的开/关:开启后以该风扇当前调试转速为基础,
-// 每 interval 秒 +step 递增到单位上限自动完成(停在 100%);关闭即停在当前转速。
-// 各风扇互相独立——一个风扇递增时另一个可以手动测试。
-func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds int) error {
+// 每 interval 秒 +step 递增到单位上限自动完成(停在上限);关闭即停在当前转速
+// 并保留步进/间隔,便于原样重新打开。各风扇互相独立——一个风扇递增时另一个
+// 可以手动测试。上次已跑到上限时再次开启会归零重跑。
+func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds int, unit string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.fanDebugAuto == nil {
@@ -1040,26 +1045,45 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 	if m.fanDebugAuto.entries == nil {
 		m.fanDebugAuto.entries = map[string]fanDebugAutoEntry{}
 	}
-	// 关闭总是允许(幂等);开启要求风扇已接管
+	if unit != "pwm" {
+		unit = "percent"
+	}
+	// 关闭总是允许(幂等);开启要求风扇已接管且参数在该单位范围内
 	if running {
 		if _, taken := m.fanDebugTakenOver[id]; !taken {
 			return fmt.Errorf("风扇 %s 未被接管,请先勾选接管", id)
 		}
-		if step < 1 {
-			return fmt.Errorf("风扇 %s 的递增转速需至少为 1", id)
+		if step < 1 || step > fanDebugUnitMax(unit) {
+			return fmt.Errorf("风扇 %s 的递增转速需在 1–%d 之间", id, fanDebugUnitMax(unit))
 		}
 		if intervalSeconds < 1 || intervalSeconds > 120 {
 			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
 		}
 	}
 	entry := m.fanDebugAuto.entries[id]
-	entry.Step = step
-	entry.Interval = intervalSeconds
-	entry.LastRamp = time.Now()
-	entry.Running = running
-	entry.Done = false
+	if running {
+		// 基准已在单位上限(上次跑完):归零重跑,避免开了立刻又完成
+		if base, ok := m.fanDebugTakenOver[id]; ok && base >= fanDebugUnitMax(unit) {
+			m.fanDebugTakenOver[id] = 0
+		}
+		entry.Step = step
+		entry.Interval = intervalSeconds
+		entry.Unit = unit
+		entry.LastRamp = time.Now()
+		entry.Done = false
+		entry.Running = true
+		if m.fanDebugUnits == nil {
+			m.fanDebugUnits = map[string]string{}
+		}
+		m.fanDebugUnits[id] = unit
+	} else {
+		entry.Running = false
+		entry.Done = false
+	}
 	m.fanDebugAuto.entries[id] = entry
-	m.ensureFanDebugAutoLoop()
+	if running {
+		m.ensureFanDebugAutoLoop()
+	}
 	return nil
 }
 
@@ -1200,21 +1224,18 @@ type FanDebugFan struct {
 	Mode         int64  `json:"mode"`
 	TakenOver    bool   `json:"taken_over"`
 	DebugPercent int    `json:"debug_percent,omitempty"`
-	DebugUnit    string `json:"debug_unit,omitempty"`            // 该风扇调试值的单位(percent/pwm),未设置按 percent
-	AutoStep     int    `json:"auto_step,omitempty"`             // 自动递增:每 Interval 秒 +Step
-	AutoInterval int    `json:"auto_interval_seconds,omitempty"` // 自动递增间隔(秒)
-	AutoRunning  bool   `json:"auto_running"`                    // 自动递增进行中
-	AutoDone     bool   `json:"auto_done,omitempty"`             // 已到该单位上限
+	DebugUnit    string `json:"debug_unit,omitempty"`    // 该风扇调试值的单位(percent/pwm),未设置按 percent
+	AutoStep     int    `json:"auto_step,omitempty"`     // 自动递增:每 Interval 秒 +Step
+	AutoInterval int    `json:"auto_interval,omitempty"` // 自动递增间隔(秒)
+	AutoRunning  bool   `json:"auto_running"`            // 自动递增进行中
+	AutoDone     bool   `json:"auto_done,omitempty"`     // 已到该单位上限
 }
 
 type FanDebugState struct {
-	Emergency    bool          `json:"emergency"`
-	AutoRunning  bool          `json:"auto_running"`
-	AutoStep     int           `json:"auto_step,omitempty"`
-	AutoInterval int           `json:"auto_interval_seconds,omitempty"`
-	AutoCurrent  int           `json:"auto_current,omitempty"`
-	LastError    string        `json:"last_error,omitempty"`
-	Fans         []FanDebugFan `json:"fans"`
+	Emergency   bool          `json:"emergency"`
+	AutoRunning bool          `json:"auto_running"` // 任一风扇的自动递增进行中
+	LastError   string        `json:"last_error,omitempty"`
+	Fans        []FanDebugFan `json:"fans"`
 }
 
 // FanDebugState 汇总调试状态与全部已发现风扇（按接口枚举，0 转也列出）。
@@ -1247,6 +1268,9 @@ func (m *Manager) FanDebugState() FanDebugState {
 				item.AutoInterval = entry.Interval
 				item.AutoRunning = entry.Running
 				item.AutoDone = entry.Done
+				if entry.Running {
+					state.AutoRunning = true
+				}
 			}
 		}
 		if unit, ok := m.fanDebugUnits[fan.ID]; ok {
