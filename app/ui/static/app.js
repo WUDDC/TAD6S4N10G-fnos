@@ -923,8 +923,8 @@ function activateTab(tabID, focus = false) {
     if (panel) panel.hidden = !active;
     if (active && focus) tab.focus();
   });
-  if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); });
-  if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
+  if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); if (fanDebugVisiblePref()) startFanDebugPoll(); });
+  else stopFanDebugPoll(); // 离开风扇控制页即停轮询(调试卡片不在当前页)
 }
 
 function setupTabs() {
