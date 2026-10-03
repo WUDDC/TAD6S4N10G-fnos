@@ -211,6 +211,13 @@ type Manager struct {
 	fanLastTarget int
 	fanLastTemp   float64
 
+	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
+	fanDebugActive    bool
+	fanDebugPercent   int
+	fanDebugEmergency bool
+	fanDebugLastError string
+	fanDebugAuto      *fanDebugAutoTest
+
 	storageMu     sync.RWMutex
 	storageScanMu sync.Mutex
 	storageStatus StorageStatus

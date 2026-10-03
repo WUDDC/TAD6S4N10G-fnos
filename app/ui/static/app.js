@@ -2476,6 +2476,137 @@ $('runlog-clear').addEventListener('click', async () => {
   }
 });
 
+// ---- 风扇调试控制（调试页勾选显示;调试期间暂停温控曲线） ----
+
+const FAN_DEBUG_VISIBLE_KEY = 'tad-fan-debug-visible';
+let fanDebugPollTimer = 0;
+
+function fanDebugVisiblePref() {
+  try { return window.localStorage.getItem(FAN_DEBUG_VISIBLE_KEY) === '1'; } catch (error) { return false; }
+}
+
+function setFanDebugVisible(visible) {
+  try { window.localStorage.setItem(FAN_DEBUG_VISIBLE_KEY, visible ? '1' : '0'); } catch (error) { /* 隐私模式忽略 */ }
+  applyFanDebugVisible();
+}
+
+function applyFanDebugVisible() {
+  const visible = fanDebugVisiblePref();
+  $('fan-debug-visible').checked = visible;
+  $('fan-debug-card').hidden = !visible;
+  if (visible) startFanDebugPoll(); else stopFanDebugPoll();
+}
+
+function startFanDebugPoll() {
+  if (fanDebugPollTimer) return;
+  const poll = async () => {
+    try {
+      renderFanDebug(await request('api/fans/debug'));
+    } catch (error) {
+      $('fan-debug-status').textContent = `调试状态读取失败：${error.message}`;
+    }
+  };
+  poll();
+  fanDebugPollTimer = window.setInterval(poll, 2000);
+}
+
+function stopFanDebugPoll() {
+  if (fanDebugPollTimer) { window.clearInterval(fanDebugPollTimer); fanDebugPollTimer = 0; }
+}
+
+function fanDebugStatus(message, error = false) {
+  showMessage(message, error, 'fan-debug-status');
+}
+
+// 渲染调试状态;只在有话要说时改状态行(自动测试进度/紧急覆盖/未启用提示)
+function renderFanDebug(state) {
+  if (typeof state.active === 'boolean') $('fan-debug-active').checked = state.active;
+  const body = $('fan-debug-body');
+  body.replaceChildren();
+  (state.fans || []).forEach((fan) => {
+    const row = document.createElement('tr');
+    const name = document.createElement('td');
+    name.textContent = `${fan.name}（通道 ${fan.channel}）`;
+    const rpm = document.createElement('td');
+    rpm.textContent = `${fan.rpm} RPM`;
+    const pwm = document.createElement('td');
+    pwm.textContent = `${fan.pwm_percent}%`;
+    const mode = document.createElement('td');
+    mode.textContent = fan.mode === 1 ? '手动' : fan.mode === 0 ? '全速' : `自动(${fan.mode})`;
+    row.append(name, rpm, pwm, mode);
+    body.append(row);
+  });
+  if (state.emergency) {
+    fanDebugStatus('⚠ CPU 超过紧急温度，已强制全部风扇 100%（覆盖调试转速）', true);
+  } else if (state.auto_running) {
+    fanDebugStatus(`自动递增进行中：当前 ${state.auto_current}%（基准 ${state.auto_base}%，每 ${state.auto_interval_seconds} 秒 +${state.auto_step}%）`);
+  } else if (!state.active) {
+    fanDebugStatus('调试模式未开启，温控曲线运行中。开启后曲线暂停、转速由下方控制。');
+  }
+  $('fan-debug-auto-start').disabled = state.auto_running;
+  $('fan-debug-auto-stop').disabled = !state.auto_running;
+}
+
+$('fan-debug-visible').addEventListener('change', () => setFanDebugVisible($('fan-debug-visible').checked));
+
+$('fan-debug-active').addEventListener('change', async () => {
+  const enabled = $('fan-debug-active').checked;
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/enable', { method: 'POST', body: JSON.stringify({ enabled }) }));
+    if (!enabled) fanDebugStatus('调试模式已关闭，温控曲线已恢复。');
+  } catch (error) {
+    $('fan-debug-active').checked = enabled; // 恢复开关为失败前状态再由下次轮询校正
+    fanDebugStatus(`切换调试模式失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('fan-debug-apply').addEventListener('click', async () => {
+  const input = $('fan-debug-pwm');
+  if (!input.reportValidity()) return;
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/pwm', { method: 'POST', body: JSON.stringify({ percent: Number(input.value) }) }));
+    fanDebugStatus(`已应用目标转速 ${Number(input.value)}%（全部风扇）。`);
+  } catch (error) {
+    fanDebugStatus(`应用失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('fan-debug-auto-start').addEventListener('click', async () => {
+  const base = Number($('fan-debug-auto-base').value);
+  const step = Number($('fan-debug-auto-step').value);
+  const interval = Number($('fan-debug-auto-interval').value);
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/auto', {
+      method: 'POST',
+      body: JSON.stringify({ base_percent: base, step_percent: step, interval_seconds: interval }),
+    }));
+    fanDebugStatus(`自动递增已开始：从 ${base}% 起，每 ${interval} 秒 +${step}%，到 100% 自动停止。`);
+  } catch (error) {
+    fanDebugStatus(`自动测试启动失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
+$('fan-debug-auto-stop').addEventListener('click', async () => {
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/auto/stop', { method: 'POST', body: '{}' }));
+    fanDebugStatus('自动递增已停止，保持当前转速。');
+  } catch (error) {
+    fanDebugStatus(`停止失败：${error.message}`, true);
+  } finally {
+    setBusy(false);
+  }
+});
+
 // ---- 长期记录保存位置：官方系统目录选择器（fnOS 应用 SDK pickSharedFile）----
 
 // SDK 单例：动态 import vendor 的 @trimjs/web-app ESM 构建，ready() 握手

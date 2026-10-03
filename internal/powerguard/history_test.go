@@ -1888,3 +1888,212 @@ func TestHandleLogClearAndExport(t *testing.T) {
 		t.Fatalf("stderr-mode clear should be ok (no-op), got %d", rec.Code)
 	}
 }
+
+// ---- 风扇调试控制（含 0 转风扇、手动转速、自动递增） ----
+
+func newFanDebugTestManager(t *testing.T) *Manager {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "proc", "cpuinfo"), []byte("model name : Intel(R) Processor N100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon3")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan1_input"), "1200")
+	writeTestValue(t, filepath.Join(hwmon, "pwm1"), "102")
+	writeTestValue(t, filepath.Join(hwmon, "pwm1_enable"), "2")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "0") // 0 转风扇(未接)
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "0")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "0")
+	// coretemp 传感器:让恢复曲线控制后有可读的 CPU 温度(45°C → CPU 曲线
+	// 最低档 30%,断言用),否则"无温度源 → 强制全速"的安全行为会打断断言
+	coretemp := filepath.Join(root, "sys", "class", "hwmon", "hwmon9")
+	if err := os.MkdirAll(coretemp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(coretemp, "name"), "coretemp")
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "45000")
+	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json"), StatePath: filepath.Join(root, "state.json"), Version: "test"}
+	if _, err := manager.LoadOrCreateConfig(); err != nil {
+		t.Fatal(err)
+	}
+	return manager
+}
+
+func TestFanDebugListsAllFansIncludingZeroRPM(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	state := manager.FanDebugState()
+	if state.Active {
+		t.Fatal("debug should default to inactive")
+	}
+	if len(state.Fans) != 2 {
+		t.Fatalf("should list all fans including 0-RPM, got %d", len(state.Fans))
+	}
+	if state.Fans[1].RPM != 0 {
+		t.Fatalf("0-RPM fan must be included, got %+v", state.Fans[1])
+	}
+}
+
+func TestFanDebugPercentAndLoopSuppression(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	pwm2 := filepath.Join(hwmon, "pwm2")
+
+	// 未开启时手动设置被拒绝
+	if err := manager.SetFanDebugPercent(50); err == nil {
+		t.Fatal("percent set must fail when debug is off")
+	}
+	if err := manager.SetFanDebugMode(true); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.fanDebugActive {
+		t.Fatal("debug should be active")
+	}
+	if err := manager.SetFanDebugPercent(50); err != nil {
+		t.Fatal(err)
+	}
+	// 全部风扇(含 0 转的 fan2)都写入 50% ≈ 128
+	for _, path := range []string{pwm1, pwm2} {
+		if got, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(got)) != "128" {
+			t.Fatalf("%s = %s, want 128 (50%%)", path, got)
+		}
+	}
+	// 调试期间 ApplyFanCurrent 不得覆盖手动值(曲线控制被暂停)
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(pwm1); strings.TrimSpace(string(got)) != "128" {
+		t.Fatalf("curve control must be suspended during debug, pwm1=%s", got)
+	}
+	// 关闭调试:立即恢复曲线控制。为让"恢复"可观测,先启用风扇控制并绑定
+	// fan1;假环境无 coretemp,applyFanLocked 的安全行为是"无温度源 → 强制
+	// 全速(255)并返回错误",据此断言 pwm1 从 128 变为全速。
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetFanDebugMode(false); err != nil {
+		t.Fatal(err)
+	}
+	if manager.fanDebugActive {
+		t.Fatal("debug should be inactive")
+	}
+	if got, _ := os.ReadFile(pwm1); strings.TrimSpace(string(got)) != "161" {
+		t.Fatalf("resume should apply CPU curve target for 45°C (63%%→161), got %s", got)
+	}
+}
+
+func TestFanDebugAutoRampStopsAtHundred(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	if err := manager.SetFanDebugMode(true); err != nil {
+		t.Fatal(err)
+	}
+	// 起始 20%,每次 +60%,1 秒间隔:20 → 80 → ≥100 停在 100
+	if err := manager.StartFanDebugAuto(20, 60, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !manager.fanDebugAuto.running {
+		t.Fatal("auto test should be running")
+	}
+	time.Sleep(2600 * time.Millisecond)
+	state := manager.FanDebugState()
+	if state.AutoRunning {
+		t.Fatal("auto test should finish after reaching 100%")
+	}
+	if state.AutoCurrent != 100 {
+		t.Fatalf("auto current = %d, want 100", state.AutoCurrent)
+	}
+	pwm1, err := os.ReadFile(filepath.Join(hwmon, "pwm1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(pwm1)) != "255" {
+		t.Fatalf("final pwm should be 255 (100%%), got %s", pwm1)
+	}
+	// 手动停止:运行中的测试可停
+	if err := manager.StartFanDebugAuto(10, 90, 1); err != nil {
+		t.Fatal(err)
+	}
+	manager.StopFanDebugAuto()
+	if manager.fanDebugAuto != nil {
+		t.Fatal("stop should clear the auto test")
+	}
+}
+
+func TestFanDebugValidation(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	if err := manager.SetFanDebugMode(true); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct{ base, step, interval int }{
+		{-1, 5, 10}, {101, 5, 10},
+		{30, 0, 10}, {30, 91, 10},
+		{30, 5, 0}, {30, 5, 121},
+	} {
+		if err := manager.StartFanDebugAuto(test.base, test.step, test.interval); err == nil {
+			t.Fatalf("StartFanDebugAuto(%d,%d,%d) should fail", test.base, test.step, test.interval)
+		}
+	}
+}
+
+func TestHandleFansDebugEndpoints(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	server := &Server{Manager: manager, History: nil, LogPath: "", Logger: log.New(os.Stderr, "", 0)}
+	call := func(method, path, body string, admin bool) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		if body != "" {
+			req = httptest.NewRequest(method, path, strings.NewReader(body))
+		}
+		if admin {
+			req.Header.Set("X-Trim-Isadmin", "true")
+		}
+		rec := httptest.NewRecorder()
+		switch path {
+		case "/api/fans/debug":
+			server.handleFansDebug(rec, req)
+		case "/api/fans/debug/enable":
+			server.handleFansDebugEnable(rec, req)
+		case "/api/fans/debug/pwm":
+			server.handleFansDebugPWM(rec, req)
+		case "/api/fans/debug/auto":
+			server.handleFansDebugAuto(rec, req)
+		case "/api/fans/debug/auto/stop":
+			server.handleFansDebugAutoStop(rec, req)
+		}
+		return rec
+	}
+	// 非管理员
+	if rec := call(http.MethodGet, "/api/fans/debug", "", false); rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin GET should 403, got %d", rec.Code)
+	}
+	// 方法守卫
+	if rec := call(http.MethodPost, "/api/fans/debug", "", true); rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST state should 405, got %d", rec.Code)
+	}
+	// 开启 + 手动 + 自动(管理员)
+	if rec := call(http.MethodPost, "/api/fans/debug/enable", `{"enabled":true}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("enable status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, "/api/fans/debug/pwm", `{"percent":77}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("pwm status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if manager.fanDebugPercent != 77 {
+		t.Fatalf("percent=%d, want 77", manager.fanDebugPercent)
+	}
+	if rec := call(http.MethodPost, "/api/fans/debug/auto", `{"base_percent":10,"step_percent":90,"interval_seconds":1}`, true); rec.Code != http.StatusOK {
+		t.Fatalf("auto status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec := call(http.MethodPost, "/api/fans/debug/auto/stop", "", true); rec.Code != http.StatusOK {
+		t.Fatalf("auto stop status=%d", rec.Code)
+	}
+}

@@ -425,6 +425,56 @@
             <p class="notice history-limit-notice">满配设备（4 风扇 + 6 盘位 + 12 传感器）每分钟采样约 0.7 KB，30 天约 30–45 MB；数据库同时受 保留天数与大小上限约束，超限后从最旧的一天开始删除。</p>
           </section>
 
+          <div class="fan-debug-toggle-row">
+            <label class="toggle"><input id="fan-debug-visible" type="checkbox"><span></span>显示风扇调试控制</label>
+          </div>
+
+          <section class="card debug-panel" id="fan-debug-card" aria-labelledby="fan-debug-heading" hidden>
+            <div class="panel-heading">
+              <div>
+                <h2 id="fan-debug-heading">风扇调试</h2>
+                <p>手动设定转速与递增测试。调试期间温控曲线暂停（CPU 超过紧急温度时仍强制全速兜底）；结束后请关闭调试模式恢复自动控制。</p>
+              </div>
+              <label class="toggle"><input id="fan-debug-active" type="checkbox"><span></span>启用调试模式</label>
+            </div>
+            <div class="table-scroll">
+              <table class="status-table fan-debug-table">
+                <thead><tr><th>风扇</th><th>通道</th><th>当前转速</th><th>当前 PWM</th><th>模式</th></tr></thead>
+                <tbody id="fan-debug-body"></tbody>
+              </table>
+            </div>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>手动目标转速（全部风扇）</span>
+                <div class="input-wrap"><input id="fan-debug-pwm" type="number" min="0" max="100" step="1" value="50" inputmode="numeric"><b>%</b></div>
+                <small>0% 为停止，100% 为全速</small>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="fan-debug-apply" type="button" class="primary">应用转速</button>
+            </div>
+            <p class="notice">自动递增测试：以起始转速为基础，每过一个间隔增加一次转速，到 100% 自动停止。</p>
+            <div class="field-grid history-settings">
+              <label class="field">
+                <span>自动测试起始转速</span>
+                <div class="input-wrap"><input id="fan-debug-auto-base" type="number" min="0" max="100" step="1" value="30" inputmode="numeric"><b>%</b></div>
+              </label>
+              <label class="field">
+                <span>每次递增</span>
+                <div class="input-wrap"><input id="fan-debug-auto-step" type="number" min="1" max="90" step="1" value="5" inputmode="numeric"><b>%</b></div>
+              </label>
+              <label class="field">
+                <span>递增间隔</span>
+                <div class="input-wrap"><input id="fan-debug-auto-interval" type="number" min="1" max="120" step="1" value="10" inputmode="numeric"><b>秒</b></div>
+              </label>
+            </div>
+            <div class="actions history-actions">
+              <button id="fan-debug-auto-start" type="button" class="primary">开始自动递增</button>
+              <button id="fan-debug-auto-stop" type="button">停止自动测试</button>
+            </div>
+            <p id="fan-debug-status" class="message" role="status" aria-live="polite"></p>
+          </section>
+
           <section class="card debug-panel" aria-labelledby="runlog-heading">
             <div class="panel-heading">
               <div>

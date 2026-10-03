@@ -1997,3 +1997,6 @@ button.danger {
 [data-theme="dark"] .status-table .storage-present td:nth-child(2) { color: #6cc0e8; }
 [data-theme="dark"] .curve-node-label { stroke: var(--surface); }
 
+
+/* ---- 风扇调试控制（调试页勾选显示） ---- */
+.fan-debug-toggle-row { margin: 2px 0 12px; }

@@ -98,6 +98,11 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/log", s.handleLogConfig)
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
 	mux.HandleFunc("/api/log/export", s.handleLogExport)
+	mux.HandleFunc("/api/fans/debug", s.handleFansDebug)
+	mux.HandleFunc("/api/fans/debug/enable", s.handleFansDebugEnable)
+	mux.HandleFunc("/api/fans/debug/pwm", s.handleFansDebugPWM)
+	mux.HandleFunc("/api/fans/debug/auto", s.handleFansDebugAuto)
+	mux.HandleFunc("/api/fans/debug/auto/stop", s.handleFansDebugAutoStop)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -423,6 +428,90 @@ func (s *Server) handleLogExport(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// ---- 风扇调试控制（调试页勾选后展示;全部管理员鉴权） ----
+
+// handleFansDebug 返回调试状态与全部已发现风扇（含 0 转通道）。
+func (s *Server) handleFansDebug(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以使用风扇调试")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugEnable 开/关调试模式。关闭时立即恢复曲线控制。
+func (s *Server) handleFansDebugEnable(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanDebugMode(payload.Enabled); err != nil {
+		writeError(w, http.StatusInternalServerError, "切换调试模式失败: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugPWM 手动设定全部风扇的目标转速（百分比）。
+func (s *Server) handleFansDebugPWM(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Percent int `json:"percent"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanDebugPercent(payload.Percent); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugAuto 启动递增测试：从基准转速起,每 interval 秒递增 step,
+// 到 100% 自动停止。
+func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		BasePercent     int `json:"base_percent"`
+		StepPercent     int `json:"step_percent"`
+		IntervalSeconds int `json:"interval_seconds"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.StartFanDebugAuto(payload.BasePercent, payload.StepPercent, payload.IntervalSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugAutoStop 停止自动递增测试,保持当前转速。
+func (s *Server) handleFansDebugAutoStop(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	s.Manager.StopFanDebugAuto()
+	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
 // handleHistoryClear 清空历史数据库：四张表全删 + VACUUM 回收空间，
