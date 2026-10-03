@@ -503,23 +503,31 @@ func (s *Server) handleFansDebugAuto(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	entries := make(map[string]fanDebugAutoEntry, len(payload.Fans))
 	for _, fan := range payload.Fans {
-		entries[fan.ID] = fanDebugAutoEntry{Step: fan.Step, Interval: fan.Interval}
-	}
-	if err := s.Manager.StartFanDebugAuto(entries); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+		if err := s.Manager.SetFanDebugAuto(fan.ID, true, fan.Step, fan.Interval); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 
-// handleFansDebugAutoStop 停止自动递增测试,保持当前转速。
+// handleFansDebugAutoStop 停止单个风扇的自动递增,保持当前转速。
 func (s *Server) handleFansDebugAutoStop(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
 	}
-	s.Manager.StopFanDebugAuto()
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanDebugAuto(payload.ID, false, 0, 0); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
 }
 

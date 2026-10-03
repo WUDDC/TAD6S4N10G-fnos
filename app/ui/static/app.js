@@ -2552,6 +2552,7 @@ function renderFanDebug(state) {
     const debugCell = document.createElement('td');
     const stepCell = document.createElement('td');
     const intervalCell = document.createElement('td');
+    const autoCell = document.createElement('td');
     if (fan.taken_over) {
       const unit = document.createElement('select');
       unit.className = 'fan-debug-unit';
@@ -2616,8 +2617,21 @@ function renderFanDebug(state) {
       debugCell.append(unit, input, apply);
       stepCell.append(stepInput);
       intervalCell.append(intervalInput);
+      // 自动测试滑动开关:开=按该行步进/间隔递增;到 100% 自动弹回并标记完成
+      const autoCell = document.createElement('td');
+      const autoToggle = document.createElement('label');
+      autoToggle.className = 'toggle fan-debug-auto-toggle';
+      const autoBox = document.createElement('input');
+      autoBox.type = 'checkbox';
+      autoBox.dataset.fanId = fan.id;
+      autoBox.checked = fan.auto_running;
+      autoBox.disabled = fan.auto_done;
+      autoBox.setAttribute('aria-label', `${fan.id} 自动递增测试`);
+      autoBox.addEventListener('change', () => applyFanDebugAuto(fan.id, autoBox.checked));
+      autoToggle.append(autoBox, document.createElement('span'));
+      autoCell.append(autoToggle);
     }
-    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell);
+    row.append(takeCell, name, channel, rpm, pwm, mode, debugCell, stepCell, intervalCell, autoCell);
     body.append(row);
   });
   if (state.emergency) {
@@ -2625,8 +2639,6 @@ function renderFanDebug(state) {
   } else if (state.auto_running) {
     fanDebugStatus('自动递增进行中：各风扇按各自的递增值与间隔推进，到 100% 自动完成。');
   }
-  $('fan-debug-auto-start').disabled = state.auto_running || !(state.fans || []).some((fan) => fan.taken_over && !fan.auto_done);
-  $('fan-debug-auto-stop').disabled = !state.auto_running;
 }
 
 $('fan-debug-visible').addEventListener('change', () => setFanDebugVisible($('fan-debug-visible').checked));
@@ -2640,39 +2652,6 @@ $('fan-debug-active').addEventListener('change', async () => {
   } catch (error) {
     $('fan-debug-active').checked = enabled; // 恢复开关为失败前状态再由下次轮询校正
     fanDebugStatus(`切换调试模式失败：${error.message}`, true);
-  } finally {
-    setBusy(false);
-  }
-});
-
-$('fan-debug-auto-start').addEventListener('click', async () => {
-  const payloadFans = [];
-  document.querySelectorAll('#fan-debug-body tr').forEach((tr) => {
-    const box = tr.querySelector('input[type=checkbox]');
-    if (!box?.checked) return;
-    const stepInput = tr.querySelector('.fan-debug-auto-input[data-kind="step"]');
-    const intervalInput = tr.querySelector('.fan-debug-auto-input[data-kind="interval"]');
-    const unitSelect = tr.querySelector('.fan-debug-unit[data-kind="auto-unit"]');
-    payloadFans.push({
-      id: box.dataset.fanId,
-      step: Number(stepInput?.value) || 5,
-      interval: Number(intervalInput?.value) || 10,
-      unit: unitSelect?.value === 'pwm' ? 'pwm' : 'percent',
-    });
-  });
-  if (!payloadFans.length) {
-    fanDebugStatus('没有可启动递增的风扇(需先接管且未完成)。', true);
-    return;
-  }
-  setBusy(true);
-  try {
-    renderFanDebug(await request('api/fans/debug/auto', {
-      method: 'POST',
-      body: JSON.stringify({ fans: payloadFans }),
-    }));
-    fanDebugStatus(`自动递增已开始：${payloadFans.map((f) => f.id.split(':').pop()).join('、')} 按各自参数递增，到 100% 自动完成。`);
-  } catch (error) {
-    fanDebugStatus(`自动测试启动失败：${error.message}`, true);
   } finally {
     setBusy(false);
   }
@@ -2753,6 +2732,23 @@ async function applyFanTakeover(id, taken) {
   } catch (error) {
     fanDebugStatus(`接管切换失败：${error.message}`, true);
     startFanDebugPoll(); // 立即轮询校正界面状态
+  } finally {
+    setBusy(false);
+  }
+}
+
+// 单风扇自动递增的开/关:开=以当前调试值为基准按步进/间隔递增。
+async function applyFanDebugAuto(id, running, step, interval) {
+  setBusy(true);
+  try {
+    renderFanDebug(await request('api/fans/debug/auto', {
+      method: 'POST',
+      body: JSON.stringify({ id, running, step, interval }),
+    }));
+    fanDebugStatus(running ? `${id} 自动递增已开始。` : `${id} 自动递增已停止,保持当前转速。`);
+  } catch (error) {
+    fanDebugStatus(`自动递增切换失败：${error.message}`, true);
+    startFanDebugPoll(); // 立即轮询校正开关状态
   } finally {
     setBusy(false);
   }
