@@ -67,6 +67,7 @@ type Config struct {
 	Log            LogConfig         `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	FanRPMBase     map[string]int    `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
 	UIPrefs        UIPrefsConfig     `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
 }
 
@@ -218,6 +219,14 @@ type Manager struct {
 	fanDebugLastError       string
 	fanDebugAuto            *fanDebugAutoTest
 	fanDebugAutoLoopRunning bool // 递增 goroutine 存活标记(无 Running 条目时退出)
+
+	// 风扇满转基准（RPM 调试模式的换算分母，落盘 Config.FanRPMBase）：全速
+	// 运转时按实测转速自动标定。窗口只被标定路径串行访问；基准的读写走 m.mu。
+	fanRPMBase      map[string]int
+	fanRPMBaseLoad  sync.Once         // 无统一构造函数，首次使用时从配置惰性载入
+	fanRPMWindow    map[string][]int  // 各风扇最近的全速 RPM 读数（稳态判定）
+	fanRPMCalib     chan fanRPMSample // DiscoverFans 的非阻塞投递；nil = 尚未启用
+	fanRPMCalibOnce sync.Once
 
 	storageMu     sync.RWMutex
 	storageScanMu sync.Mutex

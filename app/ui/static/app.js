@@ -2558,9 +2558,12 @@ function fanDebugUnit(value) {
   return FAN_DEBUG_UNITS.find((unit) => unit.value === value) || FAN_DEBUG_UNITS[1];
 }
 
-// 单位间线性换算(按各自上限等比):50% ↔ 128 PWM ↔ 1000 RPM
-function convertDebugValue(value, fromUnit, toUnit) {
-  return Math.round((value * fanDebugUnit(toUnit).max) / fanDebugUnit(fromUnit).max);
+// 单位间线性换算(按各自上限等比):50% ↔ 128 PWM ↔ 1000 RPM。
+// rpmMax 是该风扇的满转基准(后端全速实测自动标定,0/缺省用名义值 2000)。
+function convertDebugValue(value, fromUnit, toUnit, rpmMax = 0) {
+  const toMax = toUnit === 'rpm' && rpmMax ? rpmMax : fanDebugUnit(toUnit).max;
+  const fromMax = fromUnit === 'rpm' && rpmMax ? rpmMax : fanDebugUnit(fromUnit).max;
+  return Math.round((value * toMax) / fromMax);
 }
 
 // 调试值输入框 + 单位后缀;unitDef 形如 FAN_DEBUG_UNITS 项({max, suffix})。
@@ -2645,7 +2648,10 @@ function renderFanDebug(state) {
       // 自动递增进行中/已完成时输入框跟随后端实际值,避免停留在旧的手动值
       const followsAuto = fan.auto_running || fan.auto_done;
       const debugUnit = fanDebugUnit(unit.value);
-      const debugWrap = buildFanDebugInput(debugUnit, 'fan-debug-pwm-input', 'pwm', fan.id, `调试转速 ${fan.id}`);
+      // 该风扇的满转基准:RPM 单位的输入上限与换算分母(后端全速实测标定)
+      const rpmMax = fan.rpm_max || 2000;
+      const unitMax = (def) => (def.value === 'rpm' ? rpmMax : def.max);
+      const debugWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-pwm-input', 'pwm', fan.id, `调试转速 ${fan.id}`);
       const input = debugWrap.input;
       input.value = (followsAuto ? String(fan.debug_percent ?? 0) : pending[fan.id + ':pwm']) ?? String(fan.debug_percent ?? 0);
       const apply = document.createElement('button');
@@ -2660,14 +2666,14 @@ function renderFanDebug(state) {
         // 输入框与递增值按比例换算到新单位(RPM/%/PWM 上限等比)
         const v = Number(input.value);
         if (Number.isFinite(v)) {
-          input.value = String(convertDebugValue(v, from.value, to.value));
+          input.value = String(convertDebugValue(v, from.value, to.value, rpmMax));
         }
         const s = Number(stepInput.value);
         if (Number.isFinite(s) && s > 0) {
-          stepInput.value = String(convertDebugValue(s, from.value, to.value));
+          stepInput.value = String(convertDebugValue(s, from.value, to.value, rpmMax));
         }
-        input.max = String(to.max);
-        stepInput.max = String(to.max);
+        input.max = String(unitMax(to));
+        stepInput.max = String(unitMax(to));
         setCellSuffix(debugCell, to.suffix);
         setCellSuffix(stepCell, to.suffix);
         prevUnit = unit.value;
@@ -2676,7 +2682,7 @@ function renderFanDebug(state) {
           applyFanDebugPWM(fan.id, Number(input.value), unit.value, `单位已切换为${to.label}，已按新单位同步调试值。`);
         }
       });
-      const stepWrap = buildFanDebugInput(debugUnit, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
+      const stepWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
       const stepInput = stepWrap.input;
       stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
       const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);

@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -305,5 +306,64 @@ func writeTestValue(t *testing.T, path, value string) {
 	t.Helper()
 	if err := os.WriteFile(path, []byte(value), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// ---- 风扇满转基准自动标定 ----
+
+// 全速读数稳态后按中位数更新满转基准并落盘;非全速/坏读数/未稳态不标定;
+// 重启(新 Manager 惰性载入配置)后基准保留;换算与单位上限按新基准走。
+func TestFanRPMCalibrationLearnsFullSpeed(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{ConfigPath: configPath}
+	const id = "it8792:it8792:fan2"
+	// 非全速读数不标定
+	m.processFanRPMSample(id, 4500, 200)
+	if base := m.fanDebugRPMBaseLocked(id); base != fanRPMBaseDefault {
+		t.Fatalf("sub-full-speed sample must not calibrate, base=%d", base)
+	}
+	// 稳态全速窗口(极差 ≤5%):中位数 4500
+	for _, rpm := range []int{4480, 4520, 4500, 4490, 4510} {
+		m.processFanRPMSample(id, rpm, 255)
+	}
+	if base := m.fanDebugRPMBaseLocked(id); base != 4500 {
+		t.Fatalf("steady full-speed window should calibrate to the median, base=%d", base)
+	}
+	// 已落盘
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted.FanRPMBase[id] != 4500 {
+		t.Fatalf("calibration must persist to config, got %+v", persisted.FanRPMBase)
+	}
+	// 窗口混入毛刺(极差超限):不标定,基准不被单点读数带偏
+	m.processFanRPMSample(id, 9000, 255)
+	m.processFanRPMSample(id, 4495, 255)
+	if base := m.fanDebugRPMBaseLocked(id); base != 4500 {
+		t.Fatalf("non-steady window must not recalibrate, base=%d", base)
+	}
+	// 重启语义:新 Manager 从配置惰性载入基准
+	restarted := &Manager{ConfigPath: configPath}
+	if base := restarted.fanDebugRPMBaseLocked(id); base != 4500 {
+		t.Fatalf("restart should load the calibrated base, base=%d", base)
+	}
+	// 换算与上限按基准:rpm 2250 → 50% → PWM 128;上限钳到 4500
+	if got := fanDebugRaw("rpm", 2250, restarted.fanDebugRPMBaseLocked(id)); got != percentToPWM(50) {
+		t.Fatalf("rpm conversion must use the calibrated base, got %d", got)
+	}
+	if got := restarted.fanDebugUnitMaxFor(id, "rpm"); got != 4500 {
+		t.Fatalf("rpm unit max must follow the calibrated base, got %d", got)
+	}
+	// 名义基准(未标定风扇)与旧公式等价:2000 RPM → 100% PWM
+	if got := fanDebugRaw("rpm", 2000, fanRPMBaseDefault); got != 255 {
+		t.Fatalf("default base must keep 2000 RPM=100%%, got %d", got)
 	}
 }

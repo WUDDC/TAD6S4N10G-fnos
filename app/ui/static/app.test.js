@@ -708,4 +708,10 @@ test('风扇调试单位表:三种单位(RPM/%/PWM)、后缀与线性换算契�
   assert.equal(convert(50, 'percent', 'rpm'), 1000);
   assert.equal(convert(1000, 'rpm', 'percent'), 50);
   assert.equal(convert(2000, 'rpm', 'pwm'), 255);
+  // 满转基准(后端全速实测标定):rpm 换算用基准,未传退回名义 2000
+  assert.equal(convert(2250, 'rpm', 'percent', 4500), 50);
+  assert.equal(convert(50, 'percent', 'rpm', 4500), 2250);
+  assert.equal(convert(100, 'percent', 'rpm', 4500), 4500, '100% 即满转基准');
+  assert.equal(convert(4500, 'rpm', 'pwm', 4500), 255);
+  assert.equal(convert(2000, 'rpm', 'pwm'), 255, '未标定时按名义 2000');
 });

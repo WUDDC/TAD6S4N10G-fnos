@@ -410,7 +410,129 @@ func (m *Manager) DiscoverFans() ([]FanDevice, error) {
 		}
 	}
 	sort.Slice(fans, func(i, j int) bool { return fans[i].ID < fans[j].ID })
+	for _, fan := range fans {
+		m.offerFanRPMSample(fan.ID, int(fan.RPM), int(fan.PWM))
+	}
 	return fans, nil
+}
+
+// ---- 风扇满转基准自动标定 ----
+
+// it87 硬件只接受 PWM 占空比，"转速 RPM"调试单位只能按"满转基准"把 RPM
+// 线性映射成 PWM（默认假定 2000 RPM=100%）。基准从实测学得：风扇被驱动到
+// 全速时（无论来源——手动调试、曲线拉满、CPU 紧急全速兜底），把读数喂进
+// 滑窗，稳态后按中位数更新该风扇的基准并落盘，RPM 单位从此接近真实语义。
+const (
+	fanRPMBaseDefault    = 2000 // 未标定时的名义满转转速
+	fanRPMCalibMinPWM    = 250  // 原始 PWM ≥ 此值才算全速（≈98%，容忍芯片量化）
+	fanRPMCalibMinRPM    = 300  // 低于此按停转/坏读数丢弃
+	fanRPMCalibMaxRPM    = 20000
+	fanRPMCalibWindow    = 5 // 稳态判定窗口（最近 N 个全速读数）
+	fanRPMCalibSpreadPct = 5 // 窗口内极差 ≤5% 才认为稳态（升速中/抖动不标定）
+	fanRPMCalibDeltaPct  = 2 // 与现基准差 ≤2% 不动，避免反复写盘
+)
+
+type fanRPMSample struct {
+	id  string
+	rpm int
+	pwm int
+}
+
+// offerFanRPMSample 把读数非阻塞地投递给标定 goroutine：DiscoverFans 有时在
+// 持有 m.mu 的路径上被调用，这里绝不能等；通道满或未启用时丢弃（全速期间
+// 采样频繁，丢几个不影响稳态判定）。
+func (m *Manager) offerFanRPMSample(id string, rpm, pwm int) {
+	if m.fanRPMCalib == nil {
+		m.fanRPMCalibOnce.Do(func() {
+			m.fanRPMCalib = make(chan fanRPMSample, 64)
+			go m.runFanRPMCalibration()
+		})
+	}
+	select {
+	case m.fanRPMCalib <- fanRPMSample{id: id, rpm: rpm, pwm: pwm}:
+	default:
+	}
+}
+
+func (m *Manager) runFanRPMCalibration() {
+	for sample := range m.fanRPMCalib {
+		m.processFanRPMSample(sample.id, sample.rpm, sample.pwm)
+	}
+}
+
+// processFanRPMSample 消费一个读数：仅接受全速且合理的样本，窗口满且极差
+// 足够小视为稳态，取中位数与现基准比较后更新。窗口只被标定路径串行访问，
+// 不经 m.mu；基准与配置的读写走 m.mu。
+func (m *Manager) processFanRPMSample(id string, rpm, pwm int) {
+	if pwm < fanRPMCalibMinPWM || rpm < fanRPMCalibMinRPM || rpm > fanRPMCalibMaxRPM {
+		return
+	}
+	if m.fanRPMWindow == nil {
+		m.fanRPMWindow = map[string][]int{}
+	}
+	buf := append(m.fanRPMWindow[id], rpm)
+	if len(buf) > fanRPMCalibWindow {
+		buf = buf[len(buf)-fanRPMCalibWindow:]
+	}
+	m.fanRPMWindow[id] = buf
+	if len(buf) < fanRPMCalibWindow {
+		return
+	}
+	sorted := append([]int(nil), buf...)
+	sort.Ints(sorted)
+	median := sorted[len(sorted)/2]
+	lo, hi := sorted[0], sorted[len(sorted)-1]
+	if (hi-lo)*100 > median*fanRPMCalibSpreadPct {
+		return // 升速中或读数抖动，未稳态
+	}
+	m.updateFanRPMBase(id, median)
+}
+
+// updateFanRPMBase 与现基准差超过阈值才更新；内存先行（标定即时生效），
+// 落盘尽力而为（配置暂不可读/写失败时下次全速周期重试）。调用方不持 m.mu。
+func (m *Manager) updateFanRPMBase(id string, rpm int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.fanDebugRPMBaseLocked(id)
+	delta := rpm - current
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta*100 <= current*fanRPMCalibDeltaPct {
+		return
+	}
+	if m.fanRPMBase == nil {
+		m.fanRPMBase = map[string]int{}
+	}
+	m.fanRPMBase[id] = rpm
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return
+	}
+	if cfg.FanRPMBase == nil {
+		cfg.FanRPMBase = map[string]int{}
+	}
+	cfg.FanRPMBase[id] = rpm
+	_ = writeJSONAtomic(m.ConfigPath, cfg, 0o600)
+}
+
+// fanDebugRPMBaseLocked 返回该风扇的满转基准（未标定用默认值）。调用方须持
+// m.mu；首次调用从配置载入标定表。
+func (m *Manager) fanDebugRPMBaseLocked(id string) int {
+	m.fanRPMBaseLoad.Do(func() {
+		m.fanRPMBase = map[string]int{}
+		if cfg, err := m.loadConfigLocked(); err == nil {
+			for fanID, base := range cfg.FanRPMBase {
+				if base > 0 {
+					m.fanRPMBase[fanID] = base
+				}
+			}
+		}
+	})
+	if base := m.fanRPMBase[id]; base > 0 {
+		return base
+	}
+	return fanRPMBaseDefault
 }
 
 func isIT87Name(name string) bool {
@@ -983,37 +1105,48 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 }
 
 // fanDebugUnitMax 返回单位对应的调试值上限:pwm 0–255,percent 0–100。
+// rpm 的上限是每风扇的满转基准,走 fanDebugUnitMaxFor。
 func fanDebugUnitMax(unit string) int {
 	if unit == "pwm" {
 		return 255
 	}
 	if unit == "rpm" {
-		return 2000
+		return fanRPMBaseDefault
 	}
 	return 100
 }
 
-// fanDebugRaw 把单位值换算为写入硬件的原始 PWM。rpm 按 2000 RPM=100% 线性换算。
-func fanDebugRaw(unit string, value int) int {
+// fanDebugUnitMaxFor 单位上限的每风扇版:rpm 用该风扇的满转基准(实测标定),
+// 其余单位与风扇无关。调用方须持 m.mu。
+func (m *Manager) fanDebugUnitMaxFor(id, unit string) int {
+	if unit == "rpm" {
+		return m.fanDebugRPMBaseLocked(id)
+	}
+	return fanDebugUnitMax(unit)
+}
+
+// fanDebugRaw 把单位值换算为写入硬件的原始 PWM。rpm 按满转基准线性换算
+// (value/基准×100 再转 PWM;基准 2000 时即旧的 (value+10)/20)。
+func fanDebugRaw(unit string, value, rpmBase int) int {
 	if unit == "pwm" {
 		return value
 	}
 	if unit == "rpm" {
-		return percentToPWM((value + 10) / 20)
+		return percentToPWM((value*100 + rpmBase/2) / rpmBase)
 	}
 	return percentToPWM(value)
 }
 
 // SetFanDebugValue 设定单个被接管风扇的调试值。value 的单位由 unit 决定:
-// "rpm" 为转速(0–2000,按 2000=100% 换算),"percent" 为百分比(0–100),
-// "pwm" 为原始占空比(0–255)。value 存储与自动递增都按该单位进行。
+// "rpm" 为转速(0–该风扇满转基准,按基准=100% 换算),"percent" 为百分比
+// (0–100),"pwm" 为原始占空比(0–255)。value 存储与自动递增都按该单位进行。
 func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	if unit != "percent" && unit != "pwm" && unit != "rpm" {
 		return fmt.Errorf("未知的调节单位 %q", unit)
 	}
-	value = clampInt(value, 0, fanDebugUnitMax(unit))
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	value = clampInt(value, 0, m.fanDebugUnitMaxFor(id, unit))
 	if _, ok := m.fanDebugTakenOver[id]; !ok {
 		return fmt.Errorf("风扇 %s 未被接管", id)
 	}
@@ -1021,7 +1154,7 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	if err != nil {
 		return err
 	}
-	raw := fanDebugRaw(unit, value)
+	raw := fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
 	var errs []error
 	for i := range fans {
 		if fans[i].ID != id {
@@ -1041,7 +1174,7 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 				oldUnit = entry.Unit
 			}
 			if oldUnit != "" && oldUnit != unit && fanDebugUnitMax(oldUnit) > 0 {
-				entry.Step = entry.Step * fanDebugUnitMax(unit) / fanDebugUnitMax(oldUnit)
+				entry.Step = entry.Step * m.fanDebugUnitMaxFor(id, unit) / m.fanDebugUnitMaxFor(id, oldUnit)
 				if entry.Step < 1 {
 					entry.Step = 1
 				}
@@ -1079,8 +1212,8 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 		if _, taken := m.fanDebugTakenOver[id]; !taken {
 			return fmt.Errorf("风扇 %s 未被接管,请先勾选接管", id)
 		}
-		if step < 1 || step > fanDebugUnitMax(unit) {
-			return fmt.Errorf("风扇 %s 的递增转速需在 1–%d 之间", id, fanDebugUnitMax(unit))
+		if step < 1 || step > m.fanDebugUnitMaxFor(id, unit) {
+			return fmt.Errorf("风扇 %s 的递增转速需在 1–%d 之间", id, m.fanDebugUnitMaxFor(id, unit))
 		}
 		if intervalSeconds < 1 || intervalSeconds > 120 {
 			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
@@ -1089,7 +1222,7 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 	entry := m.fanDebugAuto.entries[id]
 	if running {
 		// 基准已在单位上限(上次跑完):归零重跑,避免开了立刻又完成
-		if base, ok := m.fanDebugTakenOver[id]; ok && base >= fanDebugUnitMax(unit) {
+		if base, ok := m.fanDebugTakenOver[id]; ok && base >= m.fanDebugUnitMaxFor(id, unit) {
 			m.fanDebugTakenOver[id] = 0
 		}
 		entry.Step = step
@@ -1154,11 +1287,12 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				if unit == "" {
 					unit = entry.Unit
 				}
+				unitMax := m.fanDebugUnitMaxFor(id, unit)
 				value := m.fanDebugTakenOver[id] + entry.Step
-				if value > fanDebugUnitMax(unit) {
-					value = fanDebugUnitMax(unit)
+				if value > unitMax {
+					value = unitMax
 				}
-				raw := fanDebugRaw(unit, value)
+				raw := fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
 				for i := range fans {
 					if fans[i].ID == id {
 						if err := setFanPWMRaw(fans[i], raw); err != nil {
@@ -1169,7 +1303,7 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				}
 				m.fanDebugTakenOver[id] = value
 				entry.LastRamp = now
-				if value >= fanDebugUnitMax(unit) {
+				if value >= unitMax {
 					entry.Done = true
 					entry.Running = false
 				} else {
@@ -1252,6 +1386,7 @@ type FanDebugFan struct {
 	TakenOver    bool   `json:"taken_over"`
 	DebugPercent int    `json:"debug_percent,omitempty"`
 	DebugUnit    string `json:"debug_unit,omitempty"`    // 该风扇调试值的单位(percent/pwm),未设置按 percent
+	RPMMax       int    `json:"rpm_max"`                 // 该风扇的满转基准(RPM):调试转速上限与 rpm 换算分母,未标定为 2000
 	AutoStep     int    `json:"auto_step,omitempty"`     // 自动递增:每 Interval 秒 +Step
 	AutoInterval int    `json:"auto_interval,omitempty"` // 自动递增间隔(秒)
 	AutoRunning  bool   `json:"auto_running"`            // 自动递增进行中
@@ -1288,6 +1423,7 @@ func (m *Manager) FanDebugState() FanDebugState {
 			RPM:        fan.RPM,
 			PWMPercent: pwmToPercent(fan.PWM),
 			Mode:       fan.Mode,
+			RPMMax:     m.fanDebugRPMBaseLocked(fan.ID),
 		}
 		if m.fanDebugAuto != nil {
 			if entry, ok := m.fanDebugAuto.entries[fan.ID]; ok {
