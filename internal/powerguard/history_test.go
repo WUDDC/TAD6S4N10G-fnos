@@ -1877,6 +1877,53 @@ func TestFlushArchivePendingBuffer(t *testing.T) {
 	}
 }
 
+// 过期窗口里没有行（刚开启/保存过设置水位归零，数据全在保留窗口内）时，
+// 补冲刷必须如实返回 false：不写文件、不动数据，前端据此不提示"已补归档"。
+// 水位照常推进，空窗被消费。
+func TestFlushArchiveNothingExpiredNoFlushClaim(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	store.retentionDays = 30
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	// 数据全部落在保留窗口内（cutoff = now-32 天）
+	if err := store.Append(HistorySample{TS: now.Add(-24 * time.Hour).Unix(), CPUC: 50}); err != nil {
+		t.Fatal(err)
+	}
+	flushed, err := store.FlushArchive(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed {
+		t.Fatal("empty expired window must not claim a flush")
+	}
+	if entries, _ := filepath.Glob(filepath.Join(archiveDir, "*")); len(entries) != 0 {
+		t.Fatalf("empty flush must not write archive files, got %v", entries)
+	}
+	var count int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("in-window data must be untouched, got %d rows", count)
+	}
+	if store.archiveWatermark == 0 {
+		t.Fatal("empty window should still advance the watermark")
+	}
+	// 反向对照：数据真的过期后，同一接口要报 flushed=true 且产出文件
+	store.archiveWatermark = 0
+	if err := store.Append(HistorySample{TS: now.Add(-40 * 24 * time.Hour).Unix(), CPUC: 45}); err != nil {
+		t.Fatal(err)
+	}
+	if flushed, err := store.FlushArchive(now); err != nil || !flushed {
+		t.Fatalf("expired rows must flush: flushed=%v err=%v", flushed, err)
+	}
+	if entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.csv.gz")); len(entries) == 0 {
+		t.Fatal("flush with expired rows should produce an archive file")
+	}
+}
+
 // /api/history/archive：方法守卫 + 管理员鉴权同其它配置接口。
 func TestHandleHistoryArchive(t *testing.T) {
 	manager := newHistoryTestManager(t)

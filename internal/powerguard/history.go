@@ -1352,7 +1352,9 @@ func (s *HistoryStore) appendAndLog(ctx context.Context, manager *Manager, logge
 // FlushArchive 立即补一次归档冲刷（清空数据库前由 HTTP 层调用）：把水位到
 // 当前 cutoff 之间的过期缓冲一次性写入归档盘并从主库删除、推进水位。与定时
 // 冲刷共用归档与失败计数（失败返回 error，缓冲原样保留在主库）。长期记录未
-// 开启、或保留期极长没有任何过期缓冲时是空操作。返回是否执行了冲刷。
+// 开启、保留期极长、或过期窗口里没有行（刚开启/保存过设置水位归零，数据全
+// 在保留窗口内）时是空操作——返回 false 让前端如实提示"没有缓冲可归档"，
+// 而不是声称已归档。返回是否真的归档并删除了数据。
 func (s *HistoryStore) FlushArchive(now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1362,6 +1364,14 @@ func (s *HistoryStore) FlushArchive(now time.Time) (bool, error) {
 	cutoff := now.Add(-time.Duration(s.retentionDays+historyRetentionBufferDays) * 24 * time.Hour).Unix()
 	if cutoff <= s.archiveWatermark {
 		return false, nil // 保留期极长：没有任何过期缓冲可冲
+	}
+	var pending int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM history WHERE ts >= ? AND ts < ?`, s.archiveWatermark, cutoff).Scan(&pending); err != nil {
+		return false, err
+	}
+	if pending == 0 {
+		s.archiveWatermark = cutoff // 空窗照样消费掉，避免每小时重复扫描
+		return false, nil
 	}
 	if err := s.archiveForDelete(s.archiveWatermark, cutoff); err != nil {
 		return false, err
