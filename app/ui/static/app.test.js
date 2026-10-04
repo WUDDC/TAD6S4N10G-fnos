@@ -67,7 +67,7 @@ function loadAppContext(overrides = {}) {
     clearInterval: () => {},
     setTimeout: () => 0,
     clearTimeout: () => {},
-    requestAnimationFrame: () => 0,
+    requestAnimationFrame: overrides.requestAnimationFrame || (() => 0),
     fetch: overrides.fetch || (() => new Promise(() => {})),
     Image: function Image() {},
     ResizeObserver: class ResizeObserver {
@@ -606,6 +606,22 @@ test('传感器父类下拉选项与后端 sensorGroupValues 契约一致（gpu|
   assert.ok(options.every((option) => option.label && option.label !== option.value), '每项都要有中文标签');
 });
 
+test('切到调试页：拉取历史后渲染传感器显示名列表（PR#7 重构曾丢失该钩子）', async () => {
+  const { requests, fetch } = recordingFetch((href) => (
+    href.includes('api/history')
+      ? { version: 1, interval_seconds: 60, samples: [{ ts: 1700000000, sensors: [{ group: 'cpu', key: 'Core 0', c: 50 }] }] }
+      : {}
+  ));
+  // rAF 立即执行回调，activateTab 的进页钩子才能在本用例内跑完
+  const ctx = loadAppContext({ fetch, requestAnimationFrame: (fn) => fn() });
+  // 包一层计数 spy：钩子是否存在决定渲染函数是否被调用
+  ctx.resolve('renderSensorNamesList = (function (orig) { return function () { globalThis.__sensorNamesRenders = (globalThis.__sensorNamesRenders || 0) + 1; return orig.apply(this, arguments); }; })(renderSensorNamesList)');
+  ctx.resolve("activateTab('tab-debug')");
+  await new Promise((done) => setImmediate(done));
+  assert.ok(requests.some((req) => req.url.includes('api/history')), '切调试页应拉取历史数据');
+  assert.ok(ctx.resolve('__sensorNamesRenders') >= 1, '历史返回后应渲染传感器显示名列表');
+});
+
 test('运行日志：保存校验并 POST /api/config/log；导出发起下载；清空经确认后 POST /api/log/clear', async () => {
   const { requests, fetch } = recordingFetch(() => ({}));
   const { element, click } = loadAppContext({ fetch });
@@ -692,4 +708,10 @@ test('风扇调试单位表:三种单位(RPM/%/PWM)、后缀与线性换算契�
   assert.equal(convert(50, 'percent', 'rpm'), 1000);
   assert.equal(convert(1000, 'rpm', 'percent'), 50);
   assert.equal(convert(2000, 'rpm', 'pwm'), 255);
+  // 满转基准(后端全速实测标定):rpm 换算用基准,未传退回名义 2000
+  assert.equal(convert(2250, 'rpm', 'percent', 4500), 50);
+  assert.equal(convert(50, 'percent', 'rpm', 4500), 2250);
+  assert.equal(convert(100, 'percent', 'rpm', 4500), 4500, '100% 即满转基准');
+  assert.equal(convert(4500, 'rpm', 'pwm', 4500), 255);
+  assert.equal(convert(2000, 'rpm', 'pwm'), 255, '未标定时按名义 2000');
 });

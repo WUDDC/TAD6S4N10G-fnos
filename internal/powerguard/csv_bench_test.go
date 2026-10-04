@@ -6,6 +6,7 @@ package powerguard
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"runtime"
@@ -20,20 +21,22 @@ func TestWriteCSVPerformanceProbe(t *testing.T) {
 	store := newTestStore(t)
 	defer store.Close()
 
-	// 满配单点：4 风扇 + 6 盘位 + 12 传感器（≈0.7KB/点，见文件头注释）
-	const samples = 150000 // ≈104 天满配 ≈ 100MB 级数据库
+	// 满配单点：4 风扇 + 6 盘位 + 12 传感器（≈0.7KB/点，见文件头注释）。
+	// ID 必须逐个区分：子表主键含 ID，同 ID 会被 INSERT OR REPLACE 覆盖，
+	// 每点只落 4 行（主表 + 每表 1 行），量不出满配的行数与体积。
+	const samples = 150000 // ≈104 天满配，实测库 ~170MB（数据行 345 万行）
 	base := time.Now().Unix() - samples*60
 	start := time.Now()
 	for i := 0; samples > i; i++ {
 		sample := HistorySample{TS: base + int64(i)*60, CPUC: 50, HDDC: 40, NVMeC: 45}
 		for f := 0; f < 4; f++ {
-			sample.Fans = append(sample.Fans, HistoryFanSample{ID: "it8613:fan", RPM: 1200, PWMPercent: 50})
+			sample.Fans = append(sample.Fans, HistoryFanSample{ID: fmt.Sprintf("it8613:fan%d", f), RPM: 1200, PWMPercent: 50})
 		}
 		for d := 0; d < 6; d++ {
-			sample.Disks = append(sample.Disks, HistoryDiskSample{ID: "front-1", TemperatureC: 38})
+			sample.Disks = append(sample.Disks, HistoryDiskSample{ID: fmt.Sprintf("front-%d", d), TemperatureC: 38})
 		}
 		for s := 0; s < 12; s++ {
-			sample.Sensors = append(sample.Sensors, HistorySensorSample{Group: "cpu", Key: "core", C: 52})
+			sample.Sensors = append(sample.Sensors, HistorySensorSample{Group: "cpu", Key: fmt.Sprintf("Core %d", s), C: 52})
 		}
 		if err := store.Append(sample); err != nil {
 			t.Fatal(err)

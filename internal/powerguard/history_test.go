@@ -2,8 +2,8 @@ package powerguard
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1234,10 +1235,95 @@ func TestHistoryExportCSVSkipsOrphanSubRows(t *testing.T) {
 	}
 }
 
+// 范围导出（writeCSVLocked，月度归档复用）：只导出 [lo, hi) 的采样，列头
+// 同样限定在范围内——归档单个月份时，其它月份出现过的 ID 不该混进列头；
+// 全库导出（公开 WriteCSV）行为不变。
+func TestWriteCSVRangeFiltersRowsAndColumns(t *testing.T) {
+	store := newTestStore(t)
+	base := time.Date(2026, 9, 15, 12, 0, 0, 0, time.Local)
+	insert := func(at time.Time, fanID string) {
+		t.Helper()
+		sample := HistorySample{TS: at.Unix(), CPUC: 50}
+		if fanID != "" {
+			sample.Fans = []HistoryFanSample{{ID: fanID, RPM: 1000, PWMPercent: 40}}
+		}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(base.Add(-24*time.Hour), "old:fan") // 范围外（9/14）
+	insert(base, "sep:fan")                    // 范围内（9/15）
+	insert(base.Add(24*time.Hour), "oct:fan")  // 范围外（9/16）
+	lo := base.Add(-time.Minute).Unix()
+	hi := base.Add(time.Minute).Unix()
+	var buf bytes.Buffer
+	if err := store.writeCSVLocked(context.Background(), &buf, lo, hi); err != nil {
+		t.Fatalf("range csv: %v", err)
+	}
+	content := buf.String()
+	lines := strings.Split(strings.TrimSpace(content), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expect header + 1 in-range data row, got %d:\n%s", len(lines), content)
+	}
+	if strings.Contains(content, "old:fan") || strings.Contains(content, "oct:fan") {
+		t.Fatalf("out-of-range IDs must not appear as rows or columns:\n%s", content)
+	}
+	if !strings.Contains(content, "sep:fan_rpm") || !strings.Contains(content, "1000") {
+		t.Fatalf("in-range data must survive:\n%s", content)
+	}
+	buf.Reset()
+	if err := store.WriteCSV(context.Background(), &buf); err != nil {
+		t.Fatalf("full csv: %v", err)
+	}
+	full := buf.String()
+	fullLines := strings.Split(strings.TrimSpace(full), "\n")
+	if len(fullLines) != 4 {
+		t.Fatalf("full export should keep all 3 samples, got %d lines:\n%s", len(fullLines), full)
+	}
+	for _, column := range []string{"old:fan_rpm", "sep:fan_rpm", "oct:fan_rpm"} {
+		if !strings.Contains(full, column) {
+			t.Fatalf("full export missing column %s:\n%s", column, full)
+		}
+	}
+}
+
 // ---- 长期记录（归档后再清理） ----
 
-// 开启长期记录后，日期清理先把待删数据按月归档成独立 SQLite 文件
-// （tad-history-YYYYMM.db），主库再删除；跨月数据各归各的文件。
+// readArchiveCSV 解压月度归档文件（宽表 CSV + gzip，2026-10 起取代 SQLite
+// 月文件）并返回全部文本（含 BOM 与表头）。
+func readArchiveCSV(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// archiveCSVDataRows 归档文件的数据行数（不含表头）。宽表字段都是数值与
+// 时间文本、不含内嵌换行，按行计数安全。
+func archiveCSVDataRows(t *testing.T, path string) int {
+	t.Helper()
+	content := strings.TrimPrefix(readArchiveCSV(t, path), "\ufeff")
+	content = strings.TrimRight(content, "\n")
+	if content == "" {
+		return 0
+	}
+	return strings.Count(content, "\n")
+}
+
+// 开启长期记录后，日期清理先把待删数据按月归档成独立压缩 CSV 文件
+// （tad-history-YYYYMM.csv.gz），主库再删除；跨月数据各归各的文件。
 func TestArchiveBeforePruneMonthlyFiles(t *testing.T) {
 	store := newTestStore(t)
 	archiveDir := filepath.Join(t.TempDir(), "archive")
@@ -1268,34 +1354,31 @@ func TestArchiveBeforePruneMonthlyFiles(t *testing.T) {
 		}
 	}
 	// 9 月的旧数据归档成 202609 文件；10 月数据都还在保留期内，不该有 202610 文件
-	sepPath := filepath.Join(archiveDir, "tad-history-202609.db")
+	sepPath := filepath.Join(archiveDir, "tad-history-202609.csv.gz")
 	if _, err := os.Stat(sepPath); err != nil {
 		t.Fatalf("September archive missing: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(archiveDir, "tad-history-202610.db")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(archiveDir, "tad-history-202610.csv.gz")); !os.IsNotExist(err) {
 		t.Fatalf("October archive should not exist (nothing pruned from October), err=%v", err)
 	}
-	archiveDB, err := sql.Open("sqlite", sepPath)
-	if err != nil {
-		t.Fatal(err)
+	// CSV 数据行数 = 9 月过期采样数；列头带风扇/盘位列；每行首列 ts 都在
+	// cutoff 之前（归档不得包含保留窗口内的数据）。
+	lines := strings.Split(strings.TrimRight(strings.TrimPrefix(readArchiveCSV(t, sepPath), "\ufeff"), "\n"), "\n")
+	if len(lines)-1 != wantSep {
+		t.Fatalf("archive should hold %d samples, got %d data rows", wantSep, len(lines)-1)
 	}
-	defer archiveDB.Close()
-	var archived, archivedFans int64
-	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&archived); err != nil {
-		t.Fatal(err)
+	if !strings.Contains(lines[0], "fan_f1_rpm") || !strings.Contains(lines[0], "disk_d1_c") {
+		t.Fatalf("archive header should carry fan/disk columns, got %s", lines[0])
 	}
-	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history_fans`).Scan(&archivedFans); err != nil {
-		t.Fatal(err)
-	}
-	if archived != int64(wantSep) || archivedFans != int64(wantSep) {
-		t.Fatalf("archive should hold %d samples+fans, got %d/%d", wantSep, archived, archivedFans)
-	}
-	var archivedOld int64
-	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history WHERE ts >= ?`, cutoff).Scan(&archivedOld); err != nil {
-		t.Fatal(err)
-	}
-	if archivedOld != 0 {
-		t.Fatalf("archive must not contain rows inside the retention window, got %d", archivedOld)
+	for _, line := range lines[1:] {
+		tsField, _, _ := strings.Cut(line, ",")
+		ts, err := strconv.ParseInt(tsField, 10, 64)
+		if err != nil {
+			t.Fatalf("archive row must start with unix ts, got %q", line)
+		}
+		if ts >= cutoff {
+			t.Fatalf("archive must not contain rows inside the retention window, ts=%d", ts)
+		}
 	}
 	var mainCount int64
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&mainCount); err != nil {
@@ -1420,7 +1503,7 @@ func TestEdgeTinyCapShortRetentionArchiveOn(t *testing.T) {
 	if mainOld != 0 || mainCount == 0 {
 		t.Fatalf("main should hold only the 3-day window, got %d rows (%d old)", mainCount, mainOld)
 	}
-	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.csv.gz"))
 	if len(entries) == 0 {
 		t.Fatal("expired days should be archived before deletion")
 	}
@@ -1461,7 +1544,7 @@ func TestEdgeHugeRetentionArchiveOnSizeDrivesPrune(t *testing.T) {
 	if err := store.PruneIfNeeded(now.Add(time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: historyMaxRetentionDays, ArchiveEnabled: true, ArchiveDir: archiveDir}); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.csv.gz"))
 	if len(entries) == 0 {
 		t.Fatal("size-driven prune should archive expired days when retention is huge")
 	}
@@ -1499,7 +1582,7 @@ func TestEdgeHugeRetentionArchiveOffSizePruneDeletesSilently(t *testing.T) {
 	if err := store.PruneIfNeeded(now.Add(time.Hour), HistoryConfig{MaxSizeMB: 1, RetentionDays: historyMaxRetentionDays, ArchiveDir: archiveDir}); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.csv.gz"))
 	if len(entries) != 0 {
 		t.Fatalf("archive off must not create archive files, got %v", entries)
 	}
@@ -1510,6 +1593,76 @@ func TestEdgeHugeRetentionArchiveOffSizePruneDeletesSilently(t *testing.T) {
 	if remaining == 0 || int(remaining) >= 5600 {
 		t.Fatalf("size prune should still delete without archiving, remaining=%d", remaining)
 	}
+}
+
+// 同一自然月被多次冲刷：后写批次与已有月文件按 ts 归并去重（同 ts 保留
+// 新值，等价旧 SQLite 方案 INSERT OR REPLACE 的重跑幂等），列头取并集。
+func TestArchiveSameMonthMergeDedupAndColumns(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	day := func(d, h int) time.Time {
+		return time.Date(2026, 10, d, h, 0, 0, 0, time.Local)
+	}
+	appendFan := func(at time.Time, fanID string, rpm int64) {
+		t.Helper()
+		sample := HistorySample{TS: at.Unix(), CPUC: 50,
+			Fans: []HistoryFanSample{{ID: fanID, RPM: rpm, PWMPercent: 40}}}
+		if err := store.Append(sample); err != nil {
+			t.Fatal(err)
+		}
+	}
+	lo, hi := day(1, 0).Unix(), day(2, 0).Unix()
+	for h := 0; h < 5; h++ {
+		appendFan(day(1, h), "a:fan", 1000)
+	}
+	if err := store.archiveBetween(lo, hi); err != nil {
+		t.Fatal(err)
+	}
+	// 第二批：B 风扇；其中一个 ts 与第一批重叠（主库 upsert 后该时刻只剩 B 值）
+	appendFan(day(1, 3), "b:fan", 2000)
+	appendFan(day(1, 5), "b:fan", 2000)
+	appendFan(day(1, 6), "b:fan", 2000)
+	if err := store.archiveBetween(lo, hi); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(archiveDir, "tad-history-202610.csv.gz")
+	content := strings.TrimPrefix(readArchiveCSV(t, path), "\ufeff")
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if len(lines) != 8 { // 表头 + 7 个唯一 ts
+		t.Fatalf("merged month file should hold header + 7 rows, got %d:\n%s", len(lines), content)
+	}
+	columns := strings.Split(lines[0], ",")
+	indexOf := func(name string) int {
+		for i, c := range columns {
+			if c == name {
+				return i
+			}
+		}
+		return -1
+	}
+	aRPM, bRPM := indexOf("fan_a:fan_rpm"), indexOf("fan_b:fan_rpm")
+	if aRPM < 0 || bRPM < 0 {
+		t.Fatalf("merged header must carry both fan columns, got %s", lines[0])
+	}
+	// 03:00 行属于两批：归并后必须保留新批次的值（fan_b 有值、fan_a 空）
+	rowTS := day(1, 3).Unix()
+	for _, line := range lines[1:] {
+		fields := strings.Split(line, ",")
+		ts, err := strconv.ParseInt(fields[0], 10, 64)
+		if err != nil {
+			t.Fatalf("row must start with unix ts: %q", line)
+		}
+		if ts != rowTS {
+			continue
+		}
+		if fields[bRPM] != "2000" || fields[aRPM] != "" {
+			t.Fatalf("overwritten ts must keep the newer batch: fan_a=%q fan_b=%q", fields[aRPM], fields[bRPM])
+		}
+		return
+	}
+	t.Fatalf("row for ts %d missing", rowTS)
 }
 
 // 归档缓冲（SSD）+ 冲刷（HDD）：数据照常按"当前时刻"落库（现实中不存在
@@ -1538,16 +1691,7 @@ func TestArchiveFlushBuffering(t *testing.T) {
 	}
 	archiveRows := func() int64 {
 		t.Helper()
-		db, err := sql.Open("sqlite", filepath.Join(archiveDir, "tad-history-202610.db"))
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer db.Close()
-		var n int64
-		if err := db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
+		return int64(archiveCSVDataRows(t, filepath.Join(archiveDir, "tad-history-202610.csv.gz")))
 	}
 	// 首轮(水位未建立):已过期的数据立即冲刷归档+删除
 	for i := 0; i < 5; i++ {
@@ -1626,7 +1770,7 @@ func TestEdgeSmallCapArchiveOnEarlyFlushBySize(t *testing.T) {
 	if store.dbSizeBytes() > first && store.dbSizeBytes() > 1<<20+3<<20 {
 		t.Fatalf("size pressure should trigger early flush, db=%d (first=%d)", store.dbSizeBytes(), first)
 	}
-	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.db"))
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "tad-history-*.csv.gz"))
 	if len(entries) == 0 {
 		t.Fatal("archive files should exist after early flush")
 	}
@@ -1650,7 +1794,7 @@ func TestEdgeHugeRetentionArchiveOnNoFlushChurn(t *testing.T) {
 	if err := store.Prune(now); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.csv.gz"))
 	if len(entries) != 0 {
 		t.Fatalf("nothing expired yet, no archive files expected, got %v", entries)
 	}
@@ -1662,7 +1806,7 @@ func TestEdgeHugeRetentionArchiveOnNoFlushChurn(t *testing.T) {
 	if err := store.Prune(now.Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	entries, _ = filepath.Glob(filepath.Join(archiveDir, "*.db"))
+	entries, _ = filepath.Glob(filepath.Join(archiveDir, "*.csv.gz"))
 	if len(entries) != 0 {
 		t.Fatalf("huge retention must not produce archive churn, got %v", entries)
 	}
@@ -1704,15 +1848,7 @@ func TestFlushArchivePendingBuffer(t *testing.T) {
 	if err != nil || !flushed {
 		t.Fatalf("manual flush: flushed=%v err=%v", flushed, err)
 	}
-	archiveDB, err := sql.Open("sqlite", filepath.Join(archiveDir, "tad-history-202610.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer archiveDB.Close()
-	var archived int64
-	if err := archiveDB.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&archived); err != nil {
-		t.Fatal(err)
-	}
+	archived := archiveCSVDataRows(t, filepath.Join(archiveDir, "tad-history-202610.csv.gz"))
 	if archived != 8 {
 		t.Fatalf("archive should hold 5+3=8 samples after manual flush, got %d", archived)
 	}
@@ -1738,6 +1874,53 @@ func TestFlushArchivePendingBuffer(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("no-op flush must not delete, got %d rows", n)
+	}
+}
+
+// 过期窗口里没有行（刚开启/保存过设置水位归零，数据全在保留窗口内）时，
+// 补冲刷必须如实返回 false：不写文件、不动数据，前端据此不提示"已补归档"。
+// 水位照常推进，空窗被消费。
+func TestFlushArchiveNothingExpiredNoFlushClaim(t *testing.T) {
+	store := newTestStore(t)
+	archiveDir := filepath.Join(t.TempDir(), "archive")
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.Local)
+	store.retentionDays = 30
+	store.archiveEnabled = true
+	store.archiveDir = archiveDir
+	// 数据全部落在保留窗口内（cutoff = now-32 天）
+	if err := store.Append(HistorySample{TS: now.Add(-24 * time.Hour).Unix(), CPUC: 50}); err != nil {
+		t.Fatal(err)
+	}
+	flushed, err := store.FlushArchive(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flushed {
+		t.Fatal("empty expired window must not claim a flush")
+	}
+	if entries, _ := filepath.Glob(filepath.Join(archiveDir, "*")); len(entries) != 0 {
+		t.Fatalf("empty flush must not write archive files, got %v", entries)
+	}
+	var count int64
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM history`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("in-window data must be untouched, got %d rows", count)
+	}
+	if store.archiveWatermark == 0 {
+		t.Fatal("empty window should still advance the watermark")
+	}
+	// 反向对照：数据真的过期后，同一接口要报 flushed=true 且产出文件
+	store.archiveWatermark = 0
+	if err := store.Append(HistorySample{TS: now.Add(-40 * 24 * time.Hour).Unix(), CPUC: 45}); err != nil {
+		t.Fatal(err)
+	}
+	if flushed, err := store.FlushArchive(now); err != nil || !flushed {
+		t.Fatalf("expired rows must flush: flushed=%v err=%v", flushed, err)
+	}
+	if entries, _ := filepath.Glob(filepath.Join(archiveDir, "*.csv.gz")); len(entries) == 0 {
+		t.Fatal("flush with expired rows should produce an archive file")
 	}
 }
 
