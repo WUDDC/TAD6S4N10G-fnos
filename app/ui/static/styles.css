@@ -1048,6 +1048,37 @@ body.modal-open { overflow: hidden; }
 
 /* ---- 历史温度 ---- */
 .history-chart { cursor: default; touch-action: auto; }
+/* 30 分钟档回看：图上左右拖动移动 30 点窗口；pan-y 保留纵向页面滚动手势 */
+.history-chart.scrub {
+  cursor: grab;
+  touch-action: pan-y;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.history-chart.scrub.scrubbing { cursor: grabbing; }
+.history-scrub-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.history-scrub-bar[hidden] { display: none !important; }
+.history-scrub-range { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-scrub-live {
+  flex: 0 0 auto;
+  padding: 2px 10px;
+  border: 1px solid var(--primary);
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.history-scrub-live:hover { filter: brightness(1.06); }
+.history-scrub-live[hidden] { display: none !important; }
 .history-crosshair-line {
   stroke: var(--muted);
   stroke-dasharray: 4 4;

@@ -729,3 +729,36 @@ test('风扇调试单位表:三种单位(RPM/%/PWM)、后缀与线性换算契�
   assert.equal(convert(4500, 'rpm', 'pwm', 4500), 255);
   assert.equal(convert(2000, 'rpm', 'pwm'), 255, '未标定时按名义 2000');
 });
+
+// 回看窗口对象来自 vm 沙箱，原型与宿主不同，deepEqual 会误报——逐字段断言
+function assertWindow(actual, start, end, atLive, message) {
+  assert.equal(actual.start, start, message);
+  assert.equal(actual.end, end, message);
+  assert.equal(actual.atLive, atLive, message);
+}
+
+test('30 分钟档回看：拉取范围、窗口吸附/夹取/贴最新与数据不足全覆盖', () => {
+  const historyFetchHoursFor = resolve('historyFetchHoursFor');
+  const historyScrubWindow = resolve('historyScrubWindow');
+  // 拉取范围解耦：仅 30 分钟档改拉 7.5 小时（480 点聚合上限内），其余档位原样
+  assert.equal(historyFetchHoursFor(0.5), 7.5);
+  assert.equal(historyFetchHoursFor(1), 1);
+  assert.equal(historyFetchHoursFor(720), 720);
+
+  // 45 个分钟点：默认贴最新 → 窗口=最后 30 点，末端=最新点
+  const samples = Array.from({ length: 45 }, (_, i) => ({ ts: 1000 + i * 60 }));
+  const latest = 1000 + 44 * 60;
+  assertWindow(historyScrubWindow(samples, 60, latest), latest - 29 * 60, latest, true, '默认贴最新');
+  // 拖到中间：末端吸附网格（ts=latest-10*60），atLive=false
+  assertWindow(historyScrubWindow(samples, 60, latest - 10 * 60), latest - 10 * 60 - 29 * 60, latest - 10 * 60, false, '拖到中间');
+  // 末端不在网格上时吸附到最近采样槽（latest+7 → latest）
+  const snapped = historyScrubWindow(samples, 60, latest + 7);
+  assert.equal(snapped.end, latest, '末端吸附采样网格');
+  assert.equal(snapped.atLive, true, '吸附回最新点视为实时');
+  // 越过最旧边界：末端夹在 最旧+span，窗口保持 30 点
+  assertWindow(historyScrubWindow(samples, 60, 1000), 1000, 1000 + 29 * 60, false, '越过最旧边界被夹取');
+  // 数据不足 30 点：窗口覆盖全部并视为实时
+  assertWindow(historyScrubWindow(samples.slice(0, 10), 60, 1000 + 9 * 60), 1000, 1000 + 9 * 60, true, '数据不足全覆盖');
+  // 空数据兜底
+  assertWindow(historyScrubWindow([], 60, 0), 0, 0, true, '空数据兜底');
+});
