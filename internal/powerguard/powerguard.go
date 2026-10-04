@@ -245,6 +245,9 @@ type Manager struct {
 	fanRPMLearnDisabled atomic.Bool                  // 学习已停用(测试收尾置位):挡住启动与投递
 	fanRPMLearnStopOnce sync.Once
 
+	// 主动标定期间挂起对应风扇的 RPM 闭环（避免闭环微调与全速标定互相打架）
+	fanRPMSuspend map[string]bool
+
 	storageMu     sync.RWMutex
 	storageScanMu sync.Mutex
 	storageStatus StorageStatus

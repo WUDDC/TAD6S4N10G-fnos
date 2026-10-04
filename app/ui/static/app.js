@@ -2659,6 +2659,26 @@ function renderFanDebug(state) {
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
       apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
+      // 标定满转:全速运转至读数稳态(最多约 9 秒),学特性表最高档与满转基准
+      const calibrate = document.createElement('button');
+      calibrate.type = 'button';
+      calibrate.textContent = '标定';
+      calibrate.className = 'fan-debug-apply fan-debug-calibrate';
+      calibrate.title = '全速运转数秒,实测满转转速并更新该风扇的 RPM 换算基准';
+      calibrate.addEventListener('click', async () => {
+        calibrate.disabled = true;
+        apply.disabled = true;
+        fanDebugStatus(`正在标定 ${fan.id} 的满转转速，风扇将全速运转数秒…`);
+        try {
+          const result = await request('api/fans/debug/calibrate', { method: 'POST', body: JSON.stringify({ id: fan.id }) });
+          fanDebugStatus(`标定完成：${fan.id} 满转基准 ${result.base} RPM（RPM 单位上限已同步）。`);
+        } catch (error) {
+          fanDebugStatus(`标定失败：${error.message}`, true);
+        } finally {
+          calibrate.disabled = false;
+          apply.disabled = false;
+        }
+      });
       let prevUnit = unit.value;
       unit.addEventListener('change', () => {
         const to = fanDebugUnit(unit.value);
@@ -2688,7 +2708,7 @@ function renderFanDebug(state) {
       const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
       const intervalInput = intervalWrap.input;
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
-      debugCell.append(unit, debugWrap.wrap, apply);
+      debugCell.append(unit, debugWrap.wrap, apply, calibrate);
       stepCell.append(stepWrap.wrap);
       intervalCell.append(intervalWrap.wrap);
       // 自动测试滑动开关:开=按该行步进/间隔/单位从当前调试值递增;到上限自动弹回并标记完成

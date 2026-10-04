@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -502,5 +503,76 @@ func TestFanRPMCloseLoopStep(t *testing.T) {
 	m.mu.Unlock()
 	if m.stepFanRPMCloseLoop() {
 		t.Fatal("no rpm targets should deactivate the loop")
+	}
+}
+
+// ---- 主动标定满转基准 ----
+
+// 标定按钮端到端:接管前未接管的风扇 → 全速写 255 → 恒定稳态读数入特性表
+// 240 档 + 更新满转基准并落盘 → 恢复未接管状态(交还曲线,PWM 回到标定前值)。
+// 闭环挂起:标定进行中该风扇不被闭环微调。
+func TestCalibrateFanRPMFullSpeed(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon9")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "4490")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "128")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Root: root, ConfigPath: configPath}
+	const id = "it8613:hwmon9:fan2"
+	pwm2 := filepath.Join(hwmon, "pwm2")
+
+	base, err := m.CalibrateFanRPM(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != 4490 {
+		t.Fatalf("steady reading 4490 should become the base, got %d", base)
+	}
+	// 特性表 240 档入表,基准落盘
+	m.mu.Lock()
+	table := m.fanRPMLearned[id]
+	slot240 := table[240]
+	m.mu.Unlock()
+	if slot240 != 4490 {
+		t.Fatalf("calibration must record the top slot, got %d", slot240)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "4490") {
+		t.Fatalf("calibration must persist to config: %s", raw)
+	}
+	// 恢复:未接管,交还曲线,PWM 回到标定前值
+	if _, taken := m.fanDebugTakenOver[id]; taken {
+		t.Fatal("fan was not taken over before calibration, must be released")
+	}
+	if m.fanRPMSuspend[id] {
+		t.Fatal("suspend flag must be cleared after calibration")
+	}
+	if got, _ := readInt(pwm2); got != 128 {
+		t.Fatalf("original PWM must be restored, got %d", got)
+	}
+	// 全速确实被写入过(pwm2 在标定中被写成 255,上面已验证恢复)——
+	// 直接断言闭环挂起语义:挂起中的风扇不参与闭环,唯一目标被挂起时闭环退出
+	m.mu.Lock()
+	m.fanDebugTakenOver = map[string]int{id: 3000}
+	m.fanDebugUnits = map[string]string{id: "rpm"}
+	m.fanRPMSuspend[id] = true
+	m.mu.Unlock()
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	if m.stepFanRPMCloseLoop() {
+		t.Fatal("suspended-only fan should deactivate the loop")
+	}
+	if got, _ := readInt(pwm2); got != 128 {
+		t.Fatalf("suspended fan must not be adjusted by the close loop, pwm=%d", got)
 	}
 }

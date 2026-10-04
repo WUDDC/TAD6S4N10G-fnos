@@ -750,6 +750,9 @@ func (m *Manager) stepFanRPMCloseLoop() bool {
 				if !taken {
 					continue
 				}
+				if m.fanRPMSuspend[id] {
+					continue // 主动标定进行中，闭环让位（满速采样与微调不能同写）
+				}
 				if m.fanDebugAuto != nil {
 					if entry, ok := m.fanDebugAuto.entries[id]; ok && entry.Running {
 						continue // 自动递增优先，闭环让位
@@ -1686,6 +1689,151 @@ type FanDebugState struct {
 	AutoRunning bool          `json:"auto_running"` // 任一风扇的自动递增进行中
 	LastError   string        `json:"last_error,omitempty"`
 	Fans        []FanDebugFan `json:"fans"`
+}
+
+// ---- 主动标定满转基准 ----
+
+const (
+	fanCalibSampleInterval = 500 * time.Millisecond // 稳态采样间隔
+	fanCalibSteadyWindow   = 4                      // 最近 N 个读数极差 ≤ 阈值即稳态
+	fanCalibSpreadPct      = 3                      // 稳态极差阈值（闭环容差级别，比被动学习略紧）
+	fanCalibMinSamples     = 3                      // 超时兜底所需的最少全速读数
+	fanCalibTimeout        = 9 * time.Second        // 风扇升速一般 1~3 秒，9 秒覆盖慢扇
+)
+
+// CalibrateFanRPM 主动标定单个风扇的满转基准：全速运转至读数稳态（最多约
+// 9 秒），稳态中位数经特性表入档（240 档 + 更新满转基准并落盘），随后恢复
+// 标定前的控制状态——原接管恢复原调试值与原 PWM，原未接管交还曲线控制。
+// 标定期间该风扇的 RPM 闭环挂起，避免微调与满速采样互相打架。返回新基准。
+func (m *Manager) CalibrateFanRPM(id string) (int, error) {
+	m.mu.Lock()
+	fans, _ := m.DiscoverFans()
+	var target *FanDevice
+	for i := range fans {
+		if fans[i].ID == id {
+			target = &fans[i]
+			break
+		}
+	}
+	if target == nil {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("fan %s was not found", id)
+	}
+	// 记录标定前的控制状态，结束时原样恢复
+	originalPWM := target.PWM
+	originalValue, wasTaken := m.fanDebugTakenOver[id]
+	originalUnit := m.fanDebugUnits[id]
+	if !wasTaken {
+		// 临时接管：从当前转速无缝进入全速（capture 保证释放后可恢复）
+		if err := m.captureOriginalFanLocked(*target); err != nil {
+			m.mu.Unlock()
+			return 0, err
+		}
+		if m.fanDebugTakenOver == nil {
+			m.fanDebugTakenOver = map[string]int{}
+		}
+		m.fanDebugTakenOver[id] = pwmToPercent(target.PWM)
+	}
+	if m.fanRPMSuspend == nil {
+		m.fanRPMSuspend = map[string]bool{}
+	}
+	m.fanRPMSuspend[id] = true
+	writeErr := setFanPWMRaw(*target, 255)
+	if writeErr != nil {
+		m.restoreAfterCalibrateLocked(id, wasTaken, originalValue, originalUnit, originalPWM)
+		m.mu.Unlock()
+		return 0, fmt.Errorf("全速写入失败: %w", writeErr)
+	}
+	m.mu.Unlock()
+
+	median, samples, calibErr := m.sampleFanRPMSteady(id)
+	if calibErr == nil {
+		m.recordFanRPMData(id, 240, median) // 入特性表最高档并维护满转基准（自带加锁）
+	}
+	m.mu.Lock()
+	m.restoreAfterCalibrateLocked(id, wasTaken, originalValue, originalUnit, originalPWM)
+	base := m.fanDebugRPMBaseLocked(id)
+	m.mu.Unlock()
+	if calibErr != nil {
+		return 0, calibErr
+	}
+	_ = samples
+	return base, nil
+}
+
+// sampleFanRPMSteady 全速读数循环：每 500ms 读一次，最近 4 个读数极差 ≤3%
+// 即稳态返回中位数；超时则退而求其次用已有读数的中位数（至少 fanCalibMinSamples
+// 个），否则报错。调用方不持 m.mu。
+func (m *Manager) sampleFanRPMSteady(id string) (int, int, error) {
+	deadline := time.Now().Add(fanCalibTimeout)
+	var buf []int
+	for {
+		time.Sleep(fanCalibSampleInterval)
+		m.mu.Lock()
+		fans, err := m.DiscoverFans()
+		m.mu.Unlock()
+		if err == nil {
+			for i := range fans {
+				if fans[i].ID != id {
+					continue
+				}
+				if rpm := int(fans[i].RPM); rpm >= fanRPMCalibMinRPM && rpm <= fanRPMCalibMaxRPM {
+					buf = append(buf, rpm)
+					if len(buf) > fanCalibSteadyWindow {
+						buf = buf[len(buf)-fanCalibSteadyWindow:]
+					}
+				}
+				break
+			}
+		}
+		if len(buf) >= fanCalibSteadyWindow {
+			sorted := append([]int(nil), buf...)
+			sort.Ints(sorted)
+			lo, hi, median := sorted[0], sorted[len(sorted)-1], sorted[len(sorted)/2]
+			if (hi-lo)*100 <= median*fanCalibSpreadPct {
+				return median, len(buf), nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if len(buf) >= fanCalibMinSamples {
+				sorted := append([]int(nil), buf...)
+				sort.Ints(sorted)
+				return sorted[len(sorted)/2], len(buf), nil
+			}
+			return 0, len(buf), fmt.Errorf("转速读数不稳定（%d 个有效读数），无法标定；请检查风扇后重试", len(buf))
+		}
+	}
+}
+
+// restoreAfterCalibrateLocked 恢复标定前的控制状态。两个分支都立即写回
+// 原始 PWM:接管分支重建调试值,未接管分支交还曲线控制——若控制已停用,
+// 不写回会让风扇停在标定的全速上。调用方须持 m.mu。
+func (m *Manager) restoreAfterCalibrateLocked(id string, wasTaken bool, originalValue int, originalUnit string, originalPWM int64) {
+	delete(m.fanRPMSuspend, id)
+	fans, err := m.DiscoverFans()
+	if err == nil {
+		for i := range fans {
+			if fans[i].ID == id {
+				_ = setFanPWMRaw(fans[i], int(originalPWM))
+				break
+			}
+		}
+	}
+	if wasTaken {
+		m.fanDebugTakenOver[id] = originalValue
+		if originalUnit != "" {
+			if m.fanDebugUnits == nil {
+				m.fanDebugUnits = map[string]string{}
+			}
+			m.fanDebugUnits[id] = originalUnit
+		}
+		return
+	}
+	// 标定前未接管：交还曲线控制（原始状态已在接管时存档）
+	delete(m.fanDebugTakenOver, id)
+	if m.fanDebugAuto != nil {
+		delete(m.fanDebugAuto.entries, id)
+	}
 }
 
 // FanDebugState 汇总调试状态与全部已发现风扇（按接口枚举，0 转也列出）。
