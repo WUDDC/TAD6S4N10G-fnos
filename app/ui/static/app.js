@@ -925,6 +925,8 @@ function activateTab(tabID, focus = false) {
   });
   if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); if (fanDebugVisiblePref()) startFanDebugPoll(); });
   else stopFanDebugPoll(); // 离开风扇控制页即停轮询(调试卡片不在当前页)
+  // 调试页的传感器显示名列表靠历史数据发现传感器键，进页时刷新一次再渲染
+  if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
 }
 
 function setupTabs() {
