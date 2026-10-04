@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,18 +58,19 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool              `json:"enabled"`
-	PL1W           int64             `json:"pl1_w"`
-	PL2W           int64             `json:"pl2_w"`
-	ReapplySeconds int               `json:"reapply_seconds"`
-	Fan            FanConfig         `json:"fan"`
-	GPIO           GPIOConfig        `json:"gpio"`
-	History        HistoryConfig     `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
-	Log            LogConfig         `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
-	SensorNames    map[string]string `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
-	SensorGroups   map[string]string `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
-	FanRPMBase     map[string]int    `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
-	UIPrefs        UIPrefsConfig     `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+	Enabled        bool                   `json:"enabled"`
+	PL1W           int64                  `json:"pl1_w"`
+	PL2W           int64                  `json:"pl2_w"`
+	ReapplySeconds int                    `json:"reapply_seconds"`
+	Fan            FanConfig              `json:"fan"`
+	GPIO           GPIOConfig             `json:"gpio"`
+	History        HistoryConfig          `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
+	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
+	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
+	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
+	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
+	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
 }
 
 // UIPrefsConfig 纯界面偏好，与功能配置分开存放：历史/风扇等保存接口整段
@@ -220,13 +222,28 @@ type Manager struct {
 	fanDebugAuto            *fanDebugAutoTest
 	fanDebugAutoLoopRunning bool // 递增 goroutine 存活标记(无 Running 条目时退出)
 
-	// 风扇满转基准（RPM 调试模式的换算分母，落盘 Config.FanRPMBase）：全速
-	// 运转时按实测转速自动标定。窗口只被标定路径串行访问；基准的读写走 m.mu。
+	// 风扇满转基准（RPM 调试模式的换算分母，落盘 Config.FanRPMBase）与
+	// PWM→转速特性表（落盘 Config.FanRPMMap）：稳态工况自动学习。窗口只被
+	// 学习路径串行访问；表/基准的读写走 m.mu。
 	fanRPMBase      map[string]int
 	fanRPMBaseLoad  sync.Once         // 无统一构造函数，首次使用时从配置惰性载入
-	fanRPMWindow    map[string][]int  // 各风扇最近的全速 RPM 读数（稳态判定）
 	fanRPMCalib     chan fanRPMSample // DiscoverFans 的非阻塞投递；nil = 尚未启用
 	fanRPMCalibOnce sync.Once
+
+	// RPM 闭环（设定目标转速后微调 PWM 直到 |实测-目标| ≤ 容差）：目标复用
+	// fanDebugTakenOver（rpm 单位值），活跃集合每 tick 动态判定——切单位、
+	// 取消接管、自动递增运行中的风扇自动退出闭环，无需显式注销。
+	fanRPMLearned       map[string]map[int]int       // PWM 档位 → 稳态转速（内存，落盘 Config.FanRPMMap）
+	fanRPMMapLoad       sync.Once                    // 特性表惰性载入（同 fanRPMBaseLoad）
+	fanRPMSlotWin       map[string]*fanRPMSlotWindow // 当前档位的稳态窗口（换档即覆盖）
+	fanRPMLoopRunning   bool                         // 闭环 goroutine 存活标记(无活跃目标时退出)
+	fanRPMLoopMiss      map[string]int               // 连续不可达计数(达标清零;超限暂停该风扇微调)
+	fanRPMLoopLocked    map[string]bool              // 当前是否在容差内(随调试状态下发)
+	fanRPMLastSave      time.Time                    // 特性表上次落盘时刻(学习路径写,节流用)
+	fanRPMLearnStop     chan struct{}                // 停止学习路径(测试收尾;生产进程退出即亡,恒 nil)
+	fanRPMLearnDone     chan struct{}                // 学习 goroutine 退出信号(停止后等待在途写盘完成)
+	fanRPMLearnDisabled atomic.Bool                  // 学习已停用(测试收尾置位):挡住启动与投递
+	fanRPMLearnStopOnce sync.Once
 
 	storageMu     sync.RWMutex
 	storageScanMu sync.Mutex

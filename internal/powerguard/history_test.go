@@ -2101,6 +2101,7 @@ func newFanDebugTestManager(t *testing.T) *Manager {
 	writeTestValue(t, filepath.Join(coretemp, "name"), "coretemp")
 	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "45000")
 	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json"), StatePath: filepath.Join(root, "state.json"), Version: "test"}
+	t.Cleanup(manager.stopFanRPMLearning) // 停学习路径写盘,防 TempDir 清理竞争
 	if _, err := manager.LoadOrCreateConfig(); err != nil {
 		t.Fatal(err)
 	}
@@ -2341,6 +2342,7 @@ func TestFanDebugValidation(t *testing.T) {
 // rpm 单位:1000 RPM 按 2000=100% 换算写硬件;递增到 rpm 上限完成并写满 PWM。
 func TestFanDebugRpmUnit(t *testing.T) {
 	manager := newFanDebugTestManager(t)
+	manager.stopFanRPMLearning() // 桩风扇转速不随 PWM 变,学习会真标定 base 干扰上限断言
 	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
 		t.Fatal(err)
