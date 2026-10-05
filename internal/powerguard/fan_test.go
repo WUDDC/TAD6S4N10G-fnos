@@ -661,3 +661,34 @@ func TestFanDebugAutoIntervalUnbounded(t *testing.T) {
 		t.Fatalf("absurd interval must clamp to the overflow guard, got %d", got)
 	}
 }
+
+// 自动测试运行中锁定参数:调试值与主动标定都拒绝(前端禁用控件之外的
+// 后端兜底——直连 API 的改动会破坏递增进程)。
+func TestFanDebugAutoRunningLocksParams(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugAuto(id, true, 5, 10, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	// 标定必然破坏递增(写 255 全速):运行中拒绝
+	if _, err := m.CalibrateFanRPM(id); err == nil || !strings.Contains(err.Error(), "自动测试进行中") {
+		t.Fatalf("calibration must be rejected while auto test runs, got %v", err)
+	}
+	// 调试值接口运行中不拒:单位切换的等比换算是无损操作(见
+	// TestFanDebugUnitSwitchMidRamp),锁定由前端禁用控件承担
+	if err := m.SetFanDebugValue(id, 50, "percent"); err != nil {
+		t.Fatalf("unit-resync path must stay open mid-ramp, got %v", err)
+	}
+}

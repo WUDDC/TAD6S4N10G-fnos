@@ -1464,6 +1464,8 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	if _, ok := m.fanDebugTakenOver[id]; !ok {
 		return fmt.Errorf("风扇 %s 未被接管", id)
 	}
+	// 运行中的参数锁定由前端禁用控件承担;这里不做拒绝——运行中切换单位
+	// 走本函数做等比换算,是无损操作(见 TestFanDebugUnitSwitchMidRamp)。
 	fans, err := m.DiscoverFans()
 	if err != nil {
 		return err
@@ -1756,6 +1758,12 @@ const (
 // 标定期间该风扇的 RPM 闭环挂起，避免微调与满速采样互相打架。返回新基准。
 func (m *Manager) CalibrateFanRPM(id string) (int, error) {
 	m.mu.Lock()
+	if m.fanDebugAuto != nil {
+		if entry, ok := m.fanDebugAuto.entries[id]; ok && entry.Running {
+			m.mu.Unlock()
+			return 0, fmt.Errorf("风扇 %s 的自动测试进行中,请先关闭该行的自动测试再标定", id)
+		}
+	}
 	fans, _ := m.DiscoverFans()
 	var target *FanDevice
 	for i := range fans {

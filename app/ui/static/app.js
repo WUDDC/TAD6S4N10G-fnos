@@ -2708,6 +2708,16 @@ function renderFanDebug(state) {
       const intervalWrap = buildFanDebugInput({ suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
       const intervalInput = intervalWrap.input;
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
+      // 自动测试运行中锁定整行参数(单位/调试值/应用/标定/递增/间隔):中途
+      // 改动会破坏递增进程;开关本身保持可操作(随时可停)。完成后(auto_done)
+      // 解锁。锁定随 2 秒轮询的重绘持续生效,绕过 UI 的改动还有后端拒绝兜底。
+      const autoLocked = Boolean(fan.auto_running);
+      unit.disabled = autoLocked;
+      input.disabled = autoLocked;
+      apply.disabled = autoLocked;
+      calibrate.disabled = autoLocked;
+      stepInput.disabled = autoLocked;
+      intervalInput.disabled = autoLocked;
       debugCell.append(unit, debugWrap.wrap, apply, calibrate);
       stepCell.append(stepWrap.wrap);
       intervalCell.append(intervalWrap.wrap);
