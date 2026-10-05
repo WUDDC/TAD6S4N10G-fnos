@@ -103,6 +103,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/fans/debug/pwm", s.handleFansDebugPWM)
 	mux.HandleFunc("/api/fans/debug/auto", s.handleFansDebugAuto)
 	mux.HandleFunc("/api/fans/debug/auto/stop", s.handleFansDebugAutoStop)
+	mux.HandleFunc("/api/fans/debug/calibrate", s.handleFansDebugCalibrate)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
@@ -272,12 +273,13 @@ func (s *Server) handleUIPrefsConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		HistoryRangeHours float64 `json:"history_range_hours"`
+		FanDebugVisible   bool    `json:"fan_debug_visible"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours}); err != nil {
+	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours, FanDebugVisible: payload.FanDebugVisible}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -443,6 +445,36 @@ func (s *Server) handleFansDebug(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.Manager.FanDebugState())
+}
+
+// handleFansDebugCalibrate 主动标定单个风扇的满转基准：全速运转至读数稳态
+// （最多约 9 秒），学习特性表最高档并更新基准，随后恢复标定前的控制状态。
+// 同步返回（前端按钮期间禁用行内控件）。
+func (s *Server) handleFansDebugCalibrate(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	if s.Manager == nil {
+		writeError(w, http.StatusServiceUnavailable, "风扇控制不可用")
+		return
+	}
+	var payload struct {
+		ID string `json:"id"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if payload.ID == "" {
+		writeError(w, http.StatusBadRequest, "缺少风扇 ID")
+		return
+	}
+	base, err := s.Manager.CalibrateFanRPM(payload.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"ok": 1, "base": base})
 }
 
 // handleFansDebugTakeover 接管/释放单个风扇：接管后脱离一切曲线控制。

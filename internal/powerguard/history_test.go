@@ -1144,6 +1144,48 @@ func TestSaveUIPrefsPersistsAndClamps(t *testing.T) {
 	}
 }
 
+// 风扇调试卡显隐偏好落服务端(ui_prefs),保存成功写运行日志留痕;
+// 未注入日志器时静默不报错。
+func TestSaveUIPrefsFanDebugVisibleAndLog(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	var logBuf bytes.Buffer
+	manager.SetLogger(log.New(&logBuf, "", 0))
+	// 开 + 档位一起存(前端整段替换语义)
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24, FanDebugVisible: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.UIPrefs.FanDebugVisible || cfg.UIPrefs.HistoryRangeHours != 24 {
+		t.Fatalf("fan_debug_visible should persist alongside range, got %+v", cfg.UIPrefs)
+	}
+	if !strings.Contains(logBuf.String(), "config.json saved") {
+		t.Fatalf("save must leave a trace in the run log, got %q", logBuf.String())
+	}
+	// 关:字段回落 false(omitempty 后从 JSON 省略,解码即 false)
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UIPrefs.FanDebugVisible {
+		t.Fatal("fan_debug_visible should turn off when saved as false")
+	}
+	// 关闭后再次保存:同样留下"保存发生过"的痕迹(日志只记保存事实,
+	// 不记字段值——排查"客户说没同步"只需要时间戳)
+	logBuf.Reset()
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logBuf.String(), "config.json saved") {
+		t.Fatalf("second save should be logged as well, got %q", logBuf.String())
+	}
+}
+
 // /api/config/ui-prefs：方法守卫 + 管理员鉴权同其它配置接口，成功返回 Status。
 func TestHandleUIPrefsConfig(t *testing.T) {
 	manager := newHistoryTestManager(t)
@@ -2101,6 +2143,7 @@ func newFanDebugTestManager(t *testing.T) *Manager {
 	writeTestValue(t, filepath.Join(coretemp, "name"), "coretemp")
 	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "45000")
 	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json"), StatePath: filepath.Join(root, "state.json"), Version: "test"}
+	t.Cleanup(manager.stopFanRPMLearning) // 停学习路径写盘,防 TempDir 清理竞争
 	if _, err := manager.LoadOrCreateConfig(); err != nil {
 		t.Fatal(err)
 	}
@@ -2341,6 +2384,7 @@ func TestFanDebugValidation(t *testing.T) {
 // rpm 单位:1000 RPM 按 2000=100% 换算写硬件;递增到 rpm 上限完成并写满 PWM。
 func TestFanDebugRpmUnit(t *testing.T) {
 	manager := newFanDebugTestManager(t)
+	manager.stopFanRPMLearning() // 桩风扇转速不随 PWM 变,学习会真标定 base 干扰上限断言
 	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
 		t.Fatal(err)

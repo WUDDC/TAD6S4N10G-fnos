@@ -5,7 +5,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestFanStateCaptureRejectsDifferentCPU(t *testing.T) {
@@ -319,6 +321,7 @@ func TestFanRPMCalibrationLearnsFullSpeed(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &Manager{ConfigPath: configPath}
+	t.Cleanup(m.stopFanRPMLearning)
 	const id = "it8792:it8792:fan2"
 	// 非全速读数不标定
 	m.processFanRPMSample(id, 4500, 200)
@@ -365,5 +368,432 @@ func TestFanRPMCalibrationLearnsFullSpeed(t *testing.T) {
 	// 名义基准(未标定风扇)与旧公式等价:2000 RPM → 100% PWM
 	if got := fanDebugRaw("rpm", 2000, fanRPMBaseDefault); got != 255 {
 		t.Fatalf("default base must keep 2000 RPM=100%%, got %d", got)
+	}
+}
+
+// ---- RPM 特性表学习与闭环微调 ----
+
+// 中低档位稳态读数入特性表并落盘;重启(新 Manager)后表保留;
+// 设定目标转速时初值查表插值,表外区间用满转基准外推,空表退化为线性。
+func TestFanRPMMapLearnsAndInterpolates(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{ConfigPath: configPath}
+	t.Cleanup(m.stopFanRPMLearning)
+	const id = "it8792:it8792:fan2"
+	// 两档稳态:PWM 80 → 1500,PWM 160 → 2500(每档 3 个读数)
+	for _, rpm := range []int{1490, 1510, 1500} {
+		m.processFanRPMSample(id, rpm, 80)
+	}
+	m.fanRPMLastSave = time.Time{} // 第二档落盘不受首写节流限制
+	for _, rpm := range []int{2490, 2510, 2500} {
+		m.processFanRPMSample(id, rpm, 160)
+	}
+	// 升速中(极差超限)不入表
+	m.processFanRPMSample(id, 1800, 120)
+	m.processFanRPMSample(id, 2200, 120)
+	m.processFanRPMSample(id, 1650, 120)
+	// 落盘
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted Config
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	table := persisted.FanRPMMap[id]
+	if table == nil || table[80] != 1500 || table[160] != 2500 {
+		t.Fatalf("steady slots must be learned, got %+v", persisted.FanRPMMap)
+	}
+	if _, learned := table[112]; learned {
+		t.Fatal("non-steady slot must not be learned")
+	}
+	// 重启语义:新 Manager 载入表后插值
+	restarted := &Manager{ConfigPath: configPath}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// 目标 2000:80+ (2000-1500)*(160-80)/(2500-1500) = 120
+	if got := restarted.rpmToPWMEstimateLocked(id, 2000); got != 120 {
+		t.Fatalf("interpolation: got %d, want 120", got)
+	}
+	// 表内低段:目标 1500 → 80;低于最小转速也停在 80(最低已知档)
+	if got := restarted.rpmToPWMEstimateLocked(id, 1500); got != 80 {
+		t.Fatalf("clamp to lowest known slot: got %d, want 80", got)
+	}
+	// 表外高转速:基准线性外推(2000 默认基准,目标 4000 → 255)
+	if got := restarted.rpmToPWMEstimateLocked(id, 4000); got != 255 {
+		t.Fatalf("extrapolation above table: got %d, want 255", got)
+	}
+	// 空表风扇:退化为基准线性(等价旧公式)
+	if got := restarted.rpmToPWMEstimateLocked("other:fan9", 1000); got != percentToPWM(50) {
+		t.Fatalf("empty table must fall back to linear base, got %d", got)
+	}
+}
+
+// 闭环单步:超出容差按差值微调 PWM(限幅 ±20),达标静默并标记 locked,
+// 连续不可达 15 次暂停,percent 单位不参与,无活跃目标时报告退出。
+func TestFanRPMCloseLoopStep(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon7")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	for name, value := range map[string]string{
+		"fan2_input": "2000", "pwm2": "128", "pwm2_enable": "1",
+		"fan3_input": "1800", "pwm3": "100", "pwm3_enable": "1",
+	} {
+		writeTestValue(t, filepath.Join(hwmon, name), value)
+	}
+	m := &Manager{Root: root}
+	t.Cleanup(m.stopFanRPMLearning)
+	const idA, idB = "it8613:hwmon7:fan2", "it8613:hwmon7:fan3"
+	m.mu.Lock()
+	m.fanDebugTakenOver = map[string]int{idA: 3000, idB: 50}
+	m.fanDebugUnits = map[string]string{idA: "rpm", idB: "percent"}
+	m.mu.Unlock()
+
+	fan2Input := filepath.Join(hwmon, "fan2_input")
+	pwm2 := filepath.Join(hwmon, "pwm2")
+	// 第一步:实测 2000 vs 目标 3000,容差 max(90,60)=90 → adj=(1000)*255/2000=127→钳20 → 148
+	if !m.stepFanRPMCloseLoop() {
+		t.Fatal("rpm target should keep the loop active")
+	}
+	if got, _ := readInt(pwm2); got != 148 {
+		t.Fatalf("first step should write pwm=148, got %d", got)
+	}
+	if m.fanRPMLoopLocked[idA] {
+		t.Fatal("far from target must not be locked")
+	}
+	// percent 风扇不参与
+	if got, _ := readInt(filepath.Join(hwmon, "pwm3")); got != 100 {
+		t.Fatalf("percent unit must not be touched, pwm3=%d", got)
+	}
+	// 连续不可达:推到 15 次上限后暂停写入
+	writeTestValue(t, fan2Input, "2000")
+	for i := 0; i < fanRPMCloseLoopMaxMiss-1; i++ {
+		m.stepFanRPMCloseLoop()
+	}
+	missBefore := m.fanRPMLoopMiss[idA]
+	if missBefore != fanRPMCloseLoopMaxMiss {
+		t.Fatalf("miss should cap at %d, got %d", fanRPMCloseLoopMaxMiss, missBefore)
+	}
+	writeTestValue(t, pwm2, "148") // 复位,暂停后不得再写
+	if !m.stepFanRPMCloseLoop() {
+		t.Fatal("paused fan is still an active target")
+	}
+	if got, _ := readInt(pwm2); got != 148 {
+		t.Fatalf("paused fan must not be adjusted, pwm=%d", got)
+	}
+	// 转速进入容差(3000±90):达标,locked,miss 清零
+	writeTestValue(t, fan2Input, "3010")
+	if !m.stepFanRPMCloseLoop() {
+		t.Fatal("still active after locking")
+	}
+	if !m.fanRPMLoopLocked[idA] || m.fanRPMLoopMiss[idA] != 0 {
+		t.Fatalf("in-tolerance reading should lock, locked=%v miss=%d", m.fanRPMLoopLocked[idA], m.fanRPMLoopMiss[idA])
+	}
+	// 取消接管:无活跃目标,报告退出
+	m.mu.Lock()
+	delete(m.fanDebugTakenOver, idA)
+	delete(m.fanDebugTakenOver, idB)
+	m.mu.Unlock()
+	if m.stepFanRPMCloseLoop() {
+		t.Fatal("no rpm targets should deactivate the loop")
+	}
+}
+
+// ---- 主动标定满转基准 ----
+
+// 标定按钮端到端:接管前未接管的风扇 → 全速写 255 → 恒定稳态读数入特性表
+// 240 档 + 更新满转基准并落盘 → 恢复未接管状态(交还曲线,PWM 回到标定前值)。
+// 闭环挂起:标定进行中该风扇不被闭环微调。
+func TestCalibrateFanRPMFullSpeed(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon9")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "4490")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "128")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Root: root, ConfigPath: configPath}
+	const id = "it8613:hwmon9:fan2"
+	pwm2 := filepath.Join(hwmon, "pwm2")
+
+	base, err := m.CalibrateFanRPM(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != 4490 {
+		t.Fatalf("steady reading 4490 should become the base, got %d", base)
+	}
+	// 特性表 240 档入表,基准落盘
+	m.mu.Lock()
+	table := m.fanRPMLearned[id]
+	slot240 := table[240]
+	m.mu.Unlock()
+	if slot240 != 4490 {
+		t.Fatalf("calibration must record the top slot, got %d", slot240)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "4490") {
+		t.Fatalf("calibration must persist to config: %s", raw)
+	}
+	// 恢复:未接管,交还曲线,PWM 回到标定前值
+	if _, taken := m.fanDebugTakenOver[id]; taken {
+		t.Fatal("fan was not taken over before calibration, must be released")
+	}
+	if m.fanRPMSuspend[id] {
+		t.Fatal("suspend flag must be cleared after calibration")
+	}
+	if got, _ := readInt(pwm2); got != 128 {
+		t.Fatalf("original PWM must be restored, got %d", got)
+	}
+	// 全速确实被写入过(pwm2 在标定中被写成 255,上面已验证恢复)——
+	// 直接断言闭环挂起语义:挂起中的风扇不参与闭环,唯一目标被挂起时闭环退出
+	m.mu.Lock()
+	m.fanDebugTakenOver = map[string]int{id: 3000}
+	m.fanDebugUnits = map[string]string{id: "rpm"}
+	m.fanRPMSuspend[id] = true
+	m.mu.Unlock()
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	if m.stepFanRPMCloseLoop() {
+		t.Fatal("suspended-only fan should deactivate the loop")
+	}
+	if got, _ := readInt(pwm2); got != 128 {
+		t.Fatalf("suspended fan must not be adjusted by the close loop, pwm=%d", got)
+	}
+}
+
+// ---- 回归:取消接管立即恢复转速;递增间隔不设上限 ----
+
+// 释放接管必须立即把 PWM 写回接管时的存档值:被调试风扇不在曲线列表时
+// 没有任何后台路径会再碰它,不写回就永久保持调试转速(用户实测)。
+func TestFanDebugTakeoverReleaseRestoresPWM(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Root: root, ConfigPath: configPath}
+	const id = "it8613:hwmon8:fan2"
+	pwm2 := filepath.Join(hwmon, "pwm2")
+
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugValue(id, 0, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readInt(pwm2); got != 0 {
+		t.Fatalf("debug value should drive the fan to pwm 0, got %d", got)
+	}
+	if err := m.SetFanDebugTakeover(id, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readInt(pwm2); got != 100 {
+		t.Fatalf("release must restore the captured PWM immediately, got %d", got)
+	}
+	if _, taken := m.fanDebugTakenOver[id]; taken {
+		t.Fatal("release must clear the takeover state")
+	}
+}
+
+// 递增间隔不设上限(旧实现限 1–120):>120 接受,0 报错,荒谬大值钳到
+// 溢出护栏(百年)防 Duration 回绕。
+func TestFanDebugAutoIntervalUnbounded(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	// 3600 秒(1 小时)合法
+	if err := m.SetFanDebugAuto(id, true, 5, 3600, "percent"); err != nil {
+		t.Fatalf("interval beyond the old 120s cap must be accepted: %v", err)
+	}
+	m.mu.Lock()
+	got := m.fanDebugAuto.entries[id].Interval
+	m.mu.Unlock()
+	if got != 3600 {
+		t.Fatalf("interval should be stored verbatim, got %d", got)
+	}
+	// 0 报错
+	if err := m.SetFanDebugAuto(id, true, 5, 0, "percent"); err == nil {
+		t.Fatal("interval 0 must be rejected")
+	}
+	// 荒谬大值钳到溢出护栏
+	if err := m.SetFanDebugAuto(id, true, 5, 9999999999, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	got = m.fanDebugAuto.entries[id].Interval
+	m.mu.Unlock()
+	if got != fanAutoIntervalMax {
+		t.Fatalf("absurd interval must clamp to the overflow guard, got %d", got)
+	}
+}
+
+// 自动测试运行中锁定参数:调试值与主动标定都拒绝(前端禁用控件之外的
+// 后端兜底——直连 API 的改动会破坏递增进程)。
+func TestFanDebugAutoRunningLocksParams(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugAuto(id, true, 5, 10, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	// 标定必然破坏递增(写 255 全速):运行中拒绝
+	if _, err := m.CalibrateFanRPM(id); err == nil || !strings.Contains(err.Error(), "自动测试进行中") {
+		t.Fatalf("calibration must be rejected while auto test runs, got %v", err)
+	}
+	// 调试值接口运行中不拒:单位切换的等比换算是无损操作(见
+	// TestFanDebugUnitSwitchMidRamp),锁定由前端禁用控件承担
+	if err := m.SetFanDebugValue(id, 50, "percent"); err != nil {
+		t.Fatalf("unit-resync path must stay open mid-ramp, got %v", err)
+	}
+}
+
+// ---- 回归:闭环顶格冻结(目标超出风扇能力时不再回撤试探) ----
+
+// 目标转速高于实际可达:PWM 顶到 255 后闭环必须冻结(保持全速、miss 拉满),
+// 不得因读数噪声"降档再试"形成 98↔90 振荡;读数偶发进容差可解冻;
+// 真超速(读数>目标)仍允许下调。
+func TestFanRPMCloseLoopStopsAtFullScale(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2600")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "255")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	m.mu.Lock()
+	m.fanDebugTakenOver = map[string]int{id: 3000} // 目标 3000,实际全速 ~2600,容差 90
+	m.fanDebugUnits = map[string]string{id: "rpm"}
+	m.mu.Unlock()
+	pwm2 := filepath.Join(hwmon, "pwm2")
+	fan2 := filepath.Join(hwmon, "fan2_input")
+
+	// 顶格欠速:一步进入冻结,PWM 保持 255
+	if !m.stepFanRPMCloseLoop() {
+		t.Fatal("frozen fan is still an active target")
+	}
+	if got, _ := readInt(pwm2); got != 255 {
+		t.Fatalf("full-scale PWM must be held, got %d", got)
+	}
+	m.mu.Lock()
+	miss, locked := m.fanRPMLoopMiss[id], m.fanRPMLoopLocked[id]
+	m.mu.Unlock()
+	if miss != fanRPMCloseLoopMaxMiss || !locked {
+		t.Fatalf("full-scale undershoot must freeze immediately, miss=%d locked=%v", miss, locked)
+	}
+	// 冻结中读数继续欠速:不写不动
+	writeTestValue(t, fan2, "2580")
+	m.stepFanRPMCloseLoop()
+	if got, _ := readInt(pwm2); got != 255 {
+		t.Fatalf("frozen loop must not touch PWM, got %d", got)
+	}
+	// 读数偶发进容差:解冻(miss 清零)
+	writeTestValue(t, fan2, "3010")
+	m.stepFanRPMCloseLoop()
+	m.mu.Lock()
+	miss = m.fanRPMLoopMiss[id]
+	m.mu.Unlock()
+	if miss != 0 {
+		t.Fatalf("in-tolerance reading should unfreeze, miss=%d", miss)
+	}
+	// 真超速(读数 > 目标+容差):允许下调,不冻结
+	writeTestValue(t, fan2, "3400")
+	if !m.stepFanRPMCloseLoop() {
+		t.Fatal("overshoot should keep the loop active for correction")
+	}
+	if got, _ := readInt(pwm2); got != 235 {
+		t.Fatalf("overshoot must step PWM down by max adjustment, got %d", got)
+	}
+}
+
+// 自动递增到单位上限:Done 且 PWM 顶格(既有行为,防回归)。
+func TestFanDebugAutoRampDoneAtFullScale(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "90")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	// 从 95 起步、步进 10、间隔 1 秒:一波即到 100 上限
+	if err := m.SetFanDebugValue(id, 95, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugAuto(id, true, 10, 1, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var entry fanDebugAutoEntry
+	for {
+		time.Sleep(100 * time.Millisecond)
+		m.mu.Lock()
+		entry = m.fanDebugAuto.entries[id]
+		m.mu.Unlock()
+		if entry.Done || time.Now().After(deadline) {
+			break
+		}
+	}
+	pwm2 := filepath.Join(hwmon, "pwm2")
+	if got, _ := readInt(pwm2); got != 255 {
+		t.Fatalf("ramp to 100%% should write full-scale PWM, got %d", got)
+	}
+	if !entry.Done || entry.Running {
+		t.Fatalf("ramp at unit max should be done, got %+v", entry)
 	}
 }

@@ -1480,8 +1480,9 @@ function saveHistoryRangeHours(hours) {
   try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(hours)); }
   catch (error) { /* 隐私模式等场景下仅本次生效 */ }
   // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）；
+  // ui_prefs 整段替换，必须带上当前开关值，否则会把调试卡显隐清掉。
   // 保存失败静默——localStorage 兜底足够，不打扰用户
-  request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify({ history_range_hours: hours }) }).catch(() => {});
+  request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify({ history_range_hours: hours, fan_debug_visible: uiFanDebugVisible }) }).catch(() => {});
 }
 
 // 范围标签：不足 1 小时显示分钟；无极区非整小时显示"N 小时 M 分"；
@@ -2480,16 +2481,28 @@ $('runlog-clear').addEventListener('click', async () => {
 
 // ---- 风扇调试控制（调试页勾选显示;调试期间暂停温控曲线） ----
 
-const FAN_DEBUG_VISIBLE_KEY = 'tad-fan-debug-visible';
+const FAN_DEBUG_VISIBLE_KEY = 'tad-fan-debug-visible'; // 旧版 localStorage 键,仅一次性迁移用
 let fanDebugPollTimer = 0;
+// 调试卡显隐偏好(服务端 ui_prefs 持久,跨浏览器一致);status 未到时按 false
+let uiFanDebugVisible = false;
 
 function fanDebugVisiblePref() {
-  try { return window.localStorage.getItem(FAN_DEBUG_VISIBLE_KEY) === '1'; } catch (error) { return false; }
+  return uiFanDebugVisible;
 }
 
 function setFanDebugVisible(visible) {
-  try { window.localStorage.setItem(FAN_DEBUG_VISIBLE_KEY, visible ? '1' : '0'); } catch (error) { /* 隐私模式忽略 */ }
+  const previous = uiFanDebugVisible;
+  uiFanDebugVisible = visible;
   applyFanDebugVisible();
+  // 与档位同款:偏好落服务端(随 config.ui_prefs 下发,跨浏览器一致);
+  // 失败静默恢复——开关状态以保存成功为准
+  request('api/config/ui-prefs', {
+    method: 'POST',
+    body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: visible }),
+  }).catch(() => {
+    uiFanDebugVisible = previous;
+    applyFanDebugVisible();
+  });
 }
 
 function applyFanDebugVisible() {
@@ -2499,7 +2512,31 @@ function applyFanDebugVisible() {
   if (visible) startFanDebugPoll(); else stopFanDebugPoll();
 }
 
-// 页面加载即按记忆的偏好恢复显隐(勾选过则卡片直接可见)
+// status 到达:采纳后端偏好;首次升级做一次 localStorage 迁移——旧版只存
+// 本地,后端从未有值,迁移"开着"的用户;迁移后清键,此后关开都走服务端
+function syncFanDebugVisibleFromStatus() {
+  const serverVisible = currentStatus?.config?.ui_prefs?.fan_debug_visible === true;
+  if (serverVisible === uiFanDebugVisible) {
+    if (serverVisible) { try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ } }
+    return;
+  }
+  let legacy = false;
+  try { legacy = window.localStorage.getItem(FAN_DEBUG_VISIBLE_KEY) === '1'; } catch (error) { /* 忽略 */ }
+  if (!serverVisible && legacy) {
+    // 旧版开着 → 迁移为服务端开启(带档位,同一次保存),成功后清旧键
+    try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ }
+    request('api/config/ui-prefs', {
+      method: 'POST',
+      body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: true }),
+    }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); }).catch(() => {});
+    return;
+  }
+  uiFanDebugVisible = serverVisible;
+  applyFanDebugVisible();
+}
+
+// 页面加载即按记忆的偏好恢复显隐(勾选过则卡片直接可见);status 到达后
+// syncFanDebugVisibleFromStatus 以服务端值为准
 applyFanDebugVisible();
 
 function startFanDebugPoll() {
@@ -2572,7 +2609,7 @@ function buildFanDebugInput(unitDef, className, kind, fanId, ariaLabel) {
   const input = document.createElement('input');
   input.type = 'number';
   input.min = kind === 'interval' ? '1' : '0';
-  input.max = String(unitDef.max);
+  if (Number.isFinite(unitDef.max)) input.max = String(unitDef.max);
   input.step = '1';
   input.inputMode = 'numeric';
   input.className = className;
@@ -2659,6 +2696,26 @@ function renderFanDebug(state) {
       apply.textContent = '应用';
       apply.className = 'fan-debug-apply';
       apply.addEventListener('click', () => applyFanDebugPWM(fan.id, Number(input.value), unit.value));
+      // 标定满转:全速运转至读数稳态(最多约 9 秒),学特性表最高档与满转基准
+      const calibrate = document.createElement('button');
+      calibrate.type = 'button';
+      calibrate.textContent = '标定';
+      calibrate.className = 'fan-debug-apply fan-debug-calibrate';
+      calibrate.title = '全速运转数秒,实测满转转速并更新该风扇的 RPM 换算基准';
+      calibrate.addEventListener('click', async () => {
+        calibrate.disabled = true;
+        apply.disabled = true;
+        fanDebugStatus(`正在标定 ${fan.id} 的满转转速，风扇将全速运转数秒…`);
+        try {
+          const result = await request('api/fans/debug/calibrate', { method: 'POST', body: JSON.stringify({ id: fan.id }) });
+          fanDebugStatus(`标定完成：${fan.id} 满转基准 ${result.base} RPM（RPM 单位上限已同步）。`);
+        } catch (error) {
+          fanDebugStatus(`标定失败：${error.message}`, true);
+        } finally {
+          calibrate.disabled = false;
+          apply.disabled = false;
+        }
+      });
       let prevUnit = unit.value;
       unit.addEventListener('change', () => {
         const to = fanDebugUnit(unit.value);
@@ -2685,10 +2742,20 @@ function renderFanDebug(state) {
       const stepWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
       const stepInput = stepWrap.input;
       stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
-      const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
+      const intervalWrap = buildFanDebugInput({ suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
       const intervalInput = intervalWrap.input;
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
-      debugCell.append(unit, debugWrap.wrap, apply);
+      // 自动测试运行中锁定整行参数(单位/调试值/应用/标定/递增/间隔):中途
+      // 改动会破坏递增进程;开关本身保持可操作(随时可停)。完成后(auto_done)
+      // 解锁。锁定随 2 秒轮询的重绘持续生效,绕过 UI 的改动还有后端拒绝兜底。
+      const autoLocked = Boolean(fan.auto_running);
+      unit.disabled = autoLocked;
+      input.disabled = autoLocked;
+      apply.disabled = autoLocked;
+      calibrate.disabled = autoLocked;
+      stepInput.disabled = autoLocked;
+      intervalInput.disabled = autoLocked;
+      debugCell.append(unit, debugWrap.wrap, apply, calibrate);
       stepCell.append(stepWrap.wrap);
       intervalCell.append(intervalWrap.wrap);
       // 自动测试滑动开关:开=按该行步进/间隔/单位从当前调试值递增;到上限自动弹回并标记完成
@@ -2803,6 +2870,10 @@ async function applyFanTakeover(id, taken) {
 // 单风扇自动递增的开/关:开=以当前调试值为基准,按该行步进/间隔/单位递增;
 // 关=停在当前转速(参数保留,重新打开原样继续)。各风扇互不影响。
 async function applyFanDebugAuto(id, running, step, interval, unit) {
+  // 输入框 step=1 只约束步进点击,手输 1.5 这类小数会原样到这——后端字段
+  // 是整数,不取整会 JSON decode 失败报 400
+  step = Math.round(step);
+  interval = Math.round(interval);
   const label = id.split(':').pop();
   setBusy(true);
   try {
@@ -2820,6 +2891,7 @@ async function applyFanDebugAuto(id, running, step, interval, unit) {
 }
 
 async function applyFanDebugPWM(id, value, unit, successMessage) {
+  value = Math.round(value); // 同 applyFanDebugAuto:手输小数不得原样发给整数后端
   const def = fanDebugUnit(unit);
   if (!Number.isFinite(value) || value < 0 || value > def.max) {
     fanDebugStatus(`调试值需在 0–${def.max} 之间。`, true);
@@ -2894,6 +2966,7 @@ function updatePowerMode(mode, applyPreset = true) {
 
 function render(status, keepInputs = false) {
   currentStatus = status;
+  syncFanDebugVisibleFromStatus();
   const pkg = status.packages?.[0] || {};
   const cpuTemperature = status.cpu_temperature || {};
   const fanStatus = status.fan_control || {};

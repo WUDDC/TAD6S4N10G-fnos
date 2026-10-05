@@ -416,21 +416,44 @@ func (m *Manager) DiscoverFans() ([]FanDevice, error) {
 	return fans, nil
 }
 
-// ---- 风扇满转基准自动标定 ----
+// ---- 风扇转速特性学习与 RPM 闭环 ----
 
-// it87 硬件只接受 PWM 占空比，"转速 RPM"调试单位只能按"满转基准"把 RPM
-// 线性映射成 PWM（默认假定 2000 RPM=100%）。基准从实测学得：风扇被驱动到
-// 全速时（无论来源——手动调试、曲线拉满、CPU 紧急全速兜底），把读数喂进
-// 滑窗，稳态后按中位数更新该风扇的基准并落盘，RPM 单位从此接近真实语义。
+// it87 硬件只接受 PWM 占空比，"转速 RPM"调试单位需要一条 PWM→转速 的映射
+// 才有意义。映射从实测学得：温控循环与调试操作持续产生 (PWM, 转速) 读数，
+// 同一 PWM 档位的读数攒满窗口且极差足够小（真稳态）即取中位数入表并落盘——
+// 风扇被曲线或调试驱动过的每个工况都会自动充实特性表。设定转速时先查表
+// （插值，"大概转速"），再由闭环按反馈转速微调 PWM（|实测-目标| ≤ 容差）。
+// 高档位稳态同时维护满转基准（RPM 上限与兜底换算的分母）。
 const (
-	fanRPMBaseDefault    = 2000 // 未标定时的名义满转转速
-	fanRPMCalibMinPWM    = 250  // 原始 PWM ≥ 此值才算全速（≈98%，容忍芯片量化）
-	fanRPMCalibMinRPM    = 300  // 低于此按停转/坏读数丢弃
-	fanRPMCalibMaxRPM    = 20000
-	fanRPMCalibWindow    = 5 // 稳态判定窗口（最近 N 个全速读数）
-	fanRPMCalibSpreadPct = 5 // 窗口内极差 ≤5% 才认为稳态（升速中/抖动不标定）
-	fanRPMCalibDeltaPct  = 2 // 与现基准差 ≤2% 不动，避免反复写盘
+	fanRPMBaseDefault      = 2000 // 未标定时的名义满转转速
+	fanRPMSlotStep         = 16   // 特性表档位步长（PWM），0..240 共 16 档；241–255 归 240 档（转速差异可忽略）
+	fanRPMCalibMinRPM      = 300  // 低于此按停转/坏读数丢弃（失速区不入表）
+	fanRPMCalibMaxRPM      = 20000
+	fanRPMSlotWinSize      = 3                // 档位稳态判定窗口（同一档位最近 N 个读数）
+	fanRPMSlotSpreadPct    = 4                // 窗口内极差 ≤4% 才认为稳态（升速中/抖动不入表）
+	fanRPMMapDeltaPct      = 2                // 与表现值差 ≤2% 不更新，避免反复写盘
+	fanRPMSaveMinInterval  = 30 * time.Second // 特性表落盘限频(内存更新不受限)
+	fanRPMCloseLoopTick    = 2 * time.Second
+	fanRPMCloseLoopTolPct  = 3  // 容差：|实测-目标| ≤ 目标的 3%
+	fanRPMCloseLoopMinTol  = 60 // 容差下限（转速读数本身有 ~±30 量化噪声）
+	fanRPMCloseLoopMaxAdj  = 20 // 单次微调的最大 PWM 步长（防震荡）
+	fanRPMCloseLoopMaxMiss = 15 // 连续不可达次数上限，超过即暂停微调（防永久抖动）
+
+	// 自动递增间隔的溢出护栏（百年，防 time.Duration 纳秒乘法回绕），不是
+	// 产品意义上的上限——间隔本身不设限，下限 1 秒。
+	fanAutoIntervalMax = 3155760000
 )
+
+// clampFanAutoInterval 把间隔钳进 [1, 百年]：只防荒谬大值撑爆 Duration。
+func clampFanAutoInterval(seconds int) int {
+	if seconds < 1 {
+		return 1
+	}
+	if seconds > fanAutoIntervalMax {
+		return fanAutoIntervalMax
+	}
+	return seconds
+}
 
 type fanRPMSample struct {
 	id  string
@@ -438,12 +461,24 @@ type fanRPMSample struct {
 	pwm int
 }
 
-// offerFanRPMSample 把读数非阻塞地投递给标定 goroutine：DiscoverFans 有时在
-// 持有 m.mu 的路径上被调用，这里绝不能等；通道满或未启用时丢弃（全速期间
-// 采样频繁，丢几个不影响稳态判定）。
+// fanRPMSlotWindow 当前档位的稳态窗口：同一时刻每风扇只有一个档位在采样，
+// PWM 换档即整体覆盖，天然避免跨工况混样。
+type fanRPMSlotWindow struct {
+	slot    int
+	samples []int
+}
+
+// offerFanRPMSample 把读数非阻塞地投递给学习 goroutine：DiscoverFans 有时在
+// 持有 m.mu 的路径上被调用，这里绝不能等；通道满时丢弃（稳态工况采样频繁，
+// 丢几个不影响判定）。
 func (m *Manager) offerFanRPMSample(id string, rpm, pwm int) {
+	if m.fanRPMLearnDisabled.Load() {
+		return
+	}
 	if m.fanRPMCalib == nil {
 		m.fanRPMCalibOnce.Do(func() {
+			m.fanRPMLearnStop = make(chan struct{})
+			m.fanRPMLearnDone = make(chan struct{})
 			m.fanRPMCalib = make(chan fanRPMSample, 64)
 			go m.runFanRPMCalibration()
 		})
@@ -455,65 +490,138 @@ func (m *Manager) offerFanRPMSample(id string, rpm, pwm int) {
 }
 
 func (m *Manager) runFanRPMCalibration() {
-	for sample := range m.fanRPMCalib {
-		m.processFanRPMSample(sample.id, sample.rpm, sample.pwm)
+	defer func() {
+		if m.fanRPMLearnDone != nil {
+			close(m.fanRPMLearnDone)
+		}
+	}()
+	for {
+		select {
+		case <-m.fanRPMLearnStop:
+			return
+		case sample := <-m.fanRPMCalib:
+			m.processFanRPMSample(sample.id, sample.rpm, sample.pwm)
+		}
 	}
 }
 
-// processFanRPMSample 消费一个读数：仅接受全速且合理的样本，窗口满且极差
-// 足够小视为稳态，取中位数与现基准比较后更新。窗口只被标定路径串行访问，
-// 不经 m.mu；基准与配置的读写走 m.mu。
+// stopFanRPMLearning 停止特性表学习并等待在途样本处理完。测试收尾专用:
+// 防残余 goroutine 与 t.TempDir 清理竞争写盘;生产进程退出即亡,不调用。
+func (m *Manager) stopFanRPMLearning() {
+	// 先挡住启动与投递(无论学习是否已启动),再对已启动的 goroutine 关停并
+	// 等待在途样本处理完。
+	m.fanRPMLearnDisabled.Store(true)
+	m.mu.Lock()
+	stop, done := m.fanRPMLearnStop, m.fanRPMLearnDone
+	m.mu.Unlock()
+	if stop != nil {
+		m.fanRPMLearnStopOnce.Do(func() { close(stop) })
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// processFanRPMSample 消费一个读数：合理性过滤后按档位攒窗，窗口满且极差
+// 足够小视为稳态，取中位数经 recordFanRPMData 入表。窗口只被学习路径串行
+// 访问，不经 m.mu；特性表/基准/配置的读写走 m.mu。
 func (m *Manager) processFanRPMSample(id string, rpm, pwm int) {
-	if pwm < fanRPMCalibMinPWM || rpm < fanRPMCalibMinRPM || rpm > fanRPMCalibMaxRPM {
+	if rpm < fanRPMCalibMinRPM || rpm > fanRPMCalibMaxRPM {
 		return
 	}
-	if m.fanRPMWindow == nil {
-		m.fanRPMWindow = map[string][]int{}
+	slot := pwm / fanRPMSlotStep * fanRPMSlotStep
+	if slot > 240 {
+		slot = 240 // 241–255 的转速差异可忽略，并入 240 档
 	}
-	buf := append(m.fanRPMWindow[id], rpm)
-	if len(buf) > fanRPMCalibWindow {
-		buf = buf[len(buf)-fanRPMCalibWindow:]
+	if m.fanRPMSlotWin == nil {
+		m.fanRPMSlotWin = map[string]*fanRPMSlotWindow{}
 	}
-	m.fanRPMWindow[id] = buf
-	if len(buf) < fanRPMCalibWindow {
+	win := m.fanRPMSlotWin[id]
+	if win == nil || win.slot != slot {
+		win = &fanRPMSlotWindow{slot: slot}
+		m.fanRPMSlotWin[id] = win
+	}
+	win.samples = append(win.samples, rpm)
+	if len(win.samples) > fanRPMSlotWinSize {
+		win.samples = win.samples[len(win.samples)-fanRPMSlotWinSize:]
+	}
+	if len(win.samples) < fanRPMSlotWinSize {
 		return
 	}
-	sorted := append([]int(nil), buf...)
+	sorted := append([]int(nil), win.samples...)
 	sort.Ints(sorted)
 	median := sorted[len(sorted)/2]
 	lo, hi := sorted[0], sorted[len(sorted)-1]
-	if (hi-lo)*100 > median*fanRPMCalibSpreadPct {
+	if (hi-lo)*100 > median*fanRPMSlotSpreadPct {
 		return // 升速中或读数抖动，未稳态
 	}
-	m.updateFanRPMBase(id, median)
+	m.recordFanRPMData(id, slot, median)
 }
 
-// updateFanRPMBase 与现基准差超过阈值才更新；内存先行（标定即时生效），
-// 落盘尽力而为（配置暂不可读/写失败时下次全速周期重试）。调用方不持 m.mu。
-func (m *Manager) updateFanRPMBase(id string, rpm int) {
+// recordFanRPMData 稳态中位数入特性表（高档位同时维护满转基准）；与现值差
+// 超过阈值才写，内存先行（学习即时生效），落盘尽力而为（失败时下次稳态
+// 重试）。调用方不持 m.mu。
+func (m *Manager) recordFanRPMData(id string, slot, rpm int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	current := m.fanDebugRPMBaseLocked(id)
-	delta := rpm - current
-	if delta < 0 {
-		delta = -delta
+	if m.fanRPMLearned == nil {
+		m.fanRPMLearned = map[string]map[int]int{}
 	}
-	if delta*100 <= current*fanRPMCalibDeltaPct {
-		return
+	table := m.fanRPMLearned[id]
+	if table == nil {
+		table = map[int]int{}
+		m.fanRPMLearned[id] = table
 	}
-	if m.fanRPMBase == nil {
-		m.fanRPMBase = map[string]int{}
+	if existing := table[slot]; existing > 0 {
+		delta := rpm - existing
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta*100 <= existing*fanRPMMapDeltaPct {
+			return // 表里已有可信值，不打扰
+		}
 	}
-	m.fanRPMBase[id] = rpm
-	cfg, err := m.loadConfigLocked()
-	if err != nil {
-		return
+	table[slot] = rpm
+	// 高档位顺带维护满转基准（同为稳态实测值，与标定语义一致）
+	if slot >= 240 {
+		current := m.fanDebugRPMBaseLocked(id)
+		delta := rpm - current
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta*100 > current*fanRPMMapDeltaPct {
+			if m.fanRPMBase == nil {
+				m.fanRPMBase = map[string]int{}
+			}
+			m.fanRPMBase[id] = rpm
+		}
 	}
-	if cfg.FanRPMBase == nil {
-		cfg.FanRPMBase = map[string]int{}
+	// 落盘节流:内存已更新,写盘限频——生产防高频写配置,也避免测试结束后
+	// 残余 goroutine 往已清理的临时目录写文件。断言落盘的测试先把
+	// fanRPMLastSave 清零。
+	if m.fanRPMLastSave.IsZero() || time.Since(m.fanRPMLastSave) >= fanRPMSaveMinInterval {
+		cfg, err := m.loadConfigLocked()
+		if err == nil {
+			if cfg.FanRPMBase == nil {
+				cfg.FanRPMBase = map[string]int{}
+			}
+			if cfg.FanRPMMap == nil {
+				cfg.FanRPMMap = map[string]map[int]int{}
+			}
+			for fanID, fanTable := range m.fanRPMLearned {
+				cfg.FanRPMMap[fanID] = fanTable
+			}
+			if base := m.fanRPMBase[id]; base > 0 {
+				cfg.FanRPMBase[id] = base
+			}
+			if writeJSONAtomic(m.ConfigPath, cfg, 0o600) == nil {
+				m.fanRPMLastSave = time.Now()
+			}
+		}
 	}
-	cfg.FanRPMBase[id] = rpm
-	_ = writeJSONAtomic(m.ConfigPath, cfg, 0o600)
 }
 
 // fanDebugRPMBaseLocked 返回该风扇的满转基准（未标定用默认值）。调用方须持
@@ -533,6 +641,189 @@ func (m *Manager) fanDebugRPMBaseLocked(id string) int {
 		return base
 	}
 	return fanRPMBaseDefault
+}
+
+// fanRPMLearnedLocked 返回该风扇的特性表（惰性从配置载入）。调用方须持 m.mu。
+func (m *Manager) fanRPMLearnedLocked(id string) map[int]int {
+	m.fanRPMBaseLoad.Do(func() {
+		m.fanRPMBase = map[string]int{}
+		if cfg, err := m.loadConfigLocked(); err == nil {
+			for fanID, base := range cfg.FanRPMBase {
+				if base > 0 {
+					m.fanRPMBase[fanID] = base
+				}
+			}
+		}
+	})
+	m.fanRPMMapLoad.Do(func() {
+		m.fanRPMLearned = map[string]map[int]int{}
+		if cfg, err := m.loadConfigLocked(); err == nil {
+			for fanID, table := range cfg.FanRPMMap {
+				clean := map[int]int{}
+				for slot, rpm := range table {
+					if slot >= 0 && slot <= 240 && rpm > 0 {
+						clean[slot] = rpm
+					}
+				}
+				if len(clean) > 0 {
+					m.fanRPMLearned[fanID] = clean
+				}
+			}
+		}
+	})
+	return m.fanRPMLearned[id]
+}
+
+// rpmToPWMEstimateLocked 设定目标转速时的 PWM 初值：特性表里夹逼插值（
+// "大概转速"），表外区间用满转基准线性外推，空表退化为纯基准线性（与旧
+// fanDebugRaw 行为一致）。调用方须持 m.mu。
+func (m *Manager) rpmToPWMEstimateLocked(id string, target int) int {
+	table := m.fanRPMLearnedLocked(id)
+	if len(table) == 0 {
+		base := m.fanDebugRPMBaseLocked(id)
+		return clampInt((target*255+base/2)/base, 0, 255)
+	}
+	// (转速, 档位) 按转速升序，找夹逼对线性插值
+	type point struct{ rpm, slot int }
+	points := make([]point, 0, len(table))
+	for slot, rpm := range table {
+		points = append(points, point{rpm, slot})
+	}
+	sort.Slice(points, func(i, j int) bool { return points[i].rpm < points[j].rpm })
+	if target <= points[0].rpm {
+		return points[0].slot
+	}
+	last := points[len(points)-1]
+	if target >= last.rpm {
+		// 表外高转速：满转基准线性外推（255×目标/基准），钳 255
+		base := m.fanDebugRPMBaseLocked(id)
+		return clampInt((target*255+base/2)/base, 0, 255)
+	}
+	for i := 1; i < len(points); i++ {
+		hi := points[i]
+		lo := points[i-1]
+		if target <= hi.rpm {
+			// 转速→PWM 反插值；相邻档转速相同（平台区）时任取低档
+			if hi.rpm == lo.rpm {
+				return lo.slot
+			}
+			return lo.slot + (target-lo.rpm)*(hi.slot-lo.slot)/(hi.rpm-lo.rpm)
+		}
+	}
+	return last.slot
+}
+
+// ---- RPM 闭环微调 ----
+
+// ensureFanRPMCloseLoop 保证闭环 goroutine 存活；无活跃目标时自动退出。
+func (m *Manager) ensureFanRPMCloseLoop() {
+	if m.fanRPMLoopRunning {
+		return
+	}
+	m.fanRPMLoopRunning = true
+	go m.runFanRPMCloseLoop()
+}
+
+// runFanRPMCloseLoop 每 tick 读一次反馈转速：|实测-目标| ≤ 容差即静默保持
+// （监控漂移），否则按差值比例微调 PWM（限幅防震荡）。活跃集合动态判定——
+// 只有"接管中 + rpm 单位 + 自动递增未运行"的风扇参与；集合为空 goroutine
+// 退出，下次设定转速时重新拉起。同一 PWM 的物理转速会随温度/电压缓漂，达标
+// 后仍保持监控是闭环的意义所在。
+func (m *Manager) runFanRPMCloseLoop() {
+	ticker := time.NewTicker(fanRPMCloseLoopTick)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !m.stepFanRPMCloseLoop() {
+			return
+		}
+	}
+}
+
+// stepFanRPMCloseLoop 单次闭环步：|实测-目标| ≤ 容差即静默保持（监控漂移），
+// 否则按差值比例微调 PWM（限幅防震荡）。活跃集合动态判定——只有"接管中 +
+// rpm 单位 + 自动递增未运行"的风扇参与；返回是否仍有活跃目标。
+func (m *Manager) stepFanRPMCloseLoop() bool {
+	{
+		m.mu.Lock()
+		fans, ferr := m.DiscoverFans()
+		active := false
+		if ferr == nil {
+			if m.fanRPMLoopMiss == nil {
+				m.fanRPMLoopMiss = map[string]int{}
+			}
+			if m.fanRPMLoopLocked == nil {
+				m.fanRPMLoopLocked = map[string]bool{}
+			}
+			var errs []error
+			for i := range fans {
+				fan := &fans[i]
+				id := fan.ID
+				if m.fanDebugUnits[id] != "rpm" {
+					continue
+				}
+				target, taken := m.fanDebugTakenOver[id]
+				if !taken {
+					continue
+				}
+				if m.fanRPMSuspend[id] {
+					continue // 主动标定进行中，闭环让位（满速采样与微调不能同写）
+				}
+				if m.fanDebugAuto != nil {
+					if entry, ok := m.fanDebugAuto.entries[id]; ok && entry.Running {
+						continue // 自动递增优先，闭环让位
+					}
+				}
+				active = true
+				tolerance := target * fanRPMCloseLoopTolPct / 100
+				if tolerance < fanRPMCloseLoopMinTol {
+					tolerance = fanRPMCloseLoopMinTol
+				}
+				actual := int(fan.RPM)
+				delta := actual - target
+				if delta < 0 {
+					delta = -delta
+				}
+				if delta <= tolerance {
+					m.fanRPMLoopMiss[id] = 0
+					m.fanRPMLoopLocked[id] = true
+					continue // 达标：保持现状，继续监控漂移
+				}
+				m.fanRPMLoopLocked[id] = false
+				if m.fanRPMLoopMiss[id] >= fanRPMCloseLoopMaxMiss {
+					continue // 连续不可达（目标在失速区/超量程），暂停避免永久抖动
+				}
+				base := m.fanDebugRPMBaseLocked(id)
+				adjust := (target - actual) * 255 / base
+				adjust = clampInt(adjust, -fanRPMCloseLoopMaxAdj, fanRPMCloseLoopMaxAdj)
+				// PWM 已顶格仍欠速：目标超出风扇能力，保持 255 不再回撤重试——
+				// 读数噪声会让"加满→超调→降档→欠速"无限循环（用户实测：PWM
+				// 到 98 又降回 90 重新试探）。直接进入暂停态；读数偶发进容差
+				// 仍会解冻（miss 清零）。
+				if adjust > 0 && int(fan.PWM) >= 255 {
+					m.fanRPMLoopMiss[id] = fanRPMCloseLoopMaxMiss
+					m.fanRPMLoopLocked[id] = true
+					continue
+				}
+				m.fanRPMLoopMiss[id]++
+				next := clampInt(int(fan.PWM)+adjust, 0, 255)
+				if next != int(fan.PWM) {
+					if err := setFanPWMRaw(*fan, next); err != nil {
+						errs = append(errs, fmt.Errorf("%s: %w", id, err))
+					}
+				}
+			}
+			if len(errs) > 0 {
+				m.fanDebugLastError = errors.Join(errs...).Error()
+			}
+		}
+		if !active {
+			m.fanRPMLoopRunning = false
+			m.mu.Unlock()
+			return false
+		}
+		m.mu.Unlock()
+		return true
+	}
 }
 
 func isIT87Name(name string) bool {
@@ -1065,9 +1356,9 @@ type fanDebugAutoTest struct {
 // 接管瞬间捕获 BIOS 原始状态，供插件停止/卸载时恢复。
 func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	fans, err := m.DiscoverFans()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	var target *FanDevice
@@ -1078,6 +1369,7 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		}
 	}
 	if target == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("fan %s was not found", id)
 	}
 	if m.fanDebugTakenOver == nil {
@@ -1086,9 +1378,11 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	if m.fanDebugUnits == nil {
 		m.fanDebugUnits = map[string]string{}
 	}
+	handBack := false
 	if taken {
 		if _, ok := m.fanDebugTakenOver[id]; !ok {
 			if err := m.captureOriginalFanLocked(*target); err != nil {
+				m.mu.Unlock()
 				return err
 			}
 		}
@@ -1100,8 +1394,37 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		if m.fanDebugAuto != nil {
 			delete(m.fanDebugAuto.entries, id)
 		}
+		// 立即交还控制,不等曲线循环下一拍:先写回接管时的存档 PWM——覆盖
+		// "风扇不在曲线列表/风扇控制已停用"这两种场景(没有任何后台路径会
+		// 再碰它,不写回就永久保持调试转速);曲线开着时函数尾部的
+		// ApplyFanCurrent 随即按当前曲线目标落定。
+		if original, err := m.originalFanPWMLocked(id); err == nil && original >= 0 {
+			_ = setFanPWMRaw(*target, int(original))
+		}
+		handBack = true
+	}
+	m.mu.Unlock()
+	if handBack {
+		if cfg, cfgErr := m.loadConfigLocked(); cfgErr == nil && cfg.Fan.Enabled {
+			_ = m.ApplyFanCurrent()
+		}
 	}
 	return nil
+}
+
+// originalFanPWMLocked 返回风扇第一次被接管/纳入控制时存档的 PWM;无存档
+// 返回 -1。调用方须持 m.mu。
+func (m *Manager) originalFanPWMLocked(id string) (int64, error) {
+	state, err := m.loadFanStateLocked()
+	if err != nil {
+		return -1, err
+	}
+	for _, original := range state.Fans {
+		if original.ID == id {
+			return original.PWM, nil
+		}
+	}
+	return -1, nil
 }
 
 // fanDebugUnitMax 返回单位对应的调试值上限:pwm 0–255,percent 0–100。
@@ -1150,11 +1473,29 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	if _, ok := m.fanDebugTakenOver[id]; !ok {
 		return fmt.Errorf("风扇 %s 未被接管", id)
 	}
+	// 运行中的参数锁定由前端禁用控件承担;这里不做拒绝——运行中切换单位
+	// 走本函数做等比换算,是无损操作(见 TestFanDebugUnitSwitchMidRamp)。
 	fans, err := m.DiscoverFans()
 	if err != nil {
 		return err
 	}
-	raw := fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
+	// rpm 单位：特性表插值得初值（"大概转速"），闭环随后按反馈微调到容差内；
+	// 其余单位保持精确换算。新目标重置闭环计数,给收敛重新计时。
+	var raw int
+	if unit == "rpm" {
+		raw = m.rpmToPWMEstimateLocked(id, value)
+		if m.fanRPMLoopMiss == nil {
+			m.fanRPMLoopMiss = map[string]int{}
+		}
+		if m.fanRPMLoopLocked == nil {
+			m.fanRPMLoopLocked = map[string]bool{}
+		}
+		m.fanRPMLoopMiss[id] = 0
+		m.fanRPMLoopLocked[id] = false
+		m.ensureFanRPMCloseLoop()
+	} else {
+		raw = fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
+	}
 	var errs []error
 	for i := range fans {
 		if fans[i].ID != id {
@@ -1215,9 +1556,10 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 		if step < 1 || step > m.fanDebugUnitMaxFor(id, unit) {
 			return fmt.Errorf("风扇 %s 的递增转速需在 1–%d 之间", id, m.fanDebugUnitMaxFor(id, unit))
 		}
-		if intervalSeconds < 1 || intervalSeconds > 120 {
-			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
+		if intervalSeconds < 1 {
+			return fmt.Errorf("风扇 %s 的递增间隔需至少 1 秒", id)
 		}
+		intervalSeconds = clampFanAutoInterval(intervalSeconds)
 	}
 	entry := m.fanDebugAuto.entries[id]
 	if running {
@@ -1292,7 +1634,13 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				if value > unitMax {
 					value = unitMax
 				}
-				raw := fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
+				// rpm 步进同样查特性表取初值(大概转速),其余单位精确换算
+				var raw int
+				if unit == "rpm" {
+					raw = m.rpmToPWMEstimateLocked(id, value)
+				} else {
+					raw = fanDebugRaw(unit, value, m.fanDebugRPMBaseLocked(id))
+				}
 				for i := range fans {
 					if fans[i].ID == id {
 						if err := setFanPWMRaw(fans[i], raw); err != nil {
@@ -1303,7 +1651,13 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				}
 				m.fanDebugTakenOver[id] = value
 				entry.LastRamp = now
-				if value >= unitMax {
+				// PWM 已顶格:风扇到硬件上限,RPM 单位下继续按设定值空转只会
+				// "转不上去一直挣扎"(设定值虚高过实际可达),提前完成并保持
+				// 全速;完成后的闭环另有顶格冻结兜底
+				if raw >= 255 {
+					entry.Done = true
+					entry.Running = false
+				} else if value >= unitMax {
 					entry.Done = true
 					entry.Running = false
 				} else {
@@ -1352,9 +1706,10 @@ func (m *Manager) StartFanDebugAutoBatch(entries map[string]fanDebugAutoEntry) e
 		if entry.Step < 1 || entry.Step > fanDebugUnitMax(entry.Unit) {
 			return fmt.Errorf("风扇 %s 的递增转速超出该单位上限", id)
 		}
-		if entry.Interval < 1 || entry.Interval > 120 {
-			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
+		if entry.Interval < 1 {
+			return fmt.Errorf("风扇 %s 的递增间隔需至少 1 秒", id)
 		}
+		entry.Interval = clampFanAutoInterval(entry.Interval)
 	}
 	m.stopFanDebugAutoLocked()
 	now := time.Now()
@@ -1387,6 +1742,8 @@ type FanDebugFan struct {
 	DebugPercent int    `json:"debug_percent,omitempty"`
 	DebugUnit    string `json:"debug_unit,omitempty"`    // 该风扇调试值的单位(percent/pwm),未设置按 percent
 	RPMMax       int    `json:"rpm_max"`                 // 该风扇的满转基准(RPM):调试转速上限与 rpm 换算分母,未标定为 2000
+	RPMTracking  bool   `json:"rpm_tracking,omitempty"`  // rpm 闭环跟踪中(目标已设定且未因不可达暂停)
+	RPMLocked    bool   `json:"rpm_locked,omitempty"`    // rpm 闭环达标(|实测-目标| 在容差内)
 	AutoStep     int    `json:"auto_step,omitempty"`     // 自动递增:每 Interval 秒 +Step
 	AutoInterval int    `json:"auto_interval,omitempty"` // 自动递增间隔(秒)
 	AutoRunning  bool   `json:"auto_running"`            // 自动递增进行中
@@ -1398,6 +1755,157 @@ type FanDebugState struct {
 	AutoRunning bool          `json:"auto_running"` // 任一风扇的自动递增进行中
 	LastError   string        `json:"last_error,omitempty"`
 	Fans        []FanDebugFan `json:"fans"`
+}
+
+// ---- 主动标定满转基准 ----
+
+const (
+	fanCalibSampleInterval = 500 * time.Millisecond // 稳态采样间隔
+	fanCalibSteadyWindow   = 4                      // 最近 N 个读数极差 ≤ 阈值即稳态
+	fanCalibSpreadPct      = 3                      // 稳态极差阈值（闭环容差级别，比被动学习略紧）
+	fanCalibMinSamples     = 3                      // 超时兜底所需的最少全速读数
+	fanCalibTimeout        = 9 * time.Second        // 风扇升速一般 1~3 秒，9 秒覆盖慢扇
+)
+
+// CalibrateFanRPM 主动标定单个风扇的满转基准：全速运转至读数稳态（最多约
+// 9 秒），稳态中位数经特性表入档（240 档 + 更新满转基准并落盘），随后恢复
+// 标定前的控制状态——原接管恢复原调试值与原 PWM，原未接管交还曲线控制。
+// 标定期间该风扇的 RPM 闭环挂起，避免微调与满速采样互相打架。返回新基准。
+func (m *Manager) CalibrateFanRPM(id string) (int, error) {
+	m.mu.Lock()
+	if m.fanDebugAuto != nil {
+		if entry, ok := m.fanDebugAuto.entries[id]; ok && entry.Running {
+			m.mu.Unlock()
+			return 0, fmt.Errorf("风扇 %s 的自动测试进行中,请先关闭该行的自动测试再标定", id)
+		}
+	}
+	fans, _ := m.DiscoverFans()
+	var target *FanDevice
+	for i := range fans {
+		if fans[i].ID == id {
+			target = &fans[i]
+			break
+		}
+	}
+	if target == nil {
+		m.mu.Unlock()
+		return 0, fmt.Errorf("fan %s was not found", id)
+	}
+	// 记录标定前的控制状态，结束时原样恢复
+	originalPWM := target.PWM
+	originalValue, wasTaken := m.fanDebugTakenOver[id]
+	originalUnit := m.fanDebugUnits[id]
+	if !wasTaken {
+		// 临时接管：从当前转速无缝进入全速（capture 保证释放后可恢复）
+		if err := m.captureOriginalFanLocked(*target); err != nil {
+			m.mu.Unlock()
+			return 0, err
+		}
+		if m.fanDebugTakenOver == nil {
+			m.fanDebugTakenOver = map[string]int{}
+		}
+		m.fanDebugTakenOver[id] = pwmToPercent(target.PWM)
+	}
+	if m.fanRPMSuspend == nil {
+		m.fanRPMSuspend = map[string]bool{}
+	}
+	m.fanRPMSuspend[id] = true
+	writeErr := setFanPWMRaw(*target, 255)
+	if writeErr != nil {
+		m.restoreAfterCalibrateLocked(id, wasTaken, originalValue, originalUnit, originalPWM)
+		m.mu.Unlock()
+		return 0, fmt.Errorf("全速写入失败: %w", writeErr)
+	}
+	m.mu.Unlock()
+
+	median, samples, calibErr := m.sampleFanRPMSteady(id)
+	if calibErr == nil {
+		m.recordFanRPMData(id, 240, median) // 入特性表最高档并维护满转基准（自带加锁）
+	}
+	m.mu.Lock()
+	m.restoreAfterCalibrateLocked(id, wasTaken, originalValue, originalUnit, originalPWM)
+	base := m.fanDebugRPMBaseLocked(id)
+	m.mu.Unlock()
+	if calibErr != nil {
+		return 0, calibErr
+	}
+	_ = samples
+	return base, nil
+}
+
+// sampleFanRPMSteady 全速读数循环：每 500ms 读一次，最近 4 个读数极差 ≤3%
+// 即稳态返回中位数；超时则退而求其次用已有读数的中位数（至少 fanCalibMinSamples
+// 个），否则报错。调用方不持 m.mu。
+func (m *Manager) sampleFanRPMSteady(id string) (int, int, error) {
+	deadline := time.Now().Add(fanCalibTimeout)
+	var buf []int
+	for {
+		time.Sleep(fanCalibSampleInterval)
+		m.mu.Lock()
+		fans, err := m.DiscoverFans()
+		m.mu.Unlock()
+		if err == nil {
+			for i := range fans {
+				if fans[i].ID != id {
+					continue
+				}
+				if rpm := int(fans[i].RPM); rpm >= fanRPMCalibMinRPM && rpm <= fanRPMCalibMaxRPM {
+					buf = append(buf, rpm)
+					if len(buf) > fanCalibSteadyWindow {
+						buf = buf[len(buf)-fanCalibSteadyWindow:]
+					}
+				}
+				break
+			}
+		}
+		if len(buf) >= fanCalibSteadyWindow {
+			sorted := append([]int(nil), buf...)
+			sort.Ints(sorted)
+			lo, hi, median := sorted[0], sorted[len(sorted)-1], sorted[len(sorted)/2]
+			if (hi-lo)*100 <= median*fanCalibSpreadPct {
+				return median, len(buf), nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if len(buf) >= fanCalibMinSamples {
+				sorted := append([]int(nil), buf...)
+				sort.Ints(sorted)
+				return sorted[len(sorted)/2], len(buf), nil
+			}
+			return 0, len(buf), fmt.Errorf("转速读数不稳定（%d 个有效读数），无法标定；请检查风扇后重试", len(buf))
+		}
+	}
+}
+
+// restoreAfterCalibrateLocked 恢复标定前的控制状态。两个分支都立即写回
+// 原始 PWM:接管分支重建调试值,未接管分支交还曲线控制——若控制已停用,
+// 不写回会让风扇停在标定的全速上。调用方须持 m.mu。
+func (m *Manager) restoreAfterCalibrateLocked(id string, wasTaken bool, originalValue int, originalUnit string, originalPWM int64) {
+	delete(m.fanRPMSuspend, id)
+	fans, err := m.DiscoverFans()
+	if err == nil {
+		for i := range fans {
+			if fans[i].ID == id {
+				_ = setFanPWMRaw(fans[i], int(originalPWM))
+				break
+			}
+		}
+	}
+	if wasTaken {
+		m.fanDebugTakenOver[id] = originalValue
+		if originalUnit != "" {
+			if m.fanDebugUnits == nil {
+				m.fanDebugUnits = map[string]string{}
+			}
+			m.fanDebugUnits[id] = originalUnit
+		}
+		return
+	}
+	// 标定前未接管：交还曲线控制（原始状态已在接管时存档）
+	delete(m.fanDebugTakenOver, id)
+	if m.fanDebugAuto != nil {
+		delete(m.fanDebugAuto.entries, id)
+	}
 }
 
 // FanDebugState 汇总调试状态与全部已发现风扇（按接口枚举，0 转也列出）。
@@ -1438,6 +1946,13 @@ func (m *Manager) FanDebugState() FanDebugState {
 		}
 		if unit, ok := m.fanDebugUnits[fan.ID]; ok {
 			item.DebugUnit = unit
+			if unit == "rpm" {
+				if _, taken := m.fanDebugTakenOver[fan.ID]; taken {
+					// rpm 闭环状态:目标已设定即跟踪中;连续不可达超限时暂停
+					item.RPMTracking = m.fanRPMLoopMiss[fan.ID] < fanRPMCloseLoopMaxMiss
+					item.RPMLocked = m.fanRPMLoopLocked[fan.ID]
+				}
+			}
 		}
 		if percent, ok := m.fanDebugTakenOver[fan.ID]; ok {
 			item.TakenOver = true
