@@ -161,6 +161,7 @@ func serve(args []string) error {
 		logger = log.New(file, "", log.LstdFlags|log.LUTC)
 	}
 	manager := &powerguard.Manager{Root: *root, ConfigPath: *config, StatePath: *state, Version: version}
+	manager.SetLogger(logger)
 	cfg, err := manager.LoadOrCreateConfig()
 	if err != nil {
 		return err

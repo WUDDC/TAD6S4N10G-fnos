@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -77,6 +78,7 @@ type Config struct {
 // 替换各自配置，混进去的界面偏好会被误覆盖。零值表示未设置。
 type UIPrefsConfig struct {
 	HistoryRangeHours float64 `json:"history_range_hours,omitempty"` // 历史温度时间范围档位（小时）
+	FanDebugVisible   bool    `json:"fan_debug_visible,omitempty"`   // 调试页风扇调试卡片是否显示（跨浏览器跟随账号）
 }
 
 // LogConfig 运行日志的大小设置：与历史数据库大小上限解耦。日志体量小，
@@ -245,6 +247,10 @@ type Manager struct {
 	fanRPMLearnDisabled atomic.Bool                  // 学习已停用(测试收尾置位):挡住启动与投递
 	fanRPMLearnStopOnce sync.Once
 
+	// 运行日志器（main 注入）：配置保存等需要用户可见痕迹的动作写这里；
+	// 未注入（单测）静默。
+	logger *log.Logger
+
 	// 主动标定期间挂起对应风扇的 RPM 闭环（避免闭环微调与全速标定互相打架）
 	fanRPMSuspend map[string]bool
 
@@ -254,6 +260,20 @@ type Manager struct {
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
 	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
+}
+
+// SetLogger 注入运行日志器（main 启动时调用）。
+func (m *Manager) SetLogger(logger *log.Logger) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logger = logger
+}
+
+// logf 在注入了日志器时记一条；未注入（单测）静默。调用方须持 m.mu。
+func (m *Manager) logf(format string, args ...any) {
+	if m.logger != nil {
+		m.logger.Printf(format, args...)
+	}
 }
 
 func DetectProfile(model string) (Profile, error) {
@@ -557,6 +577,8 @@ func (m *Manager) SaveUIPrefs(prefs UIPrefsConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
+	// 界面偏好落盘留痕：谁在什么时候切了风扇调试卡/档位，运行日志可追溯
+	m.logf("ui prefs saved: fan_debug_visible=%v history_range_hours=%v", prefs.FanDebugVisible, prefs.HistoryRangeHours)
 	return nil
 }
 

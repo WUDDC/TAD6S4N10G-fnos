@@ -273,12 +273,13 @@ func (s *Server) handleUIPrefsConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		HistoryRangeHours float64 `json:"history_range_hours"`
+		FanDebugVisible   bool    `json:"fan_debug_visible"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours}); err != nil {
+	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours, FanDebugVisible: payload.FanDebugVisible}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

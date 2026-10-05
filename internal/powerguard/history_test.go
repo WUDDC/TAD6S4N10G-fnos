@@ -1144,6 +1144,42 @@ func TestSaveUIPrefsPersistsAndClamps(t *testing.T) {
 	}
 }
 
+// 风扇调试卡显隐偏好落服务端(ui_prefs),保存成功写运行日志留痕;
+// 未注入日志器时静默不报错。
+func TestSaveUIPrefsFanDebugVisibleAndLog(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	var logBuf bytes.Buffer
+	manager.SetLogger(log.New(&logBuf, "", 0))
+	// 开 + 档位一起存(前端整段替换语义)
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24, FanDebugVisible: true}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.UIPrefs.FanDebugVisible || cfg.UIPrefs.HistoryRangeHours != 24 {
+		t.Fatalf("fan_debug_visible should persist alongside range, got %+v", cfg.UIPrefs)
+	}
+	if !strings.Contains(logBuf.String(), "ui prefs saved") || !strings.Contains(logBuf.String(), "fan_debug_visible=true") {
+		t.Fatalf("save must leave a trace in the run log, got %q", logBuf.String())
+	}
+	// 关:字段回落 false(omitempty 后从 JSON 省略,解码即 false)
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UIPrefs.FanDebugVisible {
+		t.Fatal("fan_debug_visible should turn off when saved as false")
+	}
+	if !strings.Contains(logBuf.String(), "fan_debug_visible=false") {
+		t.Fatalf("off transition should be logged too, got %q", logBuf.String())
+	}
+}
+
 // /api/config/ui-prefs：方法守卫 + 管理员鉴权同其它配置接口，成功返回 Status。
 func TestHandleUIPrefsConfig(t *testing.T) {
 	manager := newHistoryTestManager(t)

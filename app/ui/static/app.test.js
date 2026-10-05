@@ -517,7 +517,7 @@ test('档位记忆挂后端：切档 POST api/config/ui-prefs；首帧采纳后�
   const prefPosts = wrote.requests.filter((req) => req.url.includes('api/config/ui-prefs'));
   assert.equal(prefPosts.length, 1, '切档应 POST 一次 ui-prefs');
   assert.equal(prefPosts[0].init.method, 'POST');
-  assert.deepEqual(JSON.parse(prefPosts[0].init.body), { history_range_hours: 6 });
+  assert.deepEqual(JSON.parse(prefPosts[0].init.body), { history_range_hours: 6, fan_debug_visible: false }, 'ui_prefs 整段替换,必须带上当前开关值');
 
   // 独立上下文（未手动切档）：后端下发 2 小时 → 采纳并按新档位取数
   const adopt = recordingFetch(() => ({ samples: [] }));
