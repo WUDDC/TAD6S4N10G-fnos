@@ -1161,7 +1161,7 @@ func TestSaveUIPrefsFanDebugVisibleAndLog(t *testing.T) {
 	if !cfg.UIPrefs.FanDebugVisible || cfg.UIPrefs.HistoryRangeHours != 24 {
 		t.Fatalf("fan_debug_visible should persist alongside range, got %+v", cfg.UIPrefs)
 	}
-	if !strings.Contains(logBuf.String(), "ui prefs saved") || !strings.Contains(logBuf.String(), "fan_debug_visible=true") {
+	if !strings.Contains(logBuf.String(), "config.json saved") {
 		t.Fatalf("save must leave a trace in the run log, got %q", logBuf.String())
 	}
 	// 关:字段回落 false(omitempty 后从 JSON 省略,解码即 false)
@@ -1175,8 +1175,14 @@ func TestSaveUIPrefsFanDebugVisibleAndLog(t *testing.T) {
 	if cfg.UIPrefs.FanDebugVisible {
 		t.Fatal("fan_debug_visible should turn off when saved as false")
 	}
-	if !strings.Contains(logBuf.String(), "fan_debug_visible=false") {
-		t.Fatalf("off transition should be logged too, got %q", logBuf.String())
+	// 关闭后再次保存:同样留下"保存发生过"的痕迹(日志只记保存事实,
+	// 不记字段值——排查"客户说没同步"只需要时间戳)
+	logBuf.Reset()
+	if err := manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: 24}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logBuf.String(), "config.json saved") {
+		t.Fatalf("second save should be logged as well, got %q", logBuf.String())
 	}
 }
 

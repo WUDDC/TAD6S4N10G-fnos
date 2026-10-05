@@ -276,6 +276,17 @@ func (m *Manager) logf(format string, args ...any) {
 	}
 }
 
+// saveConfigLocked 用户主动保存的统一写盘出口：成功即记一条运行日志。
+// 排查"设置没同步"时，日志里有保存记录 = 客户当时确实点了保存；自动学习
+// 等内部写盘不走这里（高频且非用户点击，会稀释信号）。调用方须持 m.mu。
+func (m *Manager) saveConfigLocked(cfg Config) error {
+	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+		return err
+	}
+	m.logf("config.json saved")
+	return nil
+}
+
 func DetectProfile(model string) (Profile, error) {
 	normalized := strings.ToLower(strings.Join(strings.Fields(model), " "))
 	if strings.Contains(normalized, "i3-n305") || strings.Contains(normalized, "i3 n305") {
@@ -331,7 +342,7 @@ func (m *Manager) SaveHistoryConfig(history HistoryConfig) error {
 		_ = os.Remove(probe)
 		cfg.History.ArchiveDir = dir
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -363,7 +374,7 @@ func (m *Manager) SaveLogConfig(logCfg LogConfig) error {
 	}
 	cfg.Log = logCfg
 	normalizeConfig(&cfg)
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -496,7 +507,7 @@ func (m *Manager) SaveAndApply(cfg Config) error {
 		m.lastError = err.Error()
 		return err
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -554,7 +565,7 @@ func (m *Manager) SaveSensorSettings(names, groups map[string]string) error {
 	}
 	cfg.SensorNames = cleanedNames
 	cfg.SensorGroups = cleanedGroups
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -573,12 +584,10 @@ func (m *Manager) SaveUIPrefs(prefs UIPrefsConfig) error {
 		return err
 	}
 	cfg.UIPrefs = prefs
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
-	// 界面偏好落盘留痕：谁在什么时候切了风扇调试卡/档位，运行日志可追溯
-	m.logf("ui prefs saved: fan_debug_visible=%v history_range_hours=%v", prefs.FanDebugVisible, prefs.HistoryRangeHours)
 	return nil
 }
 
@@ -609,7 +618,7 @@ func (m *Manager) SaveGlobalConfig(global GlobalConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -642,7 +651,7 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -674,7 +683,7 @@ func (m *Manager) SaveGPIOConfig(gpio GPIOConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -726,7 +735,7 @@ func (m *Manager) DisableAndRestore() error {
 	if err := m.validateLocked(cfg); err != nil {
 		return err
 	}
-	if err := writeJSONAtomic(m.ConfigPath, cfg, 0o600); err != nil {
+	if err := m.saveConfigLocked(cfg); err != nil {
 		return err
 	}
 	if err := m.restoreLocked(); err != nil {
