@@ -2572,7 +2572,7 @@ function buildFanDebugInput(unitDef, className, kind, fanId, ariaLabel) {
   const input = document.createElement('input');
   input.type = 'number';
   input.min = kind === 'interval' ? '1' : '0';
-  input.max = String(unitDef.max);
+  if (Number.isFinite(unitDef.max)) input.max = String(unitDef.max);
   input.step = '1';
   input.inputMode = 'numeric';
   input.className = className;
@@ -2705,7 +2705,7 @@ function renderFanDebug(state) {
       const stepWrap = buildFanDebugInput({ ...debugUnit, max: unitMax(debugUnit) }, 'fan-debug-auto-input', 'step', fan.id, `递增转速 ${fan.id}`);
       const stepInput = stepWrap.input;
       stepInput.value = pending[fan.id + ':step'] ?? String(fan.auto_step || 5);
-      const intervalWrap = buildFanDebugInput({ max: 120, suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
+      const intervalWrap = buildFanDebugInput({ suffix: '秒' }, 'fan-debug-auto-input', 'interval', fan.id, `递增间隔 ${fan.id}`);
       const intervalInput = intervalWrap.input;
       intervalInput.value = pending[fan.id + ':interval'] ?? String(fan.auto_interval || 10);
       debugCell.append(unit, debugWrap.wrap, apply, calibrate);

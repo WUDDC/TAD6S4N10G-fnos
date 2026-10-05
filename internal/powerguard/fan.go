@@ -438,7 +438,22 @@ const (
 	fanRPMCloseLoopMinTol  = 60 // 容差下限（转速读数本身有 ~±30 量化噪声）
 	fanRPMCloseLoopMaxAdj  = 20 // 单次微调的最大 PWM 步长（防震荡）
 	fanRPMCloseLoopMaxMiss = 15 // 连续不可达次数上限，超过即暂停微调（防永久抖动）
+
+	// 自动递增间隔的溢出护栏（百年，防 time.Duration 纳秒乘法回绕），不是
+	// 产品意义上的上限——间隔本身不设限，下限 1 秒。
+	fanAutoIntervalMax = 3155760000
 )
+
+// clampFanAutoInterval 把间隔钳进 [1, 百年]：只防荒谬大值撑爆 Duration。
+func clampFanAutoInterval(seconds int) int {
+	if seconds < 1 {
+		return 1
+	}
+	if seconds > fanAutoIntervalMax {
+		return fanAutoIntervalMax
+	}
+	return seconds
+}
 
 type fanRPMSample struct {
 	id  string
@@ -1332,9 +1347,9 @@ type fanDebugAutoTest struct {
 // 接管瞬间捕获 BIOS 原始状态，供插件停止/卸载时恢复。
 func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	fans, err := m.DiscoverFans()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	var target *FanDevice
@@ -1345,6 +1360,7 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		}
 	}
 	if target == nil {
+		m.mu.Unlock()
 		return fmt.Errorf("fan %s was not found", id)
 	}
 	if m.fanDebugTakenOver == nil {
@@ -1353,9 +1369,11 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 	if m.fanDebugUnits == nil {
 		m.fanDebugUnits = map[string]string{}
 	}
+	handBack := false
 	if taken {
 		if _, ok := m.fanDebugTakenOver[id]; !ok {
 			if err := m.captureOriginalFanLocked(*target); err != nil {
+				m.mu.Unlock()
 				return err
 			}
 		}
@@ -1367,8 +1385,37 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		if m.fanDebugAuto != nil {
 			delete(m.fanDebugAuto.entries, id)
 		}
+		// 立即交还控制,不等曲线循环下一拍:先写回接管时的存档 PWM——覆盖
+		// "风扇不在曲线列表/风扇控制已停用"这两种场景(没有任何后台路径会
+		// 再碰它,不写回就永久保持调试转速);曲线开着时函数尾部的
+		// ApplyFanCurrent 随即按当前曲线目标落定。
+		if original, err := m.originalFanPWMLocked(id); err == nil && original >= 0 {
+			_ = setFanPWMRaw(*target, int(original))
+		}
+		handBack = true
+	}
+	m.mu.Unlock()
+	if handBack {
+		if cfg, cfgErr := m.loadConfigLocked(); cfgErr == nil && cfg.Fan.Enabled {
+			_ = m.ApplyFanCurrent()
+		}
 	}
 	return nil
+}
+
+// originalFanPWMLocked 返回风扇第一次被接管/纳入控制时存档的 PWM;无存档
+// 返回 -1。调用方须持 m.mu。
+func (m *Manager) originalFanPWMLocked(id string) (int64, error) {
+	state, err := m.loadFanStateLocked()
+	if err != nil {
+		return -1, err
+	}
+	for _, original := range state.Fans {
+		if original.ID == id {
+			return original.PWM, nil
+		}
+	}
+	return -1, nil
 }
 
 // fanDebugUnitMax 返回单位对应的调试值上限:pwm 0–255,percent 0–100。
@@ -1498,9 +1545,10 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 		if step < 1 || step > m.fanDebugUnitMaxFor(id, unit) {
 			return fmt.Errorf("风扇 %s 的递增转速需在 1–%d 之间", id, m.fanDebugUnitMaxFor(id, unit))
 		}
-		if intervalSeconds < 1 || intervalSeconds > 120 {
-			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
+		if intervalSeconds < 1 {
+			return fmt.Errorf("风扇 %s 的递增间隔需至少 1 秒", id)
 		}
+		intervalSeconds = clampFanAutoInterval(intervalSeconds)
 	}
 	entry := m.fanDebugAuto.entries[id]
 	if running {
@@ -1641,9 +1689,10 @@ func (m *Manager) StartFanDebugAutoBatch(entries map[string]fanDebugAutoEntry) e
 		if entry.Step < 1 || entry.Step > fanDebugUnitMax(entry.Unit) {
 			return fmt.Errorf("风扇 %s 的递增转速超出该单位上限", id)
 		}
-		if entry.Interval < 1 || entry.Interval > 120 {
-			return fmt.Errorf("风扇 %s 的递增间隔需在 1–120 秒之间", id)
+		if entry.Interval < 1 {
+			return fmt.Errorf("风扇 %s 的递增间隔需至少 1 秒", id)
 		}
+		entry.Interval = clampFanAutoInterval(entry.Interval)
 	}
 	m.stopFanDebugAutoLocked()
 	now := time.Now()

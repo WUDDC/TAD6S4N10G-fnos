@@ -576,3 +576,88 @@ func TestCalibrateFanRPMFullSpeed(t *testing.T) {
 		t.Fatalf("suspended fan must not be adjusted by the close loop, pwm=%d", got)
 	}
 }
+
+// ---- 回归:取消接管立即恢复转速;递增间隔不设上限 ----
+
+// 释放接管必须立即把 PWM 写回接管时的存档值:被调试风扇不在曲线列表时
+// 没有任何后台路径会再碰它,不写回就永久保持调试转速(用户实测)。
+func TestFanDebugTakeoverReleaseRestoresPWM(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{Root: root, ConfigPath: configPath}
+	const id = "it8613:hwmon8:fan2"
+	pwm2 := filepath.Join(hwmon, "pwm2")
+
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugValue(id, 0, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readInt(pwm2); got != 0 {
+		t.Fatalf("debug value should drive the fan to pwm 0, got %d", got)
+	}
+	if err := m.SetFanDebugTakeover(id, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := readInt(pwm2); got != 100 {
+		t.Fatalf("release must restore the captured PWM immediately, got %d", got)
+	}
+	if _, taken := m.fanDebugTakenOver[id]; taken {
+		t.Fatal("release must clear the takeover state")
+	}
+}
+
+// 递增间隔不设上限(旧实现限 1–120):>120 接受,0 报错,荒谬大值钳到
+// 溢出护栏(百年)防 Duration 回绕。
+func TestFanDebugAutoIntervalUnbounded(t *testing.T) {
+	root := t.TempDir()
+	hwmon := filepath.Join(root, "sys", "class", "hwmon", "hwmon8")
+	if err := os.MkdirAll(hwmon, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, filepath.Join(hwmon, "name"), "it8613")
+	writeTestValue(t, filepath.Join(hwmon, "fan2_input"), "2000")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "100")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "1")
+	m := &Manager{Root: root}
+	const id = "it8613:hwmon8:fan2"
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatal(err)
+	}
+	// 3600 秒(1 小时)合法
+	if err := m.SetFanDebugAuto(id, true, 5, 3600, "percent"); err != nil {
+		t.Fatalf("interval beyond the old 120s cap must be accepted: %v", err)
+	}
+	m.mu.Lock()
+	got := m.fanDebugAuto.entries[id].Interval
+	m.mu.Unlock()
+	if got != 3600 {
+		t.Fatalf("interval should be stored verbatim, got %d", got)
+	}
+	// 0 报错
+	if err := m.SetFanDebugAuto(id, true, 5, 0, "percent"); err == nil {
+		t.Fatal("interval 0 must be rejected")
+	}
+	// 荒谬大值钳到溢出护栏
+	if err := m.SetFanDebugAuto(id, true, 5, 9999999999, "percent"); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	got = m.fanDebugAuto.entries[id].Interval
+	m.mu.Unlock()
+	if got != fanAutoIntervalMax {
+		t.Fatalf("absurd interval must clamp to the overflow guard, got %d", got)
+	}
+}
