@@ -792,10 +792,19 @@ func (m *Manager) stepFanRPMCloseLoop() bool {
 				if m.fanRPMLoopMiss[id] >= fanRPMCloseLoopMaxMiss {
 					continue // 连续不可达（目标在失速区/超量程），暂停避免永久抖动
 				}
-				m.fanRPMLoopMiss[id]++
 				base := m.fanDebugRPMBaseLocked(id)
 				adjust := (target - actual) * 255 / base
 				adjust = clampInt(adjust, -fanRPMCloseLoopMaxAdj, fanRPMCloseLoopMaxAdj)
+				// PWM 已顶格仍欠速：目标超出风扇能力，保持 255 不再回撤重试——
+				// 读数噪声会让"加满→超调→降档→欠速"无限循环（用户实测：PWM
+				// 到 98 又降回 90 重新试探）。直接进入暂停态；读数偶发进容差
+				// 仍会解冻（miss 清零）。
+				if adjust > 0 && int(fan.PWM) >= 255 {
+					m.fanRPMLoopMiss[id] = fanRPMCloseLoopMaxMiss
+					m.fanRPMLoopLocked[id] = true
+					continue
+				}
+				m.fanRPMLoopMiss[id]++
 				next := clampInt(int(fan.PWM)+adjust, 0, 255)
 				if next != int(fan.PWM) {
 					if err := setFanPWMRaw(*fan, next); err != nil {
@@ -1642,7 +1651,13 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 				}
 				m.fanDebugTakenOver[id] = value
 				entry.LastRamp = now
-				if value >= unitMax {
+				// PWM 已顶格:风扇到硬件上限,RPM 单位下继续按设定值空转只会
+				// "转不上去一直挣扎"(设定值虚高过实际可达),提前完成并保持
+				// 全速;完成后的闭环另有顶格冻结兜底
+				if raw >= 255 {
+					entry.Done = true
+					entry.Running = false
+				} else if value >= unitMax {
 					entry.Done = true
 					entry.Running = false
 				} else {
