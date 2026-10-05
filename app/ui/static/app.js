@@ -2823,6 +2823,10 @@ async function applyFanTakeover(id, taken) {
 // 单风扇自动递增的开/关:开=以当前调试值为基准,按该行步进/间隔/单位递增;
 // 关=停在当前转速(参数保留,重新打开原样继续)。各风扇互不影响。
 async function applyFanDebugAuto(id, running, step, interval, unit) {
+  // 输入框 step=1 只约束步进点击,手输 1.5 这类小数会原样到这——后端字段
+  // 是整数,不取整会 JSON decode 失败报 400
+  step = Math.round(step);
+  interval = Math.round(interval);
   const label = id.split(':').pop();
   setBusy(true);
   try {
@@ -2840,6 +2844,7 @@ async function applyFanDebugAuto(id, running, step, interval, unit) {
 }
 
 async function applyFanDebugPWM(id, value, unit, successMessage) {
+  value = Math.round(value); // 同 applyFanDebugAuto:手输小数不得原样发给整数后端
   const def = fanDebugUnit(unit);
   if (!Number.isFinite(value) || value < 0 || value > def.max) {
     fanDebugStatus(`调试值需在 0–${def.max} 之间。`, true);

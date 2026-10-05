@@ -458,6 +458,20 @@ test('保存历史设置：保存天数越界时不发请求，仅在 message-hi
   assert.equal(element('message-history').textContent, '保存天数需至少为 1 天。');
 });
 
+test('风扇调试参数四舍五入为整数——手输 1.5 这类小数不得原样发到后端', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ fans: [] }));
+  const app = loadAppContext({ fetch });
+  // 自动测试:步进/间隔取整
+  await app.resolve('applyFanDebugAuto')('it8:fan1', true, 1.5, 2.7, 'percent');
+  const auto = JSON.parse(requests.find((req) => req.url.includes('api/fans/debug/auto')).init.body);
+  assert.equal(auto.fans[0].step, 2);
+  assert.equal(auto.fans[0].interval, 3);
+  // 调试转速取整
+  await app.resolve('applyFanDebugPWM')('it8:fan1', 45.6, 'percent');
+  const pwm = JSON.parse(requests.find((req) => req.url.includes('api/fans/debug/pwm')).init.body);
+  assert.equal(pwm.value, 46);
+});
+
 test('清空数据库：点击即补冲刷（取消也发）；确认后 POST api/history/clear 并强制刷新缓存', async () => {
   const cancelled = recordingFetch(() => ({ ok: true, flushed: false }));
   const cancelledApp = loadAppContext({ fetch: cancelled.fetch, confirm: () => false });
