@@ -254,60 +254,71 @@ func newSerialState(path string) *serialReaderState {
 	return &serialReaderState{path: path, key: serialSensorKey(path)}
 }
 
-func TestReadSerialLinesCollectsLines(t *testing.T) {
+func TestReadSerialWindowCollectsLines(t *testing.T) {
 	m := &Manager{}
 	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{
-		// 一行拆多个包到达 + 多种行格式；末尾不留换行的残行不产生读数
-		reads:   [][]byte{[]byte("25."), []byte("6\r\ntemp:26.5\n"), []byte(`{"temp":27.25}` + "\n"), []byte("no newline tail")},
-		readErr: errors.New("port gone"),
+		// 一行拆多个包到达 + 多种行格式；末尾不留换行的残行不产生读数。
+		// reads 耗尽后安静返回：窗口到期正常收尾，不报错。
+		reads: [][]byte{[]byte("25."), []byte("6\r\ntemp:26.5\n"), []byte(`{"temp":27.25}` + "\n"), []byte("no newline tail")},
 	}
-	err := m.readSerialLines(context.Background(), port, state)
-	if err == nil || !strings.Contains(err.Error(), "read: port gone") {
-		t.Fatalf("readSerialLines() err=%v, want read error", err)
+	if err := m.readSerialWindow(context.Background(), port, state, 150*time.Millisecond); err != nil {
+		t.Fatalf("readSerialWindow()=%v, want nil on window expiry", err)
 	}
 	if state.latest.Celsius != 27.25 || state.latest.Key != "usb:tty:ttyUSB0" {
 		t.Fatalf("latest=(%q,%v), want (usb:tty:ttyUSB0,27.25)", state.latest.Key, state.latest.Celsius)
 	}
 }
 
-func TestReadSerialLinesStale(t *testing.T) {
-	current := time.Unix(1_700_000_000, 0)
-	serialNow = func() time.Time { current = current.Add(5 * time.Second); return current }
-	t.Cleanup(func() { serialNow = time.Now })
-	m := &Manager{}
+// 跨轮无数据判定：打开成功但持续没有效行超过 serialStaleAfter 时记
+// "无数据"错误；读到行即清。
+func TestPollSerialOnceNoData(t *testing.T) {
+	m := &Manager{serialReaders: map[string]*serialReaderState{}}
 	state := newSerialState("/dev/ttyUSB0")
-	port := &fakeSerialPort{readErr: os.ErrDeadlineExceeded}
-	err := m.readSerialLines(context.Background(), port, state)
-	if !errors.Is(err, errNoSerialData) {
-		t.Fatalf("readSerialLines() err=%v, want errNoSerialData", err)
+	state.lastDataAt = time.Now().Add(-2 * serialStaleAfter)
+	m.serialReaders["/dev/ttyUSB0"] = state
+	previousOpener := openSerialPort
+	openSerialPort = func(string, int) (serialPort, error) { return &fakeSerialPort{}, nil }
+	t.Cleanup(func() { openSerialPort = previousOpener })
+
+	m.pollSerialOnce(context.Background(), SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0"}, state)
+	if !strings.Contains(state.lastError, errNoSerialData.Error()) {
+		t.Fatalf("lastError=%q, want no-data error", state.lastError)
 	}
-	if !state.latest.At.IsZero() {
-		t.Fatalf("stale loop must not store readings, got %v", state.latest.Celsius)
+
+	// 读到行后错误清除
+	state.lastDataAt = time.Now()
+	port := &fakeSerialPort{reads: [][]byte{[]byte("+21.5\n")}}
+	openSerialPort = func(string, int) (serialPort, error) { return port, nil }
+	m.pollSerialOnce(context.Background(), SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0"}, state)
+	if state.latest.Celsius != 21.5 || state.lastError != "" {
+		t.Fatalf("after reading: latest=%v lastError=%q", state.latest.Celsius, state.lastError)
 	}
 }
 
-func TestReadSerialLinesEOFAliasHangup(t *testing.T) {
+// EOF（读取流挂断）按普通读错误上报：轮询模式下下一轮重开即自愈，无需
+// 特殊通道；EOF 前已解析的读数保留。
+func TestReadSerialWindowEOF(t *testing.T) {
 	m := &Manager{}
 	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{reads: [][]byte{[]byte("25.6\n")}, readErr: io.EOF}
-	err := m.readSerialLines(context.Background(), port, state)
-	if !errors.Is(err, errSerialHangup) || !errors.Is(err, io.EOF) {
-		t.Fatalf("readSerialLines() err=%v, want errSerialHangup wrapping io.EOF", err)
+	err := m.readSerialWindow(context.Background(), port, state, time.Second)
+	if err == nil || !strings.Contains(err.Error(), "read:") {
+		t.Fatalf("readSerialWindow() err=%v, want read error", err)
 	}
 	if state.latest.Celsius != 25.6 {
 		t.Fatalf("EOF before error must keep stored reading, got %v", state.latest.Celsius)
 	}
 }
 
-func TestReadSerialLinesCancelExits(t *testing.T) {
+func TestReadSerialWindowCancelExits(t *testing.T) {
 	m := &Manager{}
 	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{reads: [][]byte{[]byte("23.4\n")}, blocks: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- m.readSerialLines(ctx, port, state) }()
+	go func() { errCh <- m.readSerialWindow(ctx, port, state, time.Second) }()
 	waitForSerialCondition(t, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -319,13 +330,10 @@ func TestReadSerialLinesCancelExits(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cancel must end loop without error, got %v", err)
 		}
-	case <-time.After(6 * time.Second): // 阻塞中的 Read 最迟 serialReadTimeout 后返回
-		t.Fatal("cancel did not end readSerialLines")
+	case <-time.After(6 * time.Second): // 阻塞中的 Read 最迟窗口截止后返回
+		t.Fatal("cancel did not end readSerialWindow")
 	}
 }
-
-// ---- 保存配置 ----
-
 func TestSaveSerialSensorConfigs(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
@@ -395,7 +403,8 @@ func TestSerialSensorLoopServesAndDisables(t *testing.T) {
 		m.SerialSensorLoop(ctx, nil)
 		close(done)
 	}()
-	// 两个读取器各自读出温度
+	// 两个读取器各自读出温度（间歇轮询下 serialOpen 是瞬态，以读取器
+	// 存在与读数为达成条件）
 	waitForSerialCondition(t, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()

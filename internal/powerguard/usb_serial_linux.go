@@ -73,5 +73,16 @@ func configureSerial(file *os.File, baud int) error {
 	if err := unix.IoctlSetTermios(int(file.Fd()), unix.TCSETS, termios); err != nil {
 		return fmt.Errorf("tcsets: %w", err)
 	}
+	// 清 DTR/RTS：open() 默认会把两条线拉起，Arduino 类板子把 DTR 接到
+	// RESET——间歇轮询每次开口都复位一次传感器就读不到数了。清掉后开口
+	// 不再触发对端复位（需要复位的烧录器自己会拉，不受影响）。
+	bits, err := unix.IoctlGetInt(int(file.Fd()), unix.TIOCMGET)
+	if err != nil {
+		return fmt.Errorf("tiocmget: %w", err)
+	}
+	bits &^= unix.TIOCM_DTR | unix.TIOCM_RTS
+	if err := unix.IoctlSetInt(int(file.Fd()), unix.TIOCMSET, bits); err != nil {
+		return fmt.Errorf("tiocmset: %w", err)
+	}
 	return nil
 }

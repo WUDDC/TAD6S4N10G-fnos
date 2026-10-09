@@ -13,19 +13,20 @@ package powerguard
 //
 // 多设备模型：SerialSensorLoop 是监督者，按配置数组与在跑读取器集合做
 // diff——保存新配置 kick 后增删对应读取器；每个启用的 (path,baud) 一个
-// 常驻 goroutine 持续读串口（传感器通常每秒一行），互不影响。开口即 DTR
-// 复位类设备（Arduino）每次重连需 1-2 秒才出数据，因此选常驻连接而非逐
-// 采样开关口。断线/无数据按 serialRetryWait 重连，读数缓存给
-// extraTemperatures 并入采样链（key 形如 "usb:tty:ttyUSB0"，自动归「其它」
-// 组并享受改名链路）。停止输出超过 serialStaleAfter 的读数不入采样——拔掉
-// 的传感器曲线自然断线，不留冻结值。
+// 常驻 goroutine，以 serialPollInterval 节奏做"开口→读一把→关口"的间歇
+// 轮询：串口在绝大部分时间里保持空闲，用户手动调试（cat）或其他程序可以
+// 随时打开同一串口，不会长期互抢数据（tty 的字节流只派发给先到的 reader，
+// 两个常驻读会互相偷行）。开口后立即清 DTR/RTS（usb_serial_linux.go），
+// 避免 Arduino 类板子被 open 复位。读数缓存给 extraTemperatures 并入采样
+// 链（key 形如 "usb:tty:ttyUSB0"，自动归「其它」组并享受改名链路）。跨轮
+// 停止输出超过 serialStaleAfter 的读数不入采样——拔掉的传感器曲线自然断
+// 线，不留冻结值。
 
 import (
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -37,14 +38,13 @@ import (
 )
 
 const (
-	serialDefaultBaud     = 9600             // 波特率缺省值（DIY 固件事实标准）
-	serialReadTimeout     = 3 * time.Second  // 单次 Read deadline，也是断连检查周期
-	serialStaleAfter      = 30 * time.Second // 超过此时长无新行视为失效，读数不入采样
-	serialRetryWait       = 10 * time.Second // 连接失败/失效后的重连间隔
-	serialHangupRetryWait = 2 * time.Second  // EOF 瞬断的快速重连间隔（设备大概率还在）
-	serialIdleWait        = 15 * time.Second // 无启用设备时监督者空转间隔
-	serialReconcileGap    = 60 * time.Second // 监督者周期对账间隔（kick 之外的兜底）
-	serialMaxDevices      = 8                // 配置行数上限（防手滑/脏数据堆积）
+	serialDefaultBaud  = 9600             // 波特率缺省值（DIY 固件事实标准）
+	serialPollInterval = 5 * time.Second  // 轮询周期：开口→读一把→关口→睡到下轮
+	serialReadWindow   = 3 * time.Second  // 每轮的读取窗口：读到行即续命，窗口到即关口
+	serialStaleAfter   = 30 * time.Second // 跨轮无新行视为失效，读数不入采样（曲线断线）
+	serialIdleWait     = 15 * time.Second // 无启用设备时监督者空转间隔
+	serialReconcileGap = 60 * time.Second // 监督者周期对账间隔（kick 之外的兜底）
+	serialMaxDevices   = 8                // 配置行数上限（防手滑/脏数据堆积）
 )
 
 // serialBaudRates 配置界面与校验共用的波特率白名单。
@@ -137,13 +137,14 @@ var serialNow = time.Now
 // serialReaderState 一个读取器的运行状态，全部字段随 m.mu 保护；cancel 由
 // 监督者持有，done 在读取 goroutine 退出时关闭。
 type serialReaderState struct {
-	path      string
-	key       string
-	cancel    context.CancelFunc
-	done      chan struct{}
-	latest    serialReading // 最近一次有效读数（At 零值 = 尚无数据）
-	open      bool          // 当前是否持有已打开的串口
-	lastError string        // 最近一次读取错误（变化才记日志，恢复清空）
+	path       string
+	key        string
+	cancel     context.CancelFunc
+	done       chan struct{}
+	latest     serialReading // 最近一次有效读数（At 零值 = 尚无数据）
+	lastDataAt time.Time     // 最近一次读到有效行（跨轮的无数据判定用）
+	open       bool          // 当前轮是否持有已打开的串口
+	lastError  string        // 最近一次读取错误（变化才记日志，恢复清空）
 }
 
 // serialReading 最近一次有效读数（At 为零值表示尚无数据）。
@@ -223,16 +224,19 @@ func (m *Manager) reconcileSerialReaders(ctx context.Context) {
 	}
 }
 
-// runSerialReader 单个设备的常驻读取循环：连接→读到出错→按重连节奏再来。
+// runSerialReader 单个设备的轮询循环：每 serialPollInterval 醒来一次，开口
+// → 读一把（serialReadWindow 窗口）→ 关口。串口在 ~95% 的时间里保持空闲，
+// 用户的手动调试（cat）或其他程序可以随时打开读取，不会长期互抢数据。
 // ctx 取消（监督者对账判定该设备不该在跑，或整个服务停止）即退出并从
-// m.serialReaders 摘除自己。错误只在变化时记一条日志（重连风暴不刷屏）。
+// m.serialReaders 摘除自己。错误只在变化时记一条日志（不刷屏）。
 func (m *Manager) runSerialReader(ctx context.Context, cfg SerialSensorConfig) {
 	readerCtx, cancel := context.WithCancel(ctx)
 	state := &serialReaderState{
-		path:   cfg.Path,
-		key:    serialSensorKey(cfg.Path),
-		cancel: cancel,
-		done:   make(chan struct{}),
+		path:       cfg.Path,
+		key:        serialSensorKey(cfg.Path),
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		lastDataAt: serialNow(),
 	}
 	m.mu.Lock()
 	// 对账间隙里同路径可能已有读取器在跑（周期对账与 kick 竞争）：让位退出
@@ -253,57 +257,64 @@ func (m *Manager) runSerialReader(ctx context.Context, cfg SerialSensorConfig) {
 	}()
 
 	for readerCtx.Err() == nil {
-		port, err := openSerialPort(cfg.Path, cfg.Baud)
-		if err != nil {
-			m.noteSerialReaderError(state, fmt.Errorf("%s: %w", cfg.Path, err))
-			if !serialSleep(readerCtx, serialRetryWait) {
-				return
-			}
-			continue
-		}
-		m.setSerialReaderOpen(state, true)
-		m.noteSerialReaderError(state, nil)
-		err = m.readSerialLines(readerCtx, port, state)
-		_ = port.Close()
-		m.setSerialReaderOpen(state, false)
-		if readerCtx.Err() != nil {
-			return
-		}
-		if err != nil {
-			m.noteSerialReaderError(state, err)
-		}
-		// EOF 是读取流被挂断（USB 串口内核层偶发瞬断/复位），设备大概率
-		// 还在：走 2 秒快速重连，别按拔线的 10 秒节奏干等——读数中断窗口
-		// 从最坏 ~13 秒缩到 ~5 秒。其它错误（打不开/无数据）保持 10 秒。
-		wait := serialRetryWait
-		if errors.Is(err, errSerialHangup) {
-			wait = serialHangupRetryWait
-		}
-		if !serialSleep(readerCtx, wait) {
+		m.pollSerialOnce(readerCtx, cfg, state)
+		if !serialSleep(readerCtx, serialPollInterval) {
 			return
 		}
 	}
 }
 
-// readSerialLines 持续读串口直到出错或 ctx 取消。跨 Read 攒行（传感器一行
-// 可能分多个包到达），每行交给 extractSerialTemperature，有效读数写 state。
-// 阻塞中的 Read 由 SetReadDeadline（3 秒）保证返回，ctx 取消最迟一个
-// deadline 周期后生效。
-func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *serialReaderState) error {
+// pollSerialOnce 执行一轮"开口→读→关口"：打开失败记错误等下轮；打开成功
+// 后在窗口内读行，EOF/IO 错误也只记账不重试（下一轮重开即自愈）；窗口结束
+// 检查跨轮无数据时长，超过 serialStaleAfter 记"无数据"错误——传感器坏/
+// 波特率错时给用户可见反馈，读到行即清。
+func (m *Manager) pollSerialOnce(ctx context.Context, cfg SerialSensorConfig, state *serialReaderState) {
+	port, err := openSerialPort(cfg.Path, cfg.Baud)
+	if err != nil {
+		m.noteSerialReaderError(state, fmt.Errorf("%s: %w", cfg.Path, err))
+		return
+	}
+	defer func() {
+		_ = port.Close() // 间歇模式的关键：读完就关口，串口归还给系统
+		m.setSerialReaderOpen(state, false)
+	}()
+	m.setSerialReaderOpen(state, true)
+	windowStart := serialNow()
+	if err := m.readSerialWindow(ctx, port, state, serialReadWindow); err != nil && ctx.Err() == nil {
+		// EOF 等瞬断在轮询模式下无需特殊处理：下一轮重开即自愈
+		m.noteSerialReaderError(state, err)
+	}
+	m.mu.Lock()
+	lastData := state.lastDataAt
+	m.mu.Unlock()
+	if lastData.After(windowStart) {
+		// 本轮读到过有效行：数据链路健康，清掉历史错误（如瞬断/无数据）
+		m.noteSerialReaderError(state, nil)
+	} else if serialNow().Sub(lastData) > serialStaleAfter {
+		m.noteSerialReaderError(state, fmt.Errorf("%s: %d 秒无数据: %w", state.key, int(serialStaleAfter.Seconds()), errNoSerialData))
+	}
+}
+
+// readSerialWindow 在 window 时长内持续读串口并解析行，窗口到期或 ctx 取消
+// 返回。跨 Read 攒行（传感器一行可能分多个包到达），每行交给
+// extractSerialTemperature，有效读数刷新 state.latest 与 state.lastDataAt。
+// 单次 Read 的 deadline 设为窗口截止：不支持 deadline 的内核由 VTIME 兜底。
+func (m *Manager) readSerialWindow(ctx context.Context, port serialPort, state *serialReaderState, window time.Duration) error {
+	deadline := serialNow().Add(window)
 	var pending []byte
-	lastData := serialNow()
 	buf := make([]byte, 256)
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil
 		}
-		if err := port.SetReadDeadline(serialNow().Add(serialReadTimeout)); err != nil {
+		if remaining := deadline.Sub(serialNow()); remaining <= 0 {
+			return nil
+		} else if err := port.SetReadDeadline(deadline); err != nil {
 			// 个别内核不支持 deadline：依赖 VTIME 兜底（usb_serial_linux.go）
 			_ = err
 		}
 		n, err := port.Read(buf)
 		if n > 0 {
-			lastData = serialNow()
 			pending = append(pending, buf[:n]...)
 			for {
 				idx := bytes.IndexAny(pending, "\r\n")
@@ -313,8 +324,10 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *s
 				line := string(pending[:idx])
 				pending = pending[idx+1:]
 				if celsius, ok := extractSerialTemperature(line); ok {
+					now := serialNow()
 					m.mu.Lock()
-					state.latest = serialReading{Key: state.key, Celsius: celsius, At: serialNow()}
+					state.latest = serialReading{Key: state.key, Celsius: celsius, At: now}
+					state.lastDataAt = now
 					m.mu.Unlock()
 				}
 			}
@@ -325,26 +338,24 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *s
 		}
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				if serialNow().Sub(lastData) > serialStaleAfter {
-					return fmt.Errorf("%s: %d 秒无数据: %w", state.key, int(serialStaleAfter.Seconds()), errNoSerialData)
-				}
-				continue // 行间静默属正常：继续等下一包
+				continue // 窗口内的行间静默属正常：继续等下一包
 			}
-			// 读取流挂断（EOF）：USB 串口内核层偶发瞬断/复位，设备大概率
-			// 还在，用独立哨兵让重连走快速通道
-			if errors.Is(err, io.EOF) {
-				return fmt.Errorf("%s: read: %w", state.key, fmt.Errorf("%w: %w", errSerialHangup, io.EOF))
+			if n == 0 {
+				return fmt.Errorf("%s: read: %w", state.key, err)
 			}
+			// 已带回部分数据的错（EOF 常见带尾巴）：本行处理完，错误照报
 			return fmt.Errorf("%s: read: %w", state.key, err)
+		}
+		if n == 0 {
+			// 真实内核的 VMIN=0/VTIME 到期会阻塞约 0.5s 再返回；个别驱动
+			// 立即返回 0 字节，小睡防忙转
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }
 
-// errNoSerialData 连接成立但持续无数据的失效原因，与 IO 错误区分开。
+// errNoSerialData 打开成功但跨轮持续无数据的失效原因，与 IO 错误区分开。
 var errNoSerialData = errors.New("no data")
-
-// errSerialHangup 读取流挂断（EOF）：瞬断，重连走快速通道。
-var errSerialHangup = errors.New("hangup")
 
 // serialTempPattern 数字片段（允许正负号与小数；ParseFloat 兼容 "+25.6"）。
 // 取值时再过滤合理区间，因为 "0 25.6"（地址+温度）这类行首数字不是温度。
