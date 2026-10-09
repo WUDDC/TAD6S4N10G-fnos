@@ -1,19 +1,24 @@
 package powerguard
 
-// USB 转串口外置温度传感器（方案 A：通用文本行源）。用户经 USB 转串口模块
-// （CH340/CP210x/FTDI 等）接 DIY 温度节点（Arduino/ESP32 + DS18B20/SHT30 最
-// 常见），固件逐行自发输出含温度数字的文本（"25.6"、"temp:25.6"、
-// `{"temp":25.6}` 均可）；行内第一个落在 (0,125] 的数字按摄氏度入库。
+// USB 转串口外置温度传感器（方案 A：通用文本行源，多设备版）。用户经 USB
+// 转串口模块（CH340/CP210x/FTDI 等）接 DIY 温度节点（Arduino/ESP32 +
+// DS18B20/SHT30 最常见），固件逐行自发输出含温度数字的文本（"25.6"、
+// "temp:25.6"、"+25.6"、`{"temp":25.6}` 均可）；行内第一个落在 [-55,125] 的
+// 数字按摄氏度入库（区间取 DS18B20 物理量程，负温合法，-127 断连哨兵与
+// 恰好 0.0 拒绝——真机固件按带符号小数输出）。
 //
 // 与 usb_temper.go 的 HID 温度计分工：那边没有内核驱动、协议一族一条命令，
 // 成本在传输层；这里内核白送 /dev/ttyUSB*，成本在协议多样性——所以只做
 // "读行取数" 的最大公约数，Modbus/1-wire 等专项协议等真实需求再立项。
 //
-// 读取模型：SerialSensorLoop 常驻 goroutine 持续读串口（传感器通常每秒一行），
-// 最近读数缓存给 extraTemperatures 并入采样链（key 形如 "usb:tty:ttyUSB0"，
-// 自动归「其它」组并享受改名链路）。开口即 DTR 复位类设备（Arduino）每次重连
-// 需 1-2 秒才出数据，因此选常驻连接而非逐采样开关口。断线/无数据按
-// serialRetryWait 重连，保存配置 kick 立即按新配置重连。
+// 多设备模型：SerialSensorLoop 是监督者，按配置数组与在跑读取器集合做
+// diff——保存新配置 kick 后增删对应读取器；每个启用的 (path,baud) 一个
+// 常驻 goroutine 持续读串口（传感器通常每秒一行），互不影响。开口即 DTR
+// 复位类设备（Arduino）每次重连需 1-2 秒才出数据，因此选常驻连接而非逐
+// 采样开关口。断线/无数据按 serialRetryWait 重连，读数缓存给
+// extraTemperatures 并入采样链（key 形如 "usb:tty:ttyUSB0"，自动归「其它」
+// 组并享受改名链路）。停止输出超过 serialStaleAfter 的读数不入采样——拔掉
+// 的传感器曲线自然断线，不留冻结值。
 
 import (
 	"bytes"
@@ -31,46 +36,78 @@ import (
 )
 
 const (
-	serialDefaultBaud = 9600             // 波特率缺省值（DIY 固件事实标准）
-	serialReadTimeout = 3 * time.Second  // 单次 Read deadline，也是踢断检查周期
-	serialStaleAfter  = 30 * time.Second // 超过此时长无新行视为失效，读数不入采样
-	serialRetryWait   = 10 * time.Second // 连接失败/失效后的重连间隔
-	serialIdleWait    = 15 * time.Second // 未启用时空转间隔
+	serialDefaultBaud  = 9600             // 波特率缺省值（DIY 固件事实标准）
+	serialReadTimeout  = 3 * time.Second  // 单次 Read deadline，也是断连检查周期
+	serialStaleAfter   = 30 * time.Second // 超过此时长无新行视为失效，读数不入采样
+	serialRetryWait    = 10 * time.Second // 连接失败/失效后的重连间隔
+	serialIdleWait     = 15 * time.Second // 无启用设备时监督者空转间隔
+	serialReconcileGap = 60 * time.Second // 监督者周期对账间隔（kick 之外的兜底）
+	serialMaxDevices   = 8                // 配置行数上限（防手滑/脏数据堆积）
 )
 
 // serialBaudRates 配置界面与校验共用的波特率白名单。
 var serialBaudRates = []int{2400, 4800, 9600, 19200, 38400, 57600, 115200}
 
-// SerialSensorConfig 串口温度传感器配置，随全局 config.json 落盘。
+// SerialSensorConfig 一个串口温度传感器的配置，Config.Serials 数组元素。
 type SerialSensorConfig struct {
 	Enabled bool   `json:"enabled"`
 	Path    string `json:"path,omitempty"` // 设备路径；优先 /dev/serial/by-id/*（插拔不漂移）
 	Baud    int    `json:"baud,omitempty"` // 0 视为 serialDefaultBaud
 }
 
-// NormalizeSerialSensorConfig 校验串口配置：启用时必须给出 /dev/ 下的设备
-// 路径，波特率必须在白名单内（0 归位默认值）。停用时保留已填的路径与波特
-// 率，重新启用不必重选。
-func NormalizeSerialSensorConfig(cfg SerialSensorConfig) (SerialSensorConfig, error) {
-	cfg.Path = strings.TrimSpace(cfg.Path)
-	if !cfg.Enabled {
-		return cfg, nil
+// NormalizeSerialSensorConfigs 校验整组串口配置：启用的行必须有 /dev/ 下的
+// 设备路径与白名单波特率（0 归位默认值）；全部行的路径不得重复（同一路径
+// 两个读取器只会互相抢数据）；行数不超过 serialMaxDevices。停用的行保留
+// 已填的路径与波特率，重新启用不必重选；未启用的空行（前端刚点添加还没
+// 选设备）直接丢弃。
+func NormalizeSerialSensorConfigs(configs []SerialSensorConfig) ([]SerialSensorConfig, error) {
+	if len(configs) > serialMaxDevices {
+		return nil, fmt.Errorf("串口传感器最多配置 %d 个", serialMaxDevices)
 	}
-	if cfg.Path == "" {
-		return cfg, errors.New("启用串口传感器需先选择设备路径")
-	}
-	if !strings.HasPrefix(cfg.Path, "/dev/") {
-		return cfg, fmt.Errorf("设备路径必须是 /dev/ 下的串口节点: %s", cfg.Path)
-	}
-	if cfg.Baud == 0 {
-		cfg.Baud = serialDefaultBaud
-	}
-	for _, rate := range serialBaudRates {
-		if rate == cfg.Baud {
-			return cfg, nil
+	seen := make(map[string]bool, len(configs))
+	for i := range configs {
+		configs[i].Path = strings.TrimSpace(configs[i].Path)
+		if configs[i].Path == "" {
+			if configs[i].Enabled {
+				return nil, fmt.Errorf("第 %d 个传感器启用了但未选择设备路径", i+1)
+			}
+			continue // 未启用的空行（前端刚点添加还没选设备）直接丢弃
+		}
+		if seen[configs[i].Path] {
+			return nil, fmt.Errorf("设备路径重复：%s", configs[i].Path)
+		}
+		seen[configs[i].Path] = true
+		if !configs[i].Enabled {
+			continue
+		}
+		if !strings.HasPrefix(configs[i].Path, "/dev/") {
+			return nil, fmt.Errorf("设备路径必须是 /dev/ 下的串口节点: %s", configs[i].Path)
+		}
+		if configs[i].Baud == 0 {
+			configs[i].Baud = serialDefaultBaud
+			continue
+		}
+		if !serialBaudAllowed(configs[i].Baud) {
+			return nil, fmt.Errorf("不支持的波特率 %d（可选 %s）", configs[i].Baud, serialBaudList())
 		}
 	}
-	return cfg, fmt.Errorf("不支持的波特率 %d（可选 %s）", cfg.Baud, serialBaudList())
+	result := make([]SerialSensorConfig, 0, len(configs))
+	for _, cfg := range configs {
+		if cfg.Path == "" {
+			continue
+		}
+		result = append(result, cfg)
+	}
+	return result, nil
+}
+
+func serialBaudAllowed(baud int) bool {
+	for _, rate := range serialBaudRates {
+		if rate == baud {
+			return true
+		}
+	}
+	return false
 }
 
 func serialBaudList() string {
@@ -95,100 +132,161 @@ var openSerialPort = openSerialPortOS
 // serialNow 时钟注入点：失效判定（serialStaleAfter）的单测加速。
 var serialNow = time.Now
 
-// SerialSensorLoop 常驻串口传感器读取器，随 ctx 取消退出。每轮连接先重读
-// 配置：保存新配置 kickSerialReader 踢断当前连接，最迟 serialReadTimeout 后
-// 按新配置重连；未启用时低频空转。连接与错误状态记入 Manager 供
-// /api/status 下发。
-func (m *Manager) SerialSensorLoop(ctx context.Context, logger *log.Logger) {
-	if logger == nil {
-		logger = log.Default()
-	}
+// serialReaderState 一个读取器的运行状态，全部字段随 m.mu 保护；cancel 由
+// 监督者持有，done 在读取 goroutine 退出时关闭。
+type serialReaderState struct {
+	path      string
+	key       string
+	cancel    context.CancelFunc
+	done      chan struct{}
+	latest    serialReading // 最近一次有效读数（At 零值 = 尚无数据）
+	open      bool          // 当前是否持有已打开的串口
+	lastError string        // 最近一次读取错误（变化才记日志，恢复清空）
+}
+
+// serialReading 最近一次有效读数（At 为零值表示尚无数据）。
+type serialReading struct {
+	Key     string
+	Celsius float64
+	At      time.Time
+}
+
+// SerialSensorLoop 是多设备读取器的监督者：按配置与在跑读取器集合 diff，
+// 缺的起、多的停；保存配置 kickSerialReader 后立即重新对账，另有周期对账
+// 兜底（防未知路径漏起）。未启用任何设备时低频空转。随 ctx 取消退出并停
+// 掉全部读取器。logger 当前仅用于满足启动签名（错误日志走 logf）。
+func (m *Manager) SerialSensorLoop(ctx context.Context, _ *log.Logger) {
 	m.mu.Lock()
 	if m.serialKick == nil {
 		m.serialKick = make(chan struct{}, 1)
 	}
+	if m.serialReaders == nil {
+		m.serialReaders = make(map[string]*serialReaderState)
+	}
 	m.mu.Unlock()
 	for ctx.Err() == nil {
-		cfg, ok := m.serialSensorConfig()
-		if !ok {
-			m.setSerialOpen(false)
-			if !serialSleep(ctx, serialIdleWait) {
+		m.reconcileSerialReaders(ctx)
+		wait := serialReconcileGap
+		if len(m.serialSensorConfigsLocked()) == 0 {
+			wait = serialIdleWait
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+		case <-m.serialKick:
+			timer.Stop()
+		case <-timer.C:
+		}
+	}
+	// 退出前停掉全部读取器（进程结束/测试收尾），不等待各自的重连周期
+	m.mu.Lock()
+	for _, state := range m.serialReaders {
+		state.cancel()
+	}
+	states := make([]*serialReaderState, 0, len(m.serialReaders))
+	for _, state := range m.serialReaders {
+		states = append(states, state)
+	}
+	m.mu.Unlock()
+	for _, state := range states {
+		<-state.done
+	}
+}
+
+// reconcileSerialReaders 对账在跑读取器与启用配置：多的 cancel（不等退出，
+// 读取器自带 deadline 上限）、缺的起 goroutine。调用方不持锁。
+func (m *Manager) reconcileSerialReaders(ctx context.Context) {
+	m.mu.Lock()
+	want := make(map[string]SerialSensorConfig)
+	for _, cfg := range m.serialSensorConfigsLocked() {
+		if cfg.Enabled {
+			want[cfg.Path] = cfg
+		}
+	}
+	for path, state := range m.serialReaders {
+		if _, ok := want[path]; !ok {
+			state.cancel() // 读取器退出时自行从 map 摘除
+		}
+	}
+	start := make([]SerialSensorConfig, 0, len(want))
+	for path, cfg := range want {
+		if _, running := m.serialReaders[path]; !running {
+			start = append(start, cfg)
+		}
+	}
+	m.mu.Unlock()
+	for _, cfg := range start {
+		go m.runSerialReader(ctx, cfg) // 异步：runSerialReader 内部是常驻循环
+	}
+}
+
+// runSerialReader 单个设备的常驻读取循环：连接→读到出错→按重连节奏再来。
+// ctx 取消（监督者对账判定该设备不该在跑，或整个服务停止）即退出并从
+// m.serialReaders 摘除自己。错误只在变化时记一条日志（重连风暴不刷屏）。
+func (m *Manager) runSerialReader(ctx context.Context, cfg SerialSensorConfig) {
+	readerCtx, cancel := context.WithCancel(ctx)
+	state := &serialReaderState{
+		path:   cfg.Path,
+		key:    serialSensorKey(cfg.Path),
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	m.mu.Lock()
+	// 对账间隙里同路径可能已有读取器在跑（周期对账与 kick 竞争）：让位退出
+	if _, exists := m.serialReaders[cfg.Path]; exists {
+		m.mu.Unlock()
+		cancel()
+		close(state.done)
+		return
+	}
+	m.serialReaders[cfg.Path] = state
+	m.mu.Unlock()
+	defer func() {
+		cancel()
+		m.mu.Lock()
+		delete(m.serialReaders, cfg.Path)
+		m.mu.Unlock()
+		close(state.done)
+	}()
+
+	for readerCtx.Err() == nil {
+		port, err := openSerialPort(cfg.Path, cfg.Baud)
+		if err != nil {
+			m.noteSerialReaderError(state, fmt.Errorf("%s: %w", cfg.Path, err))
+			if !serialSleep(readerCtx, serialRetryWait) {
 				return
 			}
 			continue
 		}
-		m.connectSerialSensor(ctx, cfg)
-		if ctx.Err() != nil {
+		m.setSerialReaderOpen(state, true)
+		m.noteSerialReaderError(state, nil)
+		err = m.readSerialLines(readerCtx, port, state)
+		_ = port.Close()
+		m.setSerialReaderOpen(state, false)
+		if readerCtx.Err() != nil {
 			return
 		}
-		select {
-		case <-ctx.Done():
+		if err != nil {
+			m.noteSerialReaderError(state, err)
+		}
+		if !serialSleep(readerCtx, serialRetryWait) {
 			return
-		case <-m.serialKick: // 配置已保存：立即按新配置重连
-		case <-time.After(serialRetryWait):
 		}
 	}
 }
 
-// serialSleep 在 ctx 取消或超时后返回；ctx 已结束返回 false。
-func serialSleep(ctx context.Context, wait time.Duration) bool {
-	timer := time.NewTimer(wait)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
-
-// serialSensorConfig 读取当前串口配置；未启用或配置不可读时 ok=false。
-func (m *Manager) serialSensorConfig() (SerialSensorConfig, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	cfg, err := m.loadConfigLocked()
-	if err != nil || !cfg.Serial.Enabled || cfg.Serial.Path == "" {
-		return SerialSensorConfig{}, false
-	}
-	return cfg.Serial, true
-}
-
-// connectSerialSensor 建立一次连接并读到出错为止：连接失败记错误按重连节奏
-// 返回；连接成功后连接状态与读数持续刷新。连接本身不打日志——错误日志
-// （变化才记）已覆盖排查需要，重连风暴时不刷屏。
-func (m *Manager) connectSerialSensor(ctx context.Context, cfg SerialSensorConfig) {
-	port, err := openSerialPort(cfg.Path, cfg.Baud)
-	if err != nil {
-		m.noteSerialError(fmt.Errorf("%s: %w", cfg.Path, err))
-		return
-	}
-	defer port.Close()
-	m.setSerialOpen(true)
-	m.noteSerialError(nil)
-	defer m.setSerialOpen(false)
-	if err := m.readSerialLines(ctx, port, cfg); err != nil && ctx.Err() == nil {
-		m.noteSerialError(err)
-	}
-}
-
-// errNoSerialData 连接成立但持续无数据的失效原因，与 IO 错误区分开。
-var errNoSerialData = errors.New("no data")
-
-// readSerialLines 持续读串口直到出错、踢断（保存配置）或 ctx 取消。跨 Read
-// 攒行（传感器一行可能分多个包到达），每行交给 extractSerialTemperature，
-// 有效读数写 m.serialLatest。
-func (m *Manager) readSerialLines(ctx context.Context, port serialPort, cfg SerialSensorConfig) error {
-	key := serialSensorKey(cfg.Path)
+// readSerialLines 持续读串口直到出错或 ctx 取消。跨 Read 攒行（传感器一行
+// 可能分多个包到达），每行交给 extractSerialTemperature，有效读数写 state。
+// 阻塞中的 Read 由 SetReadDeadline（3 秒）保证返回，ctx 取消最迟一个
+// deadline 周期后生效。
+func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *serialReaderState) error {
 	var pending []byte
 	lastData := serialNow()
 	buf := make([]byte, 256)
 	for {
-		select {
-		case <-ctx.Done():
+		if err := ctx.Err(); err != nil {
 			return nil
-		case <-m.serialKick:
-			return nil
-		default:
 		}
 		if err := port.SetReadDeadline(serialNow().Add(serialReadTimeout)); err != nil {
 			// 个别内核不支持 deadline：依赖 VTIME 兜底（usb_serial_linux.go）
@@ -206,7 +304,9 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, cfg Seri
 				line := string(pending[:idx])
 				pending = pending[idx+1:]
 				if celsius, ok := extractSerialTemperature(line); ok {
-					m.storeSerialReading(key, celsius)
+					m.mu.Lock()
+					state.latest = serialReading{Key: state.key, Celsius: celsius, At: serialNow()}
+					m.mu.Unlock()
 				}
 			}
 			// 迟迟不见换行的脏数据（波特率不匹配常见乱码）防积压
@@ -217,14 +317,17 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, cfg Seri
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				if serialNow().Sub(lastData) > serialStaleAfter {
-					return fmt.Errorf("%s: %d 秒无数据: %w", key, int(serialStaleAfter.Seconds()), errNoSerialData)
+					return fmt.Errorf("%s: %d 秒无数据: %w", state.key, int(serialStaleAfter.Seconds()), errNoSerialData)
 				}
 				continue // 行间静默属正常：继续等下一包
 			}
-			return fmt.Errorf("%s: read: %w", key, err)
+			return fmt.Errorf("%s: read: %w", state.key, err)
 		}
 	}
 }
+
+// errNoSerialData 连接成立但持续无数据的失效原因，与 IO 错误区分开。
+var errNoSerialData = errors.New("no data")
 
 // serialTempPattern 数字片段（允许正负号与小数；ParseFloat 兼容 "+25.6"）。
 // 取值时再过滤合理区间，因为 "0 25.6"（地址+温度）这类行首数字不是温度。
@@ -256,55 +359,70 @@ func serialSensorKey(path string) string {
 	return "usb:tty:" + label
 }
 
-// serialReading 最近一次有效读数（At 为零值表示尚无数据）。
-type serialReading struct {
-	Key     string
-	Celsius float64
-	At      time.Time
-}
-
-func (m *Manager) storeSerialReading(key string, celsius float64) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.serialLatest = serialReading{Key: key, Celsius: celsius, At: serialNow()}
-}
-
-// serialTemperatureReadingLocked 返回仍新鲜的串口读数（供 extraTemperatures
-// 并入采样链）。停止输出超过 serialStaleAfter 即失效——采样链不展示冻结值，
-// 曲线在传感器拔掉后自然断线。调用方须持 m.mu（extraTemperatures 的调用
-// 条件；内部再取锁会与 Status() 的持锁重入死锁）。
-func (m *Manager) serialTemperatureReadingLocked() (Temperature, bool) {
-	if m.serialLatest.At.IsZero() || serialNow().Sub(m.serialLatest.At) > serialStaleAfter {
-		return Temperature{}, false
+// serialSensorConfigsLocked 返回当前串口配置数组（原样，含停用行）。调用方
+// 须持 m.mu。
+func (m *Manager) serialSensorConfigsLocked() []SerialSensorConfig {
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return nil
 	}
-	return Temperature{Label: m.serialLatest.Key, Celsius: m.serialLatest.Celsius}, true
+	return cfg.Serials
 }
 
-func (m *Manager) setSerialOpen(open bool) {
+// serialTemperatureReadingsLocked 返回全部仍新鲜的串口读数（供
+// extraTemperatures 并入采样链）。停止输出超过 serialStaleAfter 即失效——
+// 采样链不展示冻结值，曲线在传感器拔掉后自然断线。调用方须持 m.mu
+// （extraTemperatures 的调用条件；内部再取锁会与 Status() 的持锁重入死锁）。
+func (m *Manager) serialTemperatureReadingsLocked() []Temperature {
+	var result []Temperature
+	for _, state := range m.serialReaders {
+		if state.latest.At.IsZero() || serialNow().Sub(state.latest.At) > serialStaleAfter {
+			continue
+		}
+		result = append(result, Temperature{Label: state.latest.Key, Celsius: state.latest.Celsius})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
+	return result
+}
+
+func (m *Manager) setSerialReaderOpen(state *serialReaderState, open bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.serialOpen = open
+	state.open = open
 }
 
-// noteSerialError 记录/清除串口读取错误，错误变化时打一条日志（与
-// noteUSBTempError 同款：每分钟重连不刷屏，恢复即清空）。
-func (m *Manager) noteSerialError(err error) {
+// noteSerialReaderError 记录/清除一个读取器的错误，错误变化时打一条日志
+// （与 noteUSBTempError 同款：每分钟重连不刷屏，恢复即清空）。
+func (m *Manager) noteSerialReaderError(state *serialReaderState, err error) {
 	message := ""
 	if err != nil {
 		message = err.Error()
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if message == m.serialLastError {
+	if message == state.lastError {
 		return
 	}
-	m.serialLastError = message
+	state.lastError = message
 	if err != nil {
 		m.logf("serial temperature sensor read failed: %v (logging once until the error changes)", err)
 	}
 }
 
-// kickSerialReader 非阻塞通知读取器按新配置重连；读取器未运行时无事发生。
+// serialSleep 在 ctx 取消或超时后返回；ctx 已结束返回 false。
+func serialSleep(ctx context.Context, wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// kickSerialReader 非阻塞通知监督者重新对账（增删读取器）；未运行时无事
+// 发生。
 func (m *Manager) kickSerialReader() {
 	m.mu.Lock()
 	kick := m.serialKick
@@ -318,10 +436,11 @@ func (m *Manager) kickSerialReader() {
 	}
 }
 
-// SaveSerialSensorConfig 校验并保存串口传感器配置，踢断当前读取让新配置
-// 立即生效（写盘走 saveConfigLocked，自动记 "config.json saved" 运行日志）。
-func (m *Manager) SaveSerialSensorConfig(cfg SerialSensorConfig) error {
-	cfg, err := NormalizeSerialSensorConfig(cfg)
+// SaveSerialSensorConfigs 校验并保存整组串口传感器配置，踢监督者立即按新
+// 配置增删读取器（写盘走 saveConfigLocked，自动记 "config.json saved" 运行
+// 日志）。
+func (m *Manager) SaveSerialSensorConfigs(configs []SerialSensorConfig) error {
+	configs, err := NormalizeSerialSensorConfigs(configs)
 	if err != nil {
 		return err
 	}
@@ -332,7 +451,8 @@ func (m *Manager) SaveSerialSensorConfig(cfg SerialSensorConfig) error {
 		m.mu.Unlock()
 		return err
 	}
-	current.Serial = cfg
+	current.Serials = configs
+	current.Serial = nil // 旧单设备字段清空，落盘即完成新格式迁移
 	if err := m.saveConfigLocked(current); err != nil {
 		m.lastError = err.Error()
 		m.mu.Unlock()
@@ -343,15 +463,20 @@ func (m *Manager) SaveSerialSensorConfig(cfg SerialSensorConfig) error {
 	return nil
 }
 
-// SerialSensorInfo 是随 /api/status 下发的串口传感器运行状态。
+// SerialSensorConfigStatus 一个配置行的运行态，嵌入配置本体的 JSON 字段。
+type SerialSensorConfigStatus struct {
+	SerialSensorConfig
+	Open        bool      `json:"open"`
+	Key         string    `json:"key,omitempty"`
+	LastCelsius float64   `json:"last_celsius,omitempty"`
+	LastAt      time.Time `json:"last_at,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+}
+
+// SerialSensorInfo 是随 /api/status 下发的串口传感器整体状态。
 type SerialSensorInfo struct {
-	Config      SerialSensorConfig `json:"config"`
-	Devices     []SerialDeviceInfo `json:"devices"`
-	Open        bool               `json:"open"`
-	Key         string             `json:"key,omitempty"`
-	LastCelsius float64            `json:"last_celsius,omitempty"`
-	LastAt      time.Time          `json:"last_at,omitempty"`
-	LastError   string             `json:"last_error,omitempty"`
+	Configs []SerialSensorConfigStatus `json:"configs"`
+	Devices []SerialDeviceInfo         `json:"devices"`
 }
 
 // SerialDeviceInfo 是设备下拉里的一个候选串口。
@@ -360,24 +485,31 @@ type SerialDeviceInfo struct {
 	Label string `json:"label"`
 }
 
-// serialStatusLocked 汇总串口传感器运行状态。调用方须持 m.mu（与 Status()
-// 一致）；设备枚举是纯 sysfs/目录读取，与 Status 现有的 DiscoverPackages
-// 同量级开销。
-func (m *Manager) serialStatusLocked(cfg SerialSensorConfig) SerialSensorInfo {
-	info := SerialSensorInfo{Config: cfg, Devices: m.serialDeviceCandidates()}
-	info.Open = m.serialOpen
-	info.LastError = m.serialLastError
-	if !m.serialLatest.At.IsZero() {
-		info.Key = m.serialLatest.Key
-		info.LastCelsius = m.serialLatest.Celsius
-		info.LastAt = m.serialLatest.At
+// serialStatusLocked 汇总串口传感器整体状态（配置行含各自运行态 + 候选设
+// 备枚举）。调用方须持 m.mu（与 Status() 一致）；设备枚举是纯 sysfs/目录
+// 读取，与 Status 现有的 DiscoverPackages 同量级开销。
+func (m *Manager) serialStatusLocked(configs []SerialSensorConfig) SerialSensorInfo {
+	info := SerialSensorInfo{Devices: m.serialDeviceCandidates()}
+	for _, cfg := range configs {
+		item := SerialSensorConfigStatus{SerialSensorConfig: cfg, Key: serialSensorKey(cfg.Path)}
+		if state, running := m.serialReaders[cfg.Path]; running {
+			item.Open = state.open
+			item.LastError = state.lastError
+			if !state.latest.At.IsZero() {
+				item.LastCelsius = state.latest.Celsius
+				item.LastAt = state.latest.At
+			}
+		}
+		info.Configs = append(info.Configs, item)
 	}
 	return info
 }
 
-// serialDeviceCandidates 枚举可用的候选串口：优先 /dev/serial/by-id/（名字
-// 含 VID:PID 与序列号，插拔编号不漂移），再补 /sys/class/tty 下的 ttyUSB*/
-// ttyACM*（有 device 子目录 = 真实硬件，排除板载 ttyS* 虚拟口）。
+// serialDeviceCandidates 枚举可用的候选串口，按稳定性排序展示：by-id（名
+// 字含 VID:PID 与序列号，插拔编号不漂移）→ by-path（按物理插口，多个同型
+// 号无序列号适配器唯一的稳定区分）→ /sys/class/tty 的 ttyUSB*/ttyACM*
+// （有 device 子目录 = 真实硬件，排除板载 ttyS* 虚拟口）。同一物理设备会在
+// 多个入口重复出现，指向同一硬件，选稳定的入口即可。
 func (m *Manager) serialDeviceCandidates() []SerialDeviceInfo {
 	var result []SerialDeviceInfo
 	seen := make(map[string]bool)
@@ -388,17 +520,19 @@ func (m *Manager) serialDeviceCandidates() []SerialDeviceInfo {
 		seen[path] = true
 		result = append(result, SerialDeviceInfo{Path: path, Label: label})
 	}
-	if entries, err := os.ReadDir(m.rooted("/dev/serial/by-id")); err == nil {
-		for _, entry := range entries {
-			name := entry.Name()
-			label := strings.TrimPrefix(name, "usb-")
-			label = strings.TrimSuffix(label, "-if00-port0")
-			label = strings.TrimSuffix(label, "-if00")
-			if label == "" {
-				label = name
-			}
-			add(m.rooted(filepath.Join("/dev/serial/by-id", name)), label)
+	byID, _ := os.ReadDir(m.rooted("/dev/serial/by-id"))
+	for _, entry := range byID {
+		name := entry.Name()
+		label := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(name, "usb-"), "-if00-port0"), "-if00")
+		if label == "" {
+			label = name
 		}
+		add(m.rooted(filepath.Join("/dev/serial/by-id", name)), label)
+	}
+	byPath, _ := os.ReadDir(m.rooted("/dev/serial/by-path"))
+	for _, entry := range byPath {
+		name := entry.Name()
+		add(m.rooted(filepath.Join("/dev/serial/by-path", name)), name)
 	}
 	for _, pattern := range []string{"/sys/class/tty/ttyUSB*", "/sys/class/tty/ttyACM*"} {
 		nodes, _ := filepath.Glob(m.rooted(pattern))

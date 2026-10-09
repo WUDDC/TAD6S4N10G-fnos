@@ -135,6 +135,16 @@ func defaultStorageFanCurve(minimum int) []FanPoint {
 
 func normalizeConfig(cfg *Config) bool {
 	changed := false
+	// 串口传感器旧格式迁移：单设备对象 serial → 数组 serials。读入即迁移
+	// 并把旧字段置 nil，任何一次配置保存都会把新格式落盘；传感器键由路径
+	// 派生（usb:tty:<basename>），迁移不改键，历史曲线不断线。
+	if cfg.Serial != nil {
+		if len(cfg.Serials) == 0 && (cfg.Serial.Path != "" || cfg.Serial.Enabled) {
+			cfg.Serials = []SerialSensorConfig{*cfg.Serial}
+		}
+		cfg.Serial = nil
+		changed = true
+	}
 	if cfg.Fan.Curve == nil {
 		enabled := cfg.Fan.Enabled
 		deviceID := cfg.Fan.DeviceID

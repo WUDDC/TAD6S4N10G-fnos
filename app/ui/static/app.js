@@ -3469,93 +3469,150 @@ async function saveSensorNames() {
   }
 }
 
-// ---- 调试页：USB 串口温度传感器（usb:tty:* 读数走「其它」分组） ----
+// ---- 调试页：USB 串口温度传感器（usb:tty:* 读数走「其它」分组，多设备） ----
 
 const SERIAL_BAUD_RATES = [2400, 4800, 9600, 19200, 38400, 57600, 115200];
 
 function setupSerialSensor() {
-  const deviceSelect = $('serial-sensor-device');
-  if (!deviceSelect) return;
-  const baudSelect = $('serial-sensor-baud');
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  $('serial-sensor-add').addEventListener('click', () => {
+    addSerialRow(null);
+    serialFormDirty = true;
+  });
+  $('serial-sensor-save').addEventListener('click', saveSerialSensor);
+}
+
+// renderSerialSensor 同步串口传感器卡：设备下拉选项每轮刷新（插拔自动出
+// 现），配置行集合只在用户没有未保存修改时跟随服务端，各行状态文本常刷。
+function renderSerialSensor(serial) {
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  const configs = serial?.configs || [];
+  const devices = serial?.devices || [];
+  if (!serialFormDirty) {
+    rows.replaceChildren();
+    configs.forEach((config) => appendSerialRow(config, devices));
+    if (!configs.length) {
+      const empty = document.createElement('p');
+      empty.className = 'serial-sensor-empty';
+      empty.textContent = '尚未配置串口传感器。点击「添加传感器」后选择设备与波特率。';
+      rows.append(empty);
+    }
+  } else {
+    // 已有行只刷新设备选项与状态文本，保留用户未保存的选择
+    [...rows.querySelectorAll('.serial-sensor-config')].forEach((row) => {
+      const path = row.dataset.path;
+      fillSerialDeviceOptions(row.querySelector('.serial-row-device'), devices, path);
+      const status = serialSensorStatusText(configs.find((c) => c.path === path), Date.now());
+      const line = row.querySelector('.serial-row-status');
+      line.textContent = status;
+    });
+  }
+}
+
+// appendSerialRow 追加一行配置（config 为空表示新添加的空行）。
+function appendSerialRow(config, devices) {
+  const row = document.createElement('div');
+  row.className = 'serial-sensor-config';
+  row.dataset.path = config?.path || '';
+
+  const toggle = document.createElement('label');
+  toggle.className = 'toggle serial-row-enabled';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = Boolean(config?.enabled);
+  checkbox.addEventListener('change', () => { serialFormDirty = true; });
+  const span = document.createElement('span');
+  toggle.append(checkbox, span);
+
+  const device = document.createElement('select');
+  device.className = 'serial-row-device';
+  device.addEventListener('change', () => {
+    row.dataset.path = device.value;
+    serialFormDirty = true;
+  });
+  fillSerialDeviceOptions(device, devices, config?.path || '');
+
+  const baud = document.createElement('select');
+  baud.className = 'serial-row-baud';
   SERIAL_BAUD_RATES.forEach((rate) => {
     const option = document.createElement('option');
     option.value = String(rate);
     option.textContent = `${rate} bps`;
-    if (rate === 9600) option.selected = true;
-    baudSelect.append(option);
+    if (rate === (config?.baud || 9600)) option.selected = true;
+    baud.append(option);
   });
-  const markDirty = () => { serialFormDirty = true; };
-  deviceSelect.addEventListener('change', markDirty);
-  baudSelect.addEventListener('change', markDirty);
-  $('serial-sensor-enabled').addEventListener('change', markDirty);
-  $('serial-sensor-save').addEventListener('click', saveSerialSensor);
+  baud.addEventListener('change', () => { serialFormDirty = true; });
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'serial-row-remove';
+  remove.textContent = '删除';
+  remove.addEventListener('click', () => {
+    row.remove();
+    serialFormDirty = true;
+  });
+
+  const status = document.createElement('p');
+  status.className = 'serial-row-status message';
+  status.textContent = serialSensorStatusText(config, Date.now());
+
+  row.append(toggle, device, baud, remove, status);
+  $('serial-sensor-rows').append(row);
 }
 
-// renderSerialSensor 同步串口传感器卡：设备下拉始终刷新（插拔自动出现），
-// 表单字段只在用户没有未保存修改时跟随服务端配置，状态行常刷。
-function renderSerialSensor(serial) {
-  const deviceSelect = $('serial-sensor-device');
-  if (!deviceSelect) return;
-  const config = serial?.config || {};
-  const previous = deviceSelect.value;
-  deviceSelect.replaceChildren();
-  (serial?.devices || []).forEach((device) => {
-    const option = document.createElement('option');
-    option.value = device.path;
-    option.textContent = `${device.label}（${device.path}）`;
-    deviceSelect.append(option);
-  });
-  if (config.path && ![...deviceSelect.options].some((option) => option.value === config.path)) {
-    // 已配置的设备当前没插着：保留选项避免误改配置
-    const option = document.createElement('option');
-    option.value = config.path;
-    option.textContent = `${config.path}（未检测到）`;
-    deviceSelect.append(option);
-  }
-  if (!deviceSelect.options.length) {
-    const option = document.createElement('option');
-    option.value = '';
-    option.textContent = '未发现串口设备（插入 USB 转串口后自动出现）';
-    deviceSelect.append(option);
-  }
-  if (serialFormDirty) {
-    // 保留用户未保存的选择；仅当下拉里还有这个选项时回填
-    if ([...deviceSelect.options].some((option) => option.value === previous)) deviceSelect.value = previous;
-  } else {
-    if (config.path && [...deviceSelect.options].some((option) => option.value === config.path)) {
-      deviceSelect.value = config.path;
-    }
-    $('serial-sensor-enabled').checked = Boolean(config.enabled);
-    if (config.baud) $('serial-sensor-baud').value = String(config.baud);
-  }
-  const line = $('serial-sensor-status');
-  line.textContent = serialSensorStatusText(serial, Date.now());
-  line.className = 'message';
+function addSerialRow() {
+  appendSerialRow({ enabled: true, baud: 9600 }, currentStatus?.serial?.devices || []);
 }
 
-// serialSensorStatusText 把 /api/status 的 serial 字段拼成一行人话；now 参数
-// 便于离线单测注入时钟。
-function serialSensorStatusText(serial, now = Date.now()) {
-  const config = serial?.config || {};
-  if (!config.enabled) return '串口温度传感器未启用。';
+// fillSerialDeviceOptions 填充一行的设备下拉：候选设备 + 已配置但当前未检
+// 测到的路径（保留选项避免误改配置）；selected 为当前应选中的路径。
+function fillSerialDeviceOptions(select, devices, selected) {
+  const options = [...devices.map((d) => ({ path: d.path, label: `${d.label}（${d.path}）` }))];
+  if (selected && !devices.some((d) => d.path === selected)) {
+    options.push({ path: selected, label: `${selected}（未检测到）` });
+  }
+  if (!options.length) {
+    options.push({ path: '', label: '未发现串口设备（插入 USB 转串口后自动出现）' });
+  }
+  select.replaceChildren();
+  options.forEach((option) => {
+    const el = document.createElement('option');
+    el.value = option.path;
+    el.textContent = option.label;
+    if (option.path === selected) el.selected = true;
+    select.append(el);
+  });
+}
+
+// serialSensorStatusText 把一行配置的运行态拼成一句话；now 参数便于离线
+// 单测注入时钟。
+function serialSensorStatusText(config, now = Date.now()) {
+  if (!config) return '尚未保存。';
+  if (!config.enabled) return '未启用（保留配置，不再读取）。';
   const parts = [];
-  if (serial.open) parts.push('已连接');
-  else if (serial.last_error) parts.push(`连接失败：${serial.last_error}`);
+  if (config.open) parts.push('已连接');
+  else if (config.last_error) parts.push(`连接失败：${config.last_error}`);
   else parts.push('等待连接…');
-  if (serial.last_at) {
-    const age = Math.max(0, Math.round((now - new Date(serial.last_at).getTime()) / 1000));
-    parts.push(`最近读数 ${formatTemperature(serial.last_celsius, true)}（${age} 秒前）`);
+  if (config.last_at) {
+    const age = Math.max(0, Math.round((now - new Date(config.last_at).getTime()) / 1000));
+    parts.push(`最近读数 ${formatTemperature(config.last_celsius, true)}（${age} 秒前）`);
   }
-  if (serial.key) parts.push(`曲线键 ${serial.key}`);
+  if (config.key) parts.push(`曲线键 ${config.key}`);
   return `${parts.join('；')}。`;
 }
 
 async function saveSerialSensor() {
   const line = $('serial-sensor-status');
-  const enabled = $('serial-sensor-enabled').checked;
-  const path = $('serial-sensor-device').value;
-  if (enabled && !path) {
-    line.textContent = '启用前请先选择设备路径。';
+  const configs = [...document.querySelectorAll('.serial-sensor-config')].map((row) => ({
+    enabled: row.querySelector('.serial-row-enabled input').checked,
+    path: row.querySelector('.serial-row-device').value,
+    baud: Number(row.querySelector('.serial-row-baud').value) || 9600,
+  }));
+  const enabledWithoutPath = configs.filter((c) => c.enabled && !c.path).length;
+  if (enabledWithoutPath) {
+    line.textContent = `有 ${enabledWithoutPath} 个启用的传感器未选择设备路径。`;
     line.className = 'message error';
     return;
   }
@@ -3564,13 +3621,14 @@ async function saveSerialSensor() {
   try {
     const updated = await request('api/config/serial-sensor', {
       method: 'POST',
-      body: JSON.stringify({ enabled, path, baud: Number($('serial-sensor-baud').value) || 9600 }),
+      body: JSON.stringify({ configs }),
     });
     serialFormDirty = false;
     render(updated, true);
+    const enabled = configs.filter((c) => c.enabled).length;
     line.textContent = enabled
-      ? '已保存。连接成功后读数会出现在历史图表「其它」分组，键以 usb:tty: 开头。'
-      : '已保存，串口温度传感器已停用。';
+      ? `已保存 ${configs.length} 个配置（启用 ${enabled} 个）。读数出现在历史温度「其它」分组，键以 usb:tty: 开头。`
+      : `已保存 ${configs.length} 个配置（全部停用）。`;
   } catch (error) {
     line.textContent = `保存失败：${error.message}`;
     line.className = 'message error';

@@ -2,9 +2,11 @@ package powerguard
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -67,58 +69,97 @@ func TestSerialSensorKey(t *testing.T) {
 
 // ---- 配置校验 ----
 
-func TestNormalizeSerialSensorConfig(t *testing.T) {
-	tests := []struct {
+func TestNormalizeSerialSensorConfigs(t *testing.T) {
+	valid := []SerialSensorConfig{
+		{Enabled: true, Path: "/dev/ttyUSB0"},
+		{Enabled: true, Path: "/dev/ttyACM1", Baud: 4800},
+		{Enabled: false, Path: "/dev/ttyUSB2", Baud: 115200}, // 停用行保留已填值
+	}
+	got, err := NormalizeSerialSensorConfigs(valid)
+	if err != nil {
+		t.Fatalf("NormalizeSerialSensorConfigs()=%v", err)
+	}
+	if len(got) != 3 || got[0].Baud != serialDefaultBaud || got[1].Baud != 4800 || got[2].Enabled {
+		t.Fatalf("normalized=%+v", got)
+	}
+
+	// 空行（前端刚点添加还没选设备）丢弃，不参与重复判定
+	got, err = NormalizeSerialSensorConfigs([]SerialSensorConfig{{}, {Enabled: true, Path: "/dev/ttyUSB0"}})
+	if err != nil || len(got) != 1 || got[0].Path != "/dev/ttyUSB0" {
+		t.Fatalf("empty rows must be dropped: (%+v,%v)", got, err)
+	}
+
+	bad := []struct {
 		name    string
-		cfg     SerialSensorConfig
-		want    SerialSensorConfig
+		configs []SerialSensorConfig
 		wantErr string
 	}{
-		{
-			name: "enabled defaults to 9600",
-			cfg:  SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0"},
-			want: SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 9600},
-		},
-		{
-			name:    "enabled without path",
-			cfg:     SerialSensorConfig{Enabled: true},
-			want:    SerialSensorConfig{Enabled: true},
-			wantErr: "设备路径",
-		},
-		{
-			name:    "enabled with non-dev path",
-			cfg:     SerialSensorConfig{Enabled: true, Path: "ttyUSB0", Baud: 9600},
-			want:    SerialSensorConfig{Enabled: true, Path: "ttyUSB0", Baud: 9600},
-			wantErr: "/dev/",
-		},
-		{
-			name:    "enabled with bad baud",
-			cfg:     SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 1200},
-			want:    SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 1200},
-			wantErr: "波特率",
-		},
-		{
-			name: "disabled keeps values for re-enable",
-			cfg:  SerialSensorConfig{Path: "/dev/ttyUSB0", Baud: 115200},
-			want: SerialSensorConfig{Path: "/dev/ttyUSB0", Baud: 115200},
-		},
-		{
-			name: "path trimmed",
-			cfg:  SerialSensorConfig{Enabled: true, Path: "  /dev/ttyUSB0  ", Baud: 115200},
-			want: SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 115200},
-		},
+		{"enabled without path", []SerialSensorConfig{{Enabled: true}}, "未选择设备"},
+		{"non-dev path", []SerialSensorConfig{{Enabled: true, Path: "ttyUSB0", Baud: 9600}}, "/dev/"},
+		{"bad baud", []SerialSensorConfig{{Enabled: true, Path: "/dev/ttyUSB0", Baud: 1200}}, "波特率"},
+		{"duplicate path", []SerialSensorConfig{
+			{Enabled: true, Path: "/dev/ttyUSB0", Baud: 9600},
+			{Enabled: false, Path: "/dev/ttyUSB0", Baud: 4800},
+		}, "重复"},
 	}
-	for _, test := range tests {
-		got, err := NormalizeSerialSensorConfig(test.cfg)
-		if test.wantErr != "" {
-			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
-				t.Fatalf("%s: err=%v, want contains %q", test.name, err, test.wantErr)
-			}
-			continue
+	for _, test := range bad {
+		_, err := NormalizeSerialSensorConfigs(test.configs)
+		if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+			t.Fatalf("%s: err=%v, want contains %q", test.name, err, test.wantErr)
 		}
-		if err != nil || got != test.want {
-			t.Fatalf("%s: NormalizeSerialSensorConfig()=(%+v,%v), want (%+v,nil)", test.name, got, err, test.want)
-		}
+	}
+
+	// 行数上限
+	over := make([]SerialSensorConfig, serialMaxDevices+1)
+	for i := range over {
+		over[i] = SerialSensorConfig{Enabled: true, Path: filepath.Join("/dev/tty", "x"+strconv.Itoa(i))}
+	}
+	if _, err := NormalizeSerialSensorConfigs(over); err == nil || !strings.Contains(err.Error(), "最多") {
+		t.Fatalf("over-limit err=%v, want 最多", err)
+	}
+}
+
+// ---- 旧格式迁移 ----
+
+// 旧版 config.json 的单设备 serial 对象：读入即迁移进 serials 数组、旧字段
+// 置 nil；任何一次保存都把新格式落盘，传感器键不变。
+func TestConfigSerialMigration(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	seed := `{"serial":{"enabled":true,"path":"/dev/ttyUSB0","baud":4800}}`
+	if err := os.WriteFile(configPath, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{ConfigPath: configPath}
+	m.mu.Lock()
+	cfg, err := m.loadConfigLocked()
+	m.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Serial != nil {
+		t.Fatalf("legacy serial field must be cleared after load, got %+v", cfg.Serial)
+	}
+	if len(cfg.Serials) != 1 || cfg.Serials[0] != (SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 4800}) {
+		t.Fatalf("migrated serials=%+v", cfg.Serials)
+	}
+	// 保存（任意配置保存路径都会走 loadConfigLocked→normalizeConfig）后落盘新格式
+	m.mu.Lock()
+	err = m.saveConfigLocked(cfg)
+	m.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(configPath)
+	var persisted map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if persisted["serial"] != nil {
+		t.Fatalf("legacy serial must be gone after save: %s", raw)
+	}
+	serials, ok := persisted["serials"].([]any)
+	if !ok || len(serials) != 1 {
+		t.Fatalf("serials array missing after save: %s", raw)
 	}
 }
 
@@ -135,6 +176,7 @@ func TestSerialDeviceCandidates(t *testing.T) {
 	mkdir("sys/class/tty/ttyACM1/device") // CDC-ACM
 	mkdir("sys/class/tty/ttyS0")          // 板载串口：无 device 子目录，应排除
 	mkdir("dev/serial/by-id/usb-1a86_USB_Serial-if00-port0")
+	mkdir("dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0")
 
 	m := &Manager{Root: root}
 	devices := m.serialDeviceCandidates()
@@ -146,10 +188,11 @@ func TestSerialDeviceCandidates(t *testing.T) {
 	}
 	wantPaths := []string{
 		filepath.Join(root, "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"),
+		filepath.Join(root, "/dev/serial/by-path/pci-0000:00:14.0-usb-0:3:1.0-port0"),
 		filepath.Join(root, "/dev/ttyACM1"),
 		filepath.Join(root, "/dev/ttyUSB0"),
 	}
-	wantLabels := []string{"1a86_USB_Serial", "ttyACM1", "ttyUSB0"}
+	wantLabels := []string{"1a86_USB_Serial", "pci-0000:00:14.0-usb-0:3:1.0-port0", "ttyACM1", "ttyUSB0"}
 	if strings.Join(paths, "|") != strings.Join(wantPaths, "|") ||
 		strings.Join(labels, "|") != strings.Join(wantLabels, "|") {
 		t.Fatalf("serialDeviceCandidates()=(%v,%v), want (%v,%v)", paths, labels, wantPaths, wantLabels)
@@ -180,7 +223,7 @@ func (f *fakeSerialPort) Read(b []byte) (int, error) {
 	}
 	if f.blocks != nil {
 		// 模拟真实驱动：阻塞中的 Read 也要遵守 deadline 到期返回，
-		// 否则循环无法在读间隙观察到 kick/ctx（真实 usb-serial 由 poll 保证）
+		// 否则循环无法在读间隙观察到 ctx（真实 usb-serial 由 poll 保证）
 		if !f.deadline.IsZero() {
 			select {
 			case <-f.blocks:
@@ -206,23 +249,24 @@ func (f *fakeSerialPort) Close() error {
 	return nil
 }
 
-func serialTestConfig() SerialSensorConfig {
-	return SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0", Baud: 9600}
+func newSerialState(path string) *serialReaderState {
+	return &serialReaderState{path: path, key: serialSensorKey(path)}
 }
 
 func TestReadSerialLinesCollectsLines(t *testing.T) {
-	m := &Manager{serialKick: make(chan struct{}, 1)}
+	m := &Manager{}
+	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{
 		// 一行拆多个包到达 + 多种行格式；末尾不留换行的残行不产生读数
 		reads:   [][]byte{[]byte("25."), []byte("6\r\ntemp:26.5\n"), []byte(`{"temp":27.25}` + "\n"), []byte("no newline tail")},
 		readErr: errors.New("port gone"),
 	}
-	err := m.readSerialLines(context.Background(), port, serialTestConfig())
+	err := m.readSerialLines(context.Background(), port, state)
 	if err == nil || !strings.Contains(err.Error(), "read: port gone") {
 		t.Fatalf("readSerialLines() err=%v, want read error", err)
 	}
-	if m.serialLatest.Celsius != 27.25 || m.serialLatest.Key != "usb:tty:ttyUSB0" {
-		t.Fatalf("serialLatest=(%q,%v), want (usb:tty:ttyUSB0,27.25)", m.serialLatest.Key, m.serialLatest.Celsius)
+	if state.latest.Celsius != 27.25 || state.latest.Key != "usb:tty:ttyUSB0" {
+		t.Fatalf("latest=(%q,%v), want (usb:tty:ttyUSB0,27.25)", state.latest.Key, state.latest.Celsius)
 	}
 }
 
@@ -230,90 +274,103 @@ func TestReadSerialLinesStale(t *testing.T) {
 	current := time.Unix(1_700_000_000, 0)
 	serialNow = func() time.Time { current = current.Add(5 * time.Second); return current }
 	t.Cleanup(func() { serialNow = time.Now })
-	m := &Manager{serialKick: make(chan struct{}, 1)}
+	m := &Manager{}
+	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{readErr: os.ErrDeadlineExceeded}
-	err := m.readSerialLines(context.Background(), port, serialTestConfig())
+	err := m.readSerialLines(context.Background(), port, state)
 	if !errors.Is(err, errNoSerialData) {
 		t.Fatalf("readSerialLines() err=%v, want errNoSerialData", err)
 	}
-	if !m.serialLatest.At.IsZero() {
-		t.Fatalf("stale loop must not store readings, got %v", m.serialLatest.Celsius)
+	if !state.latest.At.IsZero() {
+		t.Fatalf("stale loop must not store readings, got %v", state.latest.Celsius)
 	}
 }
 
-func TestReadSerialLinesKickCloses(t *testing.T) {
-	// 直接调用 readSerialLines 时 serialKick 不会由 SerialSensorLoop 初始化
-	m := &Manager{serialKick: make(chan struct{}, 1)}
+func TestReadSerialLinesCancelExits(t *testing.T) {
+	m := &Manager{}
+	state := newSerialState("/dev/ttyUSB0")
 	port := &fakeSerialPort{reads: [][]byte{[]byte("23.4\n")}, blocks: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	errCh := make(chan error, 1)
-	go func() { errCh <- m.readSerialLines(ctx, port, serialTestConfig()) }()
+	go func() { errCh <- m.readSerialLines(ctx, port, state) }()
 	waitForSerialCondition(t, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		return !m.serialLatest.At.IsZero()
+		return !state.latest.At.IsZero()
 	})
-	m.kickSerialReader()
+	cancel()
 	select {
 	case err := <-errCh:
 		if err != nil {
-			t.Fatalf("kick must end loop without error, got %v", err)
+			t.Fatalf("cancel must end loop without error, got %v", err)
 		}
 	case <-time.After(6 * time.Second): // 阻塞中的 Read 最迟 serialReadTimeout 后返回
-		t.Fatal("kick did not end readSerialLines")
+		t.Fatal("cancel did not end readSerialLines")
 	}
-	// Close 由连接层负责（connectSerialSensor 的 defer），readSerialLines 不关
 }
 
 // ---- 保存配置 ----
 
-func TestSaveSerialSensorConfig(t *testing.T) {
+func TestSaveSerialSensorConfigs(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	m := &Manager{ConfigPath: configPath}
+	m.mu.Lock()
 	m.serialKick = make(chan struct{}, 1)
+	m.serialReaders = map[string]*serialReaderState{}
+	m.mu.Unlock()
 
 	// 非法配置直接拒绝且不落盘
-	if err := m.SaveSerialSensorConfig(SerialSensorConfig{Enabled: true}); err == nil {
+	if err := m.SaveSerialSensorConfigs([]SerialSensorConfig{{Enabled: true}}); err == nil {
 		t.Fatal("enabled without path must fail")
 	}
 	// 合法保存：波特率归位默认值，kick 触发
-	if err := m.SaveSerialSensorConfig(SerialSensorConfig{Enabled: true, Path: "/dev/ttyUSB0"}); err != nil {
-		t.Fatalf("SaveSerialSensorConfig()=%v", err)
+	if err := m.SaveSerialSensorConfigs([]SerialSensorConfig{{Enabled: true, Path: "/dev/ttyUSB0"}}); err != nil {
+		t.Fatalf("SaveSerialSensorConfigs()=%v", err)
 	}
+	m.mu.Lock()
 	cfg, err := m.loadConfigLocked()
+	m.mu.Unlock()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.Serial.Enabled || cfg.Serial.Path != "/dev/ttyUSB0" || cfg.Serial.Baud != serialDefaultBaud {
-		t.Fatalf("saved serial config=%+v", cfg.Serial)
+	if len(cfg.Serials) != 1 || !cfg.Serials[0].Enabled || cfg.Serials[0].Baud != serialDefaultBaud {
+		t.Fatalf("saved serials=%+v", cfg.Serials)
 	}
 	select {
 	case <-m.serialKick:
 	default:
-		t.Fatal("save must kick the reader")
+		t.Fatal("save must kick the supervisor")
 	}
 }
 
-// ---- 完整循环 ----
+// ---- 监督者与读取器 ----
 
 func TestSerialSensorLoopServesAndDisables(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
-	seed := `{"serial":{"enabled":true,"path":"/dev/ttyUSB0","baud":9600}}`
+	seed := `{"serials":[{"enabled":true,"path":"/dev/ttyUSB0","baud":4800},{"enabled":true,"path":"/dev/ttyACM1","baud":9600}]}`
 	if err := os.WriteFile(configPath, []byte(seed), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	m := &Manager{ConfigPath: configPath}
-	port := &fakeSerialPort{reads: [][]byte{[]byte("23.4\n")}, blocks: make(chan struct{})}
+	ports := map[string]*fakeSerialPort{
+		"/dev/ttyUSB0": {reads: [][]byte{[]byte("23.4\n")}, blocks: make(chan struct{})},
+		"/dev/ttyACM1": {reads: [][]byte{[]byte("+18.7\n")}, blocks: make(chan struct{})},
+	}
 	previousOpener := openSerialPort
 	openSerialPort = func(path string, baud int) (serialPort, error) {
-		if path != "/dev/ttyUSB0" || baud != 9600 {
-			t.Errorf("openSerialPort(%q,%d), want (/dev/ttyUSB0,9600)", path, baud)
+		want := map[string]int{"/dev/ttyUSB0": 4800, "/dev/ttyACM1": 9600}[path]
+		if want == 0 {
+			t.Errorf("openSerialPort(%q,%d): unexpected device", path, baud)
+			return nil, errors.New("unexpected")
 		}
-		return port, nil
+		if baud != want {
+			t.Errorf("openSerialPort(%q,%d), want baud %d", path, baud, want)
+		}
+		return ports[path], nil
 	}
 	t.Cleanup(func() { openSerialPort = previousOpener })
 
@@ -324,10 +381,13 @@ func TestSerialSensorLoopServesAndDisables(t *testing.T) {
 		m.SerialSensorLoop(ctx, nil)
 		close(done)
 	}()
+	// 两个读取器各自读出温度
 	waitForSerialCondition(t, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		return m.serialOpen && m.serialLatest.Celsius == 23.4
+		return len(m.serialReaders) == 2 &&
+			serialReaderCelsius(m, "/dev/ttyUSB0") == 23.4 &&
+			serialReaderCelsius(m, "/dev/ttyACM1") == 18.7
 	})
 
 	// 防死锁回归：Status() 持 m.mu 调 extraTemperatures → 串口读数检查。
@@ -335,41 +395,59 @@ func TestSerialSensorLoopServesAndDisables(t *testing.T) {
 	m.mu.Lock()
 	extra := m.extraTemperatures()
 	m.mu.Unlock()
-	if !containsTemperature(extra, "usb:tty:ttyUSB0", 23.4) {
-		t.Fatalf("extraTemperatures()=%+v, want usb:tty:ttyUSB0=23.4", extra)
+	if !containsTemperature(extra, "usb:tty:ttyUSB0", 23.4) ||
+		!containsTemperature(extra, "usb:tty:ttyACM1", 18.7) {
+		t.Fatalf("extraTemperatures()=%+v, want both usb:tty readings", extra)
 	}
 
-	// extraTemperatures 能拿到新鲜读数；模拟数据过期后不再产出。
-	// serialTemperatureReadingLocked 须持 m.mu 调用（与 extraTemperatures
-	// 的调用条件一致），这里同时验证读数新鲜/过期两态。
-	func() {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if reading, ok := m.serialTemperatureReadingLocked(); !ok || reading.Celsius != 23.4 {
-			t.Fatalf("serialTemperatureReadingLocked()=(%+v,%v), want 23.4", reading, ok)
-		}
-		m.serialLatest.At = time.Now().Add(-2 * serialStaleAfter)
-		if _, ok := m.serialTemperatureReadingLocked(); ok {
-			t.Fatal("stale reading must not be served")
-		}
-	}()
-
-	// 保存停用：落盘 + kick → 循环退出连接进入空转
-	if err := m.SaveSerialSensorConfig(SerialSensorConfig{}); err != nil {
-		t.Fatalf("SaveSerialSensorConfig()=%v", err)
+	// 停用一个：只有 ttyUSB0 的读取器退出，另一个照常
+	if err := m.SaveSerialSensorConfigs([]SerialSensorConfig{
+		{Enabled: false, Path: "/dev/ttyUSB0", Baud: 4800},
+		{Enabled: true, Path: "/dev/ttyACM1", Baud: 9600},
+	}); err != nil {
+		t.Fatalf("SaveSerialSensorConfigs()=%v", err)
 	}
 	waitForSerialCondition(t, func() bool {
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		return !m.serialOpen
+		_, usb := m.serialReaders["/dev/ttyUSB0"]
+		_, acm := m.serialReaders["/dev/ttyACM1"]
+		return !usb && acm
+	})
+
+	// 全部停用：监督者进入空转，读取器清零
+	if err := m.SaveSerialSensorConfigs(nil); err != nil {
+		t.Fatalf("SaveSerialSensorConfigs()=%v", err)
+	}
+	waitForSerialCondition(t, func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(m.serialReaders) == 0
 	})
 
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(6 * time.Second):
 		t.Fatal("loop did not exit after cancel")
 	}
+}
+
+func serialReaderCelsius(m *Manager, path string) float64 {
+	state, ok := m.serialReaders[path]
+	if !ok {
+		return 0
+	}
+	return state.latest.Celsius
+}
+
+func containsTemperature(list []Temperature, label string, celsius float64) bool {
+	for _, item := range list {
+		if item.Label == label && item.Celsius == celsius {
+			return true
+		}
+	}
+	return false
 }
 
 func waitForSerialCondition(t *testing.T, cond func() bool) {
@@ -382,13 +460,4 @@ func waitForSerialCondition(t *testing.T, cond func() bool) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("condition not met within deadline")
-}
-
-func containsTemperature(list []Temperature, label string, celsius float64) bool {
-	for _, item := range list {
-		if item.Label == label && item.Celsius == celsius {
-			return true
-		}
-	}
-	return false
 }

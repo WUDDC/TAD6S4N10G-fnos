@@ -69,7 +69,8 @@ type Config struct {
 	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
-	Serial         SerialSensorConfig     `json:"serial"`                  // USB 串口外置温度传感器（usb_serial.go：文本行源）
+	Serial         *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
+	Serials        []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
 	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
 	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
 	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
@@ -270,12 +271,10 @@ type Manager struct {
 	gpioRuntime   gpioRuntime
 	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
 
-	// USB 串口温度传感器（usb_serial.go）：SerialSensorLoop 常驻 goroutine
-	// 的运行状态，全部随 m.mu 保护。
-	serialKick      chan struct{} // 配置保存后踢断当前连接（容量 1，非阻塞）
-	serialLatest    serialReading // 最近一次有效读数（At 零值 = 尚无数据）
-	serialOpen      bool          // 读取器当前是否持有已打开的串口
-	serialLastError string        // 最近一次读取错误（变化才记日志，恢复清空）
+	// USB 串口温度传感器（usb_serial.go）：SerialSensorLoop 监督者与各设备
+	// 读取器的运行状态，全部随 m.mu 保护。
+	serialKick    chan struct{}                 // 配置保存后通知监督者重新对账（容量 1，非阻塞）
+	serialReaders map[string]*serialReaderState // 在跑的读取器（键为设备路径，读取器退出时自行摘除）
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -1092,7 +1091,7 @@ func (m *Manager) Status() Status {
 	} else {
 		status.Config = cfg
 	}
-	status.Serial = m.serialStatusLocked(status.Config.Serial)
+	status.Serial = m.serialStatusLocked(cfg.Serials)
 	packages, err := m.DiscoverPackages()
 	if err != nil {
 		status.LastError = combineError(status.LastError, err)
@@ -1236,9 +1235,7 @@ func (m *Manager) extraTemperatures() []Temperature {
 	for _, reading := range m.usbTemperatureReadings() {
 		result = append(result, Temperature{Label: reading.Key, Celsius: reading.Celsius})
 	}
-	if reading, ok := m.serialTemperatureReadingLocked(); ok {
-		result = append(result, reading)
-	}
+	result = append(result, m.serialTemperatureReadingsLocked()...)
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
 	return result
 }

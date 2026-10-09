@@ -320,24 +320,24 @@ func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, s.Manager.Status())
 }
 
-// handleSerialSensorConfig 保存 USB 串口温度传感器配置；保存即踢断当前连接，
-// 读取器按新配置重连。连接状态与最近读数随 /api/status 的 serial 字段下发，
-// 无需单独 GET。
+// handleSerialSensorConfig 保存整组 USB 串口温度传感器配置（多设备数组）；
+// 保存即踢监督者按新配置增删读取器。各设备连接状态与最近读数随
+// /api/status 的 serial 字段下发，无需单独 GET。
 func (s *Server) handleSerialSensorConfig(w http.ResponseWriter, r *http.Request) {
 	if !s.authorizeConfigRequest(w, r) {
 		return
 	}
 	var payload struct {
-		Enabled bool   `json:"enabled"`
-		Path    string `json:"path"`
-		Baud    int    `json:"baud"`
+		Configs []SerialSensorConfig `json:"configs"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	cfg := SerialSensorConfig{Enabled: payload.Enabled, Path: payload.Path, Baud: payload.Baud}
-	if err := s.Manager.SaveSerialSensorConfig(cfg); err != nil {
+	if payload.Configs == nil {
+		payload.Configs = []SerialSensorConfig{}
+	}
+	if err := s.Manager.SaveSerialSensorConfigs(payload.Configs); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

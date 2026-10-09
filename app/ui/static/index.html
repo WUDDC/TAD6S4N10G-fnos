@@ -493,19 +493,12 @@
             <div class="panel-heading">
               <div>
                 <h2 id="serial-sensor-heading">USB 串口温度传感器</h2>
-                <p>经 USB 转串口模块（CH340、CP210x、FTDI 等）接入的温度计：固件逐行输出含温度数字的文本（如 25.6、temp:25.6），行内第一个合理温度按摄氏度入库。读数会出现在历史温度「其它」分组，可在上方「传感器显示名」改名。优先选择 by-id 设备路径，插拔后编号不漂移。</p>
+                <p>经 USB 转串口模块（CH340、CP210x、FTDI 等）接入的温度计：固件逐行输出含温度数字的文本（如 25.6、+25.6、temp:25.6），行内第一个合理温度按摄氏度入库，可同时接多个。读数出现在历史温度「其它」分组（键 usb:tty: 开头），可在上方「传感器显示名」改名。设备优先选 by-id 路径（插拔编号不漂移）；两个一模一样的适配器 by-id 会撞名，用 by-path 按物理插口区分。</p>
               </div>
             </div>
-            <label class="toggle serial-sensor-toggle"><input id="serial-sensor-enabled" type="checkbox"><span></span>启用串口温度传感器</label>
-            <div class="serial-sensor-row">
-              <label for="serial-sensor-device">设备</label>
-              <select id="serial-sensor-device"></select>
-            </div>
-            <div class="serial-sensor-row">
-              <label for="serial-sensor-baud">波特率</label>
-              <select id="serial-sensor-baud"></select>
-            </div>
+            <div id="serial-sensor-rows" class="serial-sensor-rows"></div>
             <div class="actions debug-actions">
+              <button id="serial-sensor-add" type="button">添加传感器</button>
               <button id="serial-sensor-save" type="button" class="primary">保存串口传感器</button>
             </div>
             <p id="serial-sensor-status" class="message" role="status" aria-live="polite">插入 USB 转串口设备后，下拉框会自动列出候选串口。</p>
