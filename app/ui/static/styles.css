@@ -990,6 +990,28 @@ body.modal-open { overflow: hidden; }
   margin-top: 14px;
 }
 
+/* 曲线编辑器标签页：三张卡一次只显示一张（收纵向空间）；active 主色实底，
+   与 button.primary 同一配色变量 */
+.curve-tabs { display: flex; gap: 8px; margin-top: 14px; }
+.curve-tab {
+  padding: 8px 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 13px;
+  cursor: pointer;
+}
+.curve-tab:hover { border-color: var(--primary); }
+.curve-tab.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+.curve-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+/* 卡片自身未设 display，hidden 属性默认即生效；显式写出防未来样式回归 */
+.curve-editor[hidden] { display: none; }
+
 .curve-editor {
   min-width: 0;
   padding: 14px;

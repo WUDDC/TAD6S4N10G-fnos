@@ -172,8 +172,14 @@
               </label>
             </div>
 
+            <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
+              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="cpu-curve-editor">CPU</button>
+              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="disk-curve-editor">HDD/SATA</button>
+              <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+            </div>
+
             <div class="curve-editors">
-              <section class="curve-editor" aria-labelledby="cpu-curve-heading">
+              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu">
                 <div class="curve-editor-heading">
                   <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
                   <span>读取 coretemp 最高值</span>
@@ -189,7 +195,7 @@
                 <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
                 <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="disk-curve-heading">
+              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
                   <span>取已勾选前置仓的最高温度</span>
@@ -210,7 +216,7 @@
                 </fieldset>
                 <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="nvme-curve-heading">
+              <section id="nvme-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="nvme-curve-heading" data-curve-kind="nvme" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
                   <span>取已勾选 M.2 槽的最高温度</span>

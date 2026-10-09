@@ -3853,6 +3853,43 @@ function setupCurveEditor(kind) {
   $(editor.removeID).addEventListener('click', () => removeSelectedCurvePoint(kind));
 }
 CURVE_KINDS.forEach(setupCurveEditor);
+
+// ---- 曲线编辑器标签页：三张卡一次只显示一张，收纵向空间 ----
+// 切换后必须重绘：curveChartScale 按 clientWidth 测量，隐藏期间为 0，
+// 缩放与图内文字会失真；显示后按真实尺寸重算。上次停留的标签记 localStorage
+// （页面内布局记忆，无需进服务端 ui_prefs）。
+let activeCurveKind = loadActiveCurveKind();
+
+function loadActiveCurveKind() {
+  try {
+    const saved = window.localStorage.getItem('tad-curve-tab');
+    return CURVE_KINDS.includes(saved) ? saved : 'cpu';
+  } catch (error) { return 'cpu'; }
+}
+
+function applyCurveTab(kind) {
+  activeCurveKind = CURVE_KINDS.includes(kind) ? kind : 'cpu';
+  CURVE_KINDS.forEach((candidate) => {
+    const panel = document.querySelector(`.curve-editor[data-curve-kind="${candidate}"]`);
+    if (panel) panel.hidden = candidate !== activeCurveKind;
+    const tab = $(`curve-tab-${candidate}`);
+    if (tab) {
+      tab.classList.toggle('active', candidate === activeCurveKind);
+      tab.setAttribute('aria-selected', String(candidate === activeCurveKind));
+    }
+  });
+  try { window.localStorage.setItem('tad-curve-tab', activeCurveKind); } catch (error) { /* 隐私模式等场景仅本次生效 */ }
+  renderFanChart(activeCurveKind);
+}
+
+function setupCurveTabs() {
+  CURVE_KINDS.forEach((kind) => {
+    const tab = $(`curve-tab-${kind}`);
+    if (tab) tab.addEventListener('click', () => applyCurveTab(kind));
+  });
+  applyCurveTab(activeCurveKind);
+}
+setupCurveTabs();
 function setupCurveChartScaling() {
   const charts = [
     ...CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)),
