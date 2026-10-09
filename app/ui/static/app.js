@@ -110,6 +110,7 @@ let gpioEditingScriptID = '';
 let storageVisualReady = false;
 let fanSelectorSignature = null;
 let debugReportText = '';
+let serialFormDirty = false; // 串口传感器表单有未保存的修改：轮询渲染不得覆盖
 
 function baseUrl(path) {
   const base = window.location.pathname.endsWith('/') ? window.location.pathname : `${window.location.pathname}/`;
@@ -914,7 +915,9 @@ function deleteGPIOScript(scriptID) {
 }
 
 function activateTab(tabID, focus = false) {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 只遍历主导航标签：曲线编辑器等页内 [role=tab] 自成 tablist，
+  // 不归主页面切换管——全局遍历会把它们的 aria-controls 面板误隐藏
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab) => {
     const active = tab.id === tabID;
     tab.setAttribute('aria-selected', String(active));
@@ -930,7 +933,8 @@ function activateTab(tabID, focus = false) {
 }
 
 function setupTabs() {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 同 activateTab：只接管主导航标签的点击与方向键导航
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab, index) => {
     tab.addEventListener('click', () => activateTab(tab.id));
     tab.addEventListener('keydown', (event) => {
@@ -1347,12 +1351,19 @@ let historyLastCursorEvent = null; // 最后悬停位置，自动刷新重绘后
 let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
 
-let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关，缺省全开
+let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关；未记录的组走默认（见 defaultHistoryGroupEnabled）
+// 历史曲线显隐默认（用户确认）：CPU/SATA/NVMe 只画"取最高"聚合线、风扇组
+// 全画；GPU/网卡/其它默认不画，进图例弹窗按需开——一张图不再默认铺满
+// 全部核心与单盘明细曲线。
+function defaultHistoryGroupEnabled(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' || groupKey === 'fan';
+}
 // 只读访问器（渲染与测试用）：直接写 historySeriesEnabled 的路径集中在 setHistoryGroupEnabled。
 function historySeriesEnabledFor(groupKey) {
-  return historySeriesEnabled[groupKey] !== false;
+  const value = historySeriesEnabled[groupKey];
+  return value === undefined ? defaultHistoryGroupEnabled(groupKey) : value;
 }
-let historyChildSelection = loadHistoryChildSelection(); // 组内勾选，null=全部显示
+let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
 
 // ---- 30 分钟档回看（监控录像机式拖动窗口）----
 // 拉取 7.5 小时分钟级原始数据：451 点落在服务端 480 点聚合上限内，保持
@@ -1489,10 +1500,32 @@ function loadHistoryRangeHours() {
 function saveHistoryRangeHours(hours) {
   try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(hours)); }
   catch (error) { /* 隐私模式等场景下仅本次生效 */ }
-  // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）；
-  // ui_prefs 整段替换，必须带上当前开关值，否则会把调试卡显隐清掉。
-  // 保存失败静默——localStorage 兜底足够，不打扰用户
-  request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify({ history_range_hours: hours, fan_debug_visible: uiFanDebugVisible }) }).catch(() => {});
+  // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）
+  saveUIPrefsQuietly();
+}
+
+// ui_prefs 是整段替换：任何保存点都必须带上全部四个字段（档位/调试卡显隐/
+// 历史曲线父类开关/组内勾选），漏带会把其它偏好抹回默认。overrides 用于
+// 保存点自身的新值尚未落到全局变量时（如风扇卡开关的先改后存）。
+function uiPrefsBody(overrides = {}) {
+  const children = {};
+  for (const [groupKey, selection] of Object.entries(historyChildSelection)) {
+    children[groupKey] = selection === null ? null : [...selection]; // null=全部；空数组=组开但一条不画
+  }
+  return {
+    history_range_hours: historyRangeHours,
+    fan_debug_visible: uiFanDebugVisible,
+    history_series: { ...historySeriesEnabled },
+    history_children: children,
+    ...overrides,
+  };
+}
+
+// 勾选/档位类偏好保存：失败静默——localStorage 镜像兜底，不打扰用户。
+function saveUIPrefsQuietly(overrides = {}) {
+  try {
+    return request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify(uiPrefsBody(overrides)) }).catch(() => {});
+  } catch (error) { return Promise.resolve(); }
 }
 
 // 范围标签：不足 1 小时显示分钟；无极区非整小时显示"N 小时 M 分"；
@@ -1507,15 +1540,24 @@ function historyRangeLabel(hours) {
   return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
 }
 
+// 组内默认（用户确认）：CPU/SATA/NVMe 只勾"取最高"聚合项（__agg__），
+// 其余组（风扇/GPU/网卡/其它）null=全部显示。未记录（新设备/清缓存）时生效；
+// 显式记录（含关组清空的空集合）优先于默认。
+function defaultHistoryChildSelection(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' ? new Set(['__agg__']) : null;
+}
+
 function historyChildSelectionFor(groupKey) {
-  const selection = historyChildSelection[groupKey];
-  if (selection === null || selection === undefined) return null; // null = 全部显示（跟随数据）
-  return selection instanceof Set ? selection : new Set(selection); // 统一为 Set，调用方用 has()
+  const stored = historyChildSelection[groupKey];
+  if (stored === undefined) return defaultHistoryChildSelection(groupKey);
+  if (stored === null) return null; // 显式"全部显示"
+  return stored instanceof Set ? stored : new Set(stored); // 统一为 Set，调用方用 has()
 }
 
 function setHistoryChildSelection(groupKey, selection) {
   historyChildSelection[groupKey] = selection;
   saveHistoryChildSelection();
+  saveUIPrefsQuietly();
 }
 
 // 风扇 ID 缩写：it8613:it87.2608:fan3 → fan3
@@ -1826,7 +1868,7 @@ function renderHistoryChart() {
   const tempLines = [];
   const fanLines = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const lines = historyGroupSeries(group.key, ranged, intervalSeconds);
     lines.forEach((line) => {
       line.yScale = group.key === 'fan' ? 'fan' : 'temp';
@@ -1913,11 +1955,16 @@ function renderHistoryChart() {
 // 图例：六个父类行 = 复选框（整组显隐）+ 色点 + ▾（展开子类勾选弹窗）。
 // 父类勾选开关：取消时连带清空组内全部子类勾选（存为空 Set）——可见性是
 // "父类开 && 子类勾"两层与运算，父类关时子类残留会违背直觉；重新勾上父类
-// 后子类仍是空的，要恢复数据再手动勾或点聚合项。
+// 后子类仍是空的，要恢复数据再手动勾或点聚合项。偏好同时落服务端 ui_prefs
+// 与 localStorage（镜像兜底），跨浏览器/设备一致。
 function setHistoryGroupEnabled(groupKey, enabled) {
   historySeriesEnabled[groupKey] = enabled;
+  // 直接写组内选择（不走 setHistoryChildSelection）：清空与组开关是同一次
+  // 用户操作，合并成一次 ui_prefs 保存
+  if (!enabled) historyChildSelection[groupKey] = new Set();
   saveHistorySeriesEnabled();
-  if (!enabled) setHistoryChildSelection(groupKey, new Set());
+  saveHistoryChildSelection();
+  saveUIPrefsQuietly();
   renderHistoryChart();
 }
 
@@ -1938,7 +1985,7 @@ function renderHistoryLegend() {
       item.dataset.seriesKey = group.key;
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = historySeriesEnabled[group.key] !== false;
+      box.checked = historySeriesEnabledFor(group.key);
       box.addEventListener('change', () => {
         setHistoryGroupEnabled(group.key, box.checked);
       });
@@ -2098,6 +2145,30 @@ function setHistoryRange(hours) {
 // 已操作过档位则不打扰。
 let historyRangeTouched = false;
 let historyRangeAdopted = false;
+
+// 历史曲线显隐偏好（父类开关+组内勾选）从服务端 ui_prefs 采纳：与档位同款，
+// 首次 render 后不再覆盖（用户进页后立刻点勾选不被轮询回来的旧值冲掉）。
+// 采纳后写 localStorage 镜像并重置图例标识，下次图例渲染用新勾选状态。
+let historySeriesAdopted = false;
+function applyBackendHistorySeries(prefs) {
+  if (historySeriesAdopted) return;
+  historySeriesAdopted = true;
+  const series = prefs?.history_series;
+  const children = prefs?.history_children;
+  if (!series && !children) return;
+  if (series && typeof series === 'object') historySeriesEnabled = { ...series };
+  if (children && typeof children === 'object') {
+    const merged = { ...historyChildSelection };
+    for (const [groupKey, list] of Object.entries(children)) {
+      merged[groupKey] = list === null ? null : new Set(list);
+    }
+    historyChildSelection = merged;
+  }
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  historyLegendIdentity = '';
+}
+
 function applyBackendHistoryRange(prefs) {
   if (historyRangeAdopted || historyRangeTouched) return;
   historyRangeAdopted = true;
@@ -2183,7 +2254,7 @@ function historyNearestSample(ts) {
 function historyCursorRows(sample) {
   const rows = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const selection = historyChildSelectionFor(group.key);
     const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
     childIDs.forEach((childID) => {
@@ -2613,7 +2684,7 @@ function setFanDebugVisible(visible) {
   // 失败静默恢复——开关状态以保存成功为准
   request('api/config/ui-prefs', {
     method: 'POST',
-    body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: visible }),
+    body: JSON.stringify(uiPrefsBody({ fan_debug_visible: visible })),
   }).catch(() => {
     uiFanDebugVisible = previous;
     applyFanDebugVisible();
@@ -2640,10 +2711,7 @@ function syncFanDebugVisibleFromStatus() {
   if (!serverVisible && legacy) {
     // 旧版开着 → 迁移为服务端开启(带档位,同一次保存),成功后清旧键
     try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ }
-    request('api/config/ui-prefs', {
-      method: 'POST',
-      body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: true }),
-    }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); }).catch(() => {});
+    saveUIPrefsQuietly({ fan_debug_visible: true }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); });
     return;
   }
   uiFanDebugVisible = serverVisible;
@@ -3144,9 +3212,11 @@ function render(status, keepInputs = false) {
     fillFanInputs(status.config?.fan);
     fillGPIOInputs(status.config?.gpio);
     applyBackendHistoryRange(status.config?.ui_prefs); // 后端档位先采纳，保留天数钳制随后生效
+    applyBackendHistorySeries(status.config?.ui_prefs); // 曲线显隐偏好同批采纳（跨浏览器一致）
     fillHistoryInputs(status.config?.history);
     syncRunLogInputs(status);
   }
+  renderSerialSensor(status.serial);
   CURVE_KINDS.forEach(renderFanChart);
 }
 
@@ -3399,6 +3469,181 @@ async function saveSensorNames() {
     renderHistoryChart();
   } catch (error) {
     if (status) status.textContent = `保存失败：${error.message}`;
+  }
+}
+
+// ---- 调试页：USB 串口温度传感器（usb:tty:* 读数走「其它」分组，多设备） ----
+
+const SERIAL_BAUD_RATES = [2400, 4800, 9600, 19200, 38400, 57600, 115200];
+
+function setupSerialSensor() {
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  $('serial-sensor-add').addEventListener('click', () => {
+    addSerialRow(null);
+    serialFormDirty = true;
+  });
+  $('serial-sensor-save').addEventListener('click', saveSerialSensor);
+}
+
+// renderSerialSensor 同步串口传感器卡：设备下拉选项每轮刷新（插拔自动出
+// 现），配置行集合只在用户没有未保存修改时跟随服务端，各行状态文本常刷。
+function renderSerialSensor(serial) {
+  const rows = $('serial-sensor-rows');
+  if (!rows) return;
+  const configs = serial?.configs || [];
+  const devices = serial?.devices || [];
+  if (!serialFormDirty) {
+    rows.replaceChildren();
+    configs.forEach((config) => appendSerialRow(config, devices));
+    if (!configs.length) {
+      const empty = document.createElement('p');
+      empty.className = 'serial-sensor-empty';
+      empty.textContent = '尚未配置串口传感器。点击「添加传感器」后选择设备与波特率。';
+      rows.append(empty);
+    }
+  } else {
+    // 已有行只刷新设备选项与状态文本，保留用户未保存的选择
+    [...rows.querySelectorAll('.serial-sensor-config')].forEach((row) => {
+      const path = row.dataset.path;
+      fillSerialDeviceOptions(row.querySelector('.serial-row-device'), devices, path);
+      const status = serialSensorStatusText(configs.find((c) => c.path === path), Date.now());
+      const line = row.querySelector('.serial-row-status');
+      line.textContent = status;
+    });
+  }
+}
+
+// appendSerialRow 追加一行配置（config 为空表示新添加的空行）。
+function appendSerialRow(config, devices) {
+  const row = document.createElement('div');
+  row.className = 'serial-sensor-config';
+  row.dataset.path = config?.path || '';
+
+  const toggle = document.createElement('label');
+  toggle.className = 'toggle serial-row-enabled';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = Boolean(config?.enabled);
+  checkbox.addEventListener('change', () => { serialFormDirty = true; });
+  const span = document.createElement('span');
+  toggle.append(checkbox, span);
+
+  const device = document.createElement('select');
+  device.className = 'serial-row-device';
+  device.addEventListener('change', () => {
+    row.dataset.path = device.value;
+    serialFormDirty = true;
+  });
+  fillSerialDeviceOptions(device, devices, config?.path || '');
+
+  const baud = document.createElement('select');
+  baud.className = 'serial-row-baud';
+  SERIAL_BAUD_RATES.forEach((rate) => {
+    const option = document.createElement('option');
+    option.value = String(rate);
+    option.textContent = `${rate} bps`;
+    if (rate === (config?.baud || 9600)) option.selected = true;
+    baud.append(option);
+  });
+  baud.addEventListener('change', () => { serialFormDirty = true; });
+
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'serial-row-remove';
+  remove.textContent = '删除';
+  remove.addEventListener('click', () => {
+    row.remove();
+    serialFormDirty = true;
+  });
+
+  const status = document.createElement('p');
+  status.className = 'serial-row-status message';
+  status.textContent = serialSensorStatusText(config, Date.now());
+
+  row.append(toggle, device, baud, remove, status);
+  $('serial-sensor-rows').append(row);
+}
+
+function addSerialRow() {
+  appendSerialRow({ enabled: true, baud: 9600 }, currentStatus?.serial?.devices || []);
+}
+
+// fillSerialDeviceOptions 填充一行的设备下拉：候选设备 + 已配置但当前未检
+// 测到的路径（保留选项避免误改配置）；selected 为当前应选中的路径。
+function fillSerialDeviceOptions(select, devices, selected) {
+  const options = [...devices.map((d) => ({ path: d.path, label: `${d.label}（${d.path}）` }))];
+  if (selected && !devices.some((d) => d.path === selected)) {
+    options.push({ path: selected, label: `${selected}（未检测到）` });
+  }
+  if (!options.length) {
+    options.push({ path: '', label: '未发现串口设备（插入 USB 转串口后自动出现）' });
+  }
+  select.replaceChildren();
+  options.forEach((option) => {
+    const el = document.createElement('option');
+    el.value = option.path;
+    el.textContent = option.label;
+    if (option.path === selected) el.selected = true;
+    select.append(el);
+  });
+}
+
+// serialSensorStatusText 把一行配置的运行态拼成一句话；now 参数便于离线
+// 单测注入时钟。有错误但读数还新鲜（<60 秒）时按"瞬断重连中"表述——USB
+// 串口偶发 EOF 会自动快速重连，不该吓唬用户；重连失败持续无读数才升级为
+// "连接失败"。
+function serialSensorStatusText(config, now = Date.now()) {
+  if (!config) return '尚未保存。';
+  if (!config.enabled) return '未启用（保留配置，不再读取）。';
+  const age = config.last_at
+    ? Math.max(0, Math.round((now - new Date(config.last_at).getTime()) / 1000))
+    : null;
+  const parts = [];
+  if (config.open) parts.push('已连接');
+  else if (config.last_error) {
+    parts.push(age !== null && age <= 60
+      ? `读数中断，正在自动重连（${config.last_error}）`
+      : `连接失败：${config.last_error}`);
+  } else parts.push('等待连接…');
+  if (age !== null) {
+    parts.push(`最近读数 ${formatTemperature(config.last_celsius, true)}（${age} 秒前）`);
+  }
+  if (config.key) parts.push(`曲线键 ${config.key}`);
+  return `${parts.join('；')}。`;
+}
+
+async function saveSerialSensor() {
+  const line = $('serial-sensor-status');
+  const configs = [...document.querySelectorAll('.serial-sensor-config')].map((row) => ({
+    enabled: row.querySelector('.serial-row-enabled input').checked,
+    path: row.querySelector('.serial-row-device').value,
+    baud: Number(row.querySelector('.serial-row-baud').value) || 9600,
+  }));
+  const enabledWithoutPath = configs.filter((c) => c.enabled && !c.path).length;
+  if (enabledWithoutPath) {
+    line.textContent = `有 ${enabledWithoutPath} 个启用的传感器未选择设备路径。`;
+    line.className = 'message error';
+    return;
+  }
+  const button = $('serial-sensor-save');
+  button.disabled = true;
+  try {
+    const updated = await request('api/config/serial-sensor', {
+      method: 'POST',
+      body: JSON.stringify({ configs }),
+    });
+    serialFormDirty = false;
+    render(updated, true);
+    const enabled = configs.filter((c) => c.enabled).length;
+    line.textContent = enabled
+      ? `已保存 ${configs.length} 个配置（启用 ${enabled} 个）。读数出现在历史温度「其它」分组，键以 usb:tty: 开头。`
+      : `已保存 ${configs.length} 个配置（全部停用）。`;
+  } catch (error) {
+    line.textContent = `保存失败：${error.message}`;
+    line.className = 'message error';
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -3676,6 +3921,43 @@ function setupCurveEditor(kind) {
   $(editor.removeID).addEventListener('click', () => removeSelectedCurvePoint(kind));
 }
 CURVE_KINDS.forEach(setupCurveEditor);
+
+// ---- 曲线编辑器标签页：三张卡一次只显示一张，收纵向空间 ----
+// 切换后必须重绘：curveChartScale 按 clientWidth 测量，隐藏期间为 0，
+// 缩放与图内文字会失真；显示后按真实尺寸重算。上次停留的标签记 localStorage
+// （页面内布局记忆，无需进服务端 ui_prefs）。
+let activeCurveKind = loadActiveCurveKind();
+
+function loadActiveCurveKind() {
+  try {
+    const saved = window.localStorage.getItem('tad-curve-tab');
+    return CURVE_KINDS.includes(saved) ? saved : 'cpu';
+  } catch (error) { return 'cpu'; }
+}
+
+function applyCurveTab(kind) {
+  activeCurveKind = CURVE_KINDS.includes(kind) ? kind : 'cpu';
+  CURVE_KINDS.forEach((candidate) => {
+    const panel = document.querySelector(`.curve-editor[data-curve-kind="${candidate}"]`);
+    if (panel) panel.hidden = candidate !== activeCurveKind;
+    const tab = $(`curve-tab-${candidate}`);
+    if (tab) {
+      tab.classList.toggle('active', candidate === activeCurveKind);
+      tab.setAttribute('aria-selected', String(candidate === activeCurveKind));
+    }
+  });
+  try { window.localStorage.setItem('tad-curve-tab', activeCurveKind); } catch (error) { /* 隐私模式等场景仅本次生效 */ }
+  renderFanChart(activeCurveKind);
+}
+
+function setupCurveTabs() {
+  CURVE_KINDS.forEach((kind) => {
+    const tab = $(`curve-tab-${kind}`);
+    if (tab) tab.addEventListener('click', () => applyCurveTab(kind));
+  });
+  applyCurveTab(activeCurveKind);
+}
+setupCurveTabs();
 function setupCurveChartScaling() {
   const charts = [
     ...CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)),
@@ -3721,6 +4003,7 @@ $('debug-download-report').addEventListener('click', downloadDebugReport);
 $('debug-open-issue').addEventListener('click', openDebugIssue);
 setupHistoryExport();
 setupSensorNames();
+setupSerialSensor();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);

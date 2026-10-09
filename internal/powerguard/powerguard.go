@@ -69,6 +69,8 @@ type Config struct {
 	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	Serial         *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
+	Serials        []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
 	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
 	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
 	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
@@ -79,6 +81,13 @@ type Config struct {
 type UIPrefsConfig struct {
 	HistoryRangeHours float64 `json:"history_range_hours,omitempty"` // 历史温度时间范围档位（小时）
 	FanDebugVisible   bool    `json:"fan_debug_visible,omitempty"`   // 调试页风扇调试卡片是否显示（跨浏览器跟随账号）
+	// 历史温度曲线显隐偏好（跨浏览器跟随账号）：父类开关与组内勾选。
+	// HistorySeries 值为该父类是否画曲线；HistoryChildren 为组内勾选的子曲线
+	// ID 列表（cpu/sata/nvme 的 "__agg__" 是聚合"取最高"项），null/缺省键 =
+	// 前端默认（温度组只画聚合线、风扇组全画）；空列表 = 组开但一条不画，
+	// 不能丢键——omitempty 只在 map 整体为 nil 时省略字段，内层空列表保留。
+	HistorySeries   map[string]bool     `json:"history_series,omitempty"`
+	HistoryChildren map[string][]string `json:"history_children,omitempty"`
 }
 
 // LogConfig 运行日志的大小设置：与历史数据库大小上限解耦。日志体量小，
@@ -198,6 +207,7 @@ type Status struct {
 	FanControl        FanControlStatus     `json:"fan_control"`
 	Storage           StorageStatus        `json:"storage"`
 	GPIO              GPIOStatus           `json:"gpio"`
+	Serial            SerialSensorInfo     `json:"serial"`
 	LastApply         time.Time            `json:"last_apply,omitempty"`
 	LastError         string               `json:"last_error,omitempty"`
 }
@@ -260,6 +270,11 @@ type Manager struct {
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
 	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
+
+	// USB 串口温度传感器（usb_serial.go）：SerialSensorLoop 监督者与各设备
+	// 读取器的运行状态，全部随 m.mu 保护。
+	serialKick    chan struct{}                 // 配置保存后通知监督者重新对账（容量 1，非阻塞）
+	serialReaders map[string]*serialReaderState // 在跑的读取器（键为设备路径，读取器退出时自行摘除）
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -1076,6 +1091,7 @@ func (m *Manager) Status() Status {
 	} else {
 		status.Config = cfg
 	}
+	status.Serial = m.serialStatusLocked(cfg.Serials)
 	packages, err := m.DiscoverPackages()
 	if err != nil {
 		status.LastError = combineError(status.LastError, err)
@@ -1182,8 +1198,9 @@ var knownUSBTempDrivers = map[string]bool{
 // ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
 // 硬盘芯片（nvme/drivetemp）除外：盘温只走槽位采样（history_slots），
 // hwmon 读数与 SATA/NVMe 组的单盘曲线重复。
-// 末尾并入无内核驱动的 USB 温度计（TEMPer 系列，key 前缀 "usb:"），同样
-// 归「其它」组，共享改名与父类归属覆盖链路。
+// 末尾并入无内核驱动的 USB 温度计（TEMPer 系列，key 前缀 "usb:"）与 USB
+// 串口温度传感器（key 前缀 "usb:tty:"），同样归「其它」组，共享改名与父类
+// 归属覆盖链路。
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
@@ -1218,6 +1235,7 @@ func (m *Manager) extraTemperatures() []Temperature {
 	for _, reading := range m.usbTemperatureReadings() {
 		result = append(result, Temperature{Label: reading.Key, Celsius: reading.Celsius})
 	}
+	result = append(result, m.serialTemperatureReadingsLocked()...)
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
 	return result
 }

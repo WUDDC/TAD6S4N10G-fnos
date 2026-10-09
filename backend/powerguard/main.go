@@ -208,6 +208,8 @@ func serve(args []string) error {
 	go storageLoop(ctx, manager, logger)
 	go storageActivityLoop(ctx, manager)
 	go gpioLoop(ctx, manager, logger)
+	// USB 串口温度传感器读取器：未配置时内部低频空转，常驻无副作用
+	go manager.SerialSensorLoop(ctx, logger)
 
 	select {
 	case <-ctx.Done():

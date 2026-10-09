@@ -172,8 +172,14 @@
               </label>
             </div>
 
+            <div class="curve-tabs" role="tablist" aria-label="温控曲线编辑器切换">
+              <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="true" aria-controls="cpu-curve-editor">CPU</button>
+              <button id="curve-tab-hdd" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="disk-curve-editor">HDD/SATA</button>
+              <button id="curve-tab-nvme" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="nvme-curve-editor">NVMe</button>
+            </div>
+
             <div class="curve-editors">
-              <section class="curve-editor" aria-labelledby="cpu-curve-heading">
+              <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu">
                 <div class="curve-editor-heading">
                   <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
                   <span>读取 coretemp 最高值</span>
@@ -189,7 +195,7 @@
                 <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
                 <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="disk-curve-heading">
+              <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
                   <span>取已勾选前置仓的最高温度</span>
@@ -210,7 +216,7 @@
                 </fieldset>
                 <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
               </section>
-              <section class="curve-editor" aria-labelledby="nvme-curve-heading">
+              <section id="nvme-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="nvme-curve-heading" data-curve-kind="nvme" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
                   <span>取已勾选 M.2 槽的最高温度</span>
@@ -481,6 +487,21 @@
               <button id="sensor-names-save" type="button" class="primary">保存显示名</button>
             </div>
             <p id="sensor-names-status" class="message" role="status" aria-live="polite">切换到历史温度页一次即可列出全部传感器。</p>
+          </section>
+
+          <section class="card debug-panel" aria-labelledby="serial-sensor-heading">
+            <div class="panel-heading">
+              <div>
+                <h2 id="serial-sensor-heading">USB 串口温度传感器</h2>
+                <p>经 USB 转串口模块（CH340、CP210x、FTDI 等）接入的温度计：固件逐行输出含温度数字的文本（如 25.6、+25.6、temp:25.6），行内第一个合理温度按摄氏度入库，可同时接多个。读取为间歇轮询（每 5 秒开口读一次），其余时间串口空闲、可被其他程序读取。读数出现在历史温度「其它」分组（键 usb:tty: 开头），可在上方「传感器显示名」改名。设备优先选 by-id 路径（插拔编号不漂移）；两个一模一样的适配器 by-id 会撞名，用 by-path 按物理插口区分。</p>
+              </div>
+            </div>
+            <div id="serial-sensor-rows" class="serial-sensor-rows"></div>
+            <div class="actions debug-actions">
+              <button id="serial-sensor-add" type="button">添加传感器</button>
+              <button id="serial-sensor-save" type="button" class="primary">保存串口传感器</button>
+            </div>
+            <p id="serial-sensor-status" class="message" role="status" aria-live="polite">插入 USB 转串口设备后，下拉框会自动列出候选串口。</p>
           </section>
         </section>
 

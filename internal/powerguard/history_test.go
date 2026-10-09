@@ -2519,3 +2519,44 @@ func TestHandleFansDebugEndpoints(t *testing.T) {
 		t.Fatalf("auto stop status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
+
+// SaveUIPrefs：历史曲线显隐偏好（父类开关 + 组内勾选）随整段保存往返，
+// 空子列表保留（组开但一条不画），false 开关值不被 omitempty 丢键。
+func TestSaveUIPrefsHistorySeriesVisibility(t *testing.T) {
+	manager := newHistoryTestManager(t)
+	prefs := UIPrefsConfig{
+		HistoryRangeHours: 12,
+		HistorySeries:     map[string]bool{"cpu": true, "gpu": false, "fan": true},
+		HistoryChildren: map[string][]string{
+			"cpu": {"__agg__"},
+			"fan": {"it8792:it8792:fan1", "it8792:it8792:fan2"},
+			"nic": {}, // 组开但一条不勾：空列表必须原样保留
+		},
+	}
+	if err := manager.SaveUIPrefs(prefs); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := manager.LoadOrCreateConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := cfg.UIPrefs
+	if got.HistoryRangeHours != 12 {
+		t.Fatalf("range hours = %v, want 12", got.HistoryRangeHours)
+	}
+	if !got.HistorySeries["cpu"] || got.HistorySeries["gpu"] || !got.HistorySeries["fan"] {
+		t.Fatalf("history_series = %v, want cpu/fan on and gpu off", got.HistorySeries)
+	}
+	if _, ok := got.HistorySeries["sata"]; ok {
+		t.Fatal("unset groups should stay absent (frontend default applies)")
+	}
+	if len(got.HistoryChildren["cpu"]) != 1 || got.HistoryChildren["cpu"][0] != "__agg__" {
+		t.Fatalf("cpu children = %v, want [__agg__]", got.HistoryChildren["cpu"])
+	}
+	if len(got.HistoryChildren["fan"]) != 2 {
+		t.Fatalf("fan children = %v, want 2 entries", got.HistoryChildren["fan"])
+	}
+	if list, ok := got.HistoryChildren["nic"]; !ok || len(list) != 0 {
+		t.Fatalf("empty child list must round-trip (group on, nothing drawn), got %v ok=%v", list, ok)
+	}
+}

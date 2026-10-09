@@ -94,6 +94,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
 	mux.HandleFunc("/api/config/history", s.handleHistoryConfig)
 	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
+	mux.HandleFunc("/api/config/serial-sensor", s.handleSerialSensorConfig)
 	mux.HandleFunc("/api/config/ui-prefs", s.handleUIPrefsConfig)
 	mux.HandleFunc("/api/config/log", s.handleLogConfig)
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
@@ -272,14 +273,22 @@ func (s *Server) handleUIPrefsConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		HistoryRangeHours float64 `json:"history_range_hours"`
-		FanDebugVisible   bool    `json:"fan_debug_visible"`
+		HistoryRangeHours float64             `json:"history_range_hours"`
+		FanDebugVisible   bool                `json:"fan_debug_visible"`
+		HistorySeries     map[string]bool     `json:"history_series"`
+		HistoryChildren   map[string][]string `json:"history_children"`
 	}
 	if err := decodeConfigRequest(r, &payload); err != nil {
 		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
 		return
 	}
-	if err := s.Manager.SaveUIPrefs(UIPrefsConfig{HistoryRangeHours: payload.HistoryRangeHours, FanDebugVisible: payload.FanDebugVisible}); err != nil {
+	prefs := UIPrefsConfig{
+		HistoryRangeHours: payload.HistoryRangeHours,
+		FanDebugVisible:   payload.FanDebugVisible,
+		HistorySeries:     payload.HistorySeries,
+		HistoryChildren:   payload.HistoryChildren,
+	}
+	if err := s.Manager.SaveUIPrefs(prefs); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -305,6 +314,30 @@ func (s *Server) handleSensorNamesConfig(w http.ResponseWriter, r *http.Request)
 		payload.Groups = map[string]string{}
 	}
 	if err := s.Manager.SaveSensorSettings(payload.Names, payload.Groups); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+// handleSerialSensorConfig 保存整组 USB 串口温度传感器配置（多设备数组）；
+// 保存即踢监督者按新配置增删读取器。各设备连接状态与最近读数随
+// /api/status 的 serial 字段下发，无需单独 GET。
+func (s *Server) handleSerialSensorConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Configs []SerialSensorConfig `json:"configs"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if payload.Configs == nil {
+		payload.Configs = []SerialSensorConfig{}
+	}
+	if err := s.Manager.SaveSerialSensorConfigs(payload.Configs); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

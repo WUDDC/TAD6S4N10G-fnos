@@ -990,6 +990,28 @@ body.modal-open { overflow: hidden; }
   margin-top: 14px;
 }
 
+/* 曲线编辑器标签页：三张卡一次只显示一张（收纵向空间）；active 主色实底，
+   与 button.primary 同一配色变量 */
+.curve-tabs { display: flex; gap: 8px; margin-top: 14px; }
+.curve-tab {
+  padding: 8px 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 13px;
+  cursor: pointer;
+}
+.curve-tab:hover { border-color: var(--primary); }
+.curve-tab.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+.curve-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+/* 卡片自身未设 display，hidden 属性默认即生效；显式写出防未来样式回归 */
+.curve-editor[hidden] { display: none; }
+
 .curve-editor {
   min-width: 0;
   padding: 14px;
@@ -1223,6 +1245,34 @@ body.modal-open { overflow: hidden; }
 }
 @media (max-width: 599px) {
   .sensor-name-row { grid-template-columns: 1fr; gap: 4px; }
+}
+
+/* ---- 调试页：USB 串口温度传感器（多设备表格） ---- */
+.serial-sensor-rows { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 12px; }
+.serial-sensor-empty { font-size: 13px; color: var(--muted); }
+.serial-sensor-config {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  row-gap: 4px;
+}
+.serial-sensor-config .serial-row-status { grid-column: 1 / -1; margin: 0; }
+.serial-row-enabled { margin: 0; }
+.serial-row-device, .serial-row-baud {
+  min-width: 0;
+  max-width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+.serial-row-device { overflow: hidden; text-overflow: ellipsis; }
+.serial-row-remove { padding: 6px 12px; }
+.serial-row-status { font-size: 12px; color: var(--muted); }
+@media (max-width: 599px) {
+  .serial-sensor-config { grid-template-columns: auto minmax(0, 1fr) auto; }
+  .serial-row-baud { grid-column: 2; }
+  .serial-row-remove { grid-column: 3; grid-row: 2; }
 }
 .history-dot {
   width: 10px;
