@@ -799,6 +799,11 @@ test('串口传感器状态行（多设备）：未保存/未启用/等待/已�
     serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', open: true, last_celsius: 26, last_at: '2026-10-09T12:00:10Z' }, now),
     '已连接；最近读数 26.0 °C（0 秒前）。',
   );
+  // 旧后端的零值时间戳（0001-01-01）当无读数处理，不渲染出纪元差值"亿秒前"
+  assert.equal(
+    serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', open: true, last_celsius: 0, last_at: '0001-01-01T00:00:00Z' }, now),
+    '已连接。',
+  );
 });
 
 test('历史曲线默认显隐：温度组只开聚合线+风扇全开，GPU/网卡/其它默认关', () => {

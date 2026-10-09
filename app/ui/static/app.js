@@ -3596,8 +3596,11 @@ function fillSerialDeviceOptions(select, devices, selected) {
 function serialSensorStatusText(config, now = Date.now()) {
   if (!config) return '尚未保存。';
   if (!config.enabled) return '未启用（保留配置，不再读取）。';
-  const age = config.last_at
-    ? Math.max(0, Math.round((now - new Date(config.last_at).getTime()) / 1000))
+  // 零值时间戳（旧后端下发的 0001-01-01）解析出负数毫秒，一并当无读数，
+  // 避免渲染出“63927157204 秒前”这类纪元差值
+  const lastAtMs = config.last_at ? new Date(config.last_at).getTime() : NaN;
+  const age = Number.isFinite(lastAtMs) && lastAtMs > 0
+    ? Math.max(0, Math.round((now - lastAtMs) / 1000))
     : null;
   const parts = [];
   if (config.open) parts.push('已连接');

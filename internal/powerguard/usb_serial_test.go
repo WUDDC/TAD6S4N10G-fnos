@@ -369,6 +369,59 @@ func TestSaveSerialSensorConfigs(t *testing.T) {
 	}
 }
 
+// TestSaveSerialSensorConfigsPhysicalDuplicate 同一物理设备的多个入口
+// （by-id 符号链接与裸 tty 节点解析到同一设备）必须拒绝保存：多个读取器
+// 交错开口/关口同一 tty 会互相打断打开序列（真机出过三条目全部 tiocmset
+// 失败）。其中一条停用即可放行。
+func TestSaveSerialSensorConfigsPhysicalDuplicate(t *testing.T) {
+	root := t.TempDir()
+	devDir := filepath.Join(root, "dev")
+	if err := os.MkdirAll(filepath.Join(devDir, "serial", "by-id"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	node := filepath.Join(devDir, "ttyUSB0")
+	if err := os.WriteFile(node, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../../ttyUSB0", filepath.Join(devDir, "serial", "by-id", "usb-1a86_USB_Serial-if00-port0")); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(configPath, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	m := &Manager{ConfigPath: configPath, Root: root}
+	m.mu.Lock()
+	m.serialKick = make(chan struct{}, 1)
+	m.serialReaders = map[string]*serialReaderState{}
+	m.mu.Unlock()
+
+	err := m.SaveSerialSensorConfigs([]SerialSensorConfig{
+		{Enabled: true, Path: "/dev/ttyUSB0"},
+		{Enabled: true, Path: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "同一设备") {
+		t.Fatalf("physical duplicate must be rejected, got %v", err)
+	}
+	if err := m.SaveSerialSensorConfigs([]SerialSensorConfig{
+		{Enabled: true, Path: "/dev/ttyUSB0"},
+		{Enabled: false, Path: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"},
+	}); err != nil {
+		t.Fatalf("disabled duplicate row must be allowed: %v", err)
+	}
+	// 两个不同物理设备（ttyUSB0/ttyUSB1）互不影响
+	if err := os.WriteFile(filepath.Join(devDir, "ttyUSB1"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SaveSerialSensorConfigs([]SerialSensorConfig{
+		{Enabled: true, Path: "/dev/ttyUSB0"},
+		{Enabled: true, Path: "/dev/ttyUSB1"},
+	}); err != nil {
+		t.Fatalf("distinct devices must be allowed: %v", err)
+	}
+}
+
 // ---- 监督者与读取器 ----
 
 func TestSerialSensorLoopServesAndDisables(t *testing.T) {

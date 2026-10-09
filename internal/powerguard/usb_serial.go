@@ -120,6 +120,29 @@ func serialBaudList() string {
 	return strings.Join(parts, "/")
 }
 
+// rejectSerialPhysicalDuplicates 拒绝多个启用配置指向同一物理串口。
+// by-id/by-path 是指向 /dev/ttyUSBN 的符号链接，字符串判重挡不住"同一
+// 设备加了三个入口"的配置——多个读取器交错开口/关口同一 tty 会互相打断
+// 对方的打开序列（真机出过三条目全部 tiocmset 失败）。路径当前解析不了
+// （设备拔出/不可达）时只回退字符串判重，不额外拦截。
+func (m *Manager) rejectSerialPhysicalDuplicates(configs []SerialSensorConfig) error {
+	firstPath := make(map[string]string, len(configs)) // 解析后的真实设备 → 首个配置路径
+	for _, cfg := range configs {
+		if !cfg.Enabled || cfg.Path == "" {
+			continue
+		}
+		real, err := filepath.EvalSymlinks(m.rooted(cfg.Path))
+		if err != nil {
+			continue
+		}
+		if other, dup := firstPath[real]; dup {
+			return fmt.Errorf("多个配置指向同一设备 %s：%s 与 %s", filepath.Base(real), other, cfg.Path)
+		}
+		firstPath[real] = cfg.Path
+	}
+	return nil
+}
+
 // serialPort 抽象串口的读与关闭，便于离线单测注入假设备。
 type serialPort interface {
 	Read(b []byte) (int, error)
@@ -472,6 +495,9 @@ func (m *Manager) SaveSerialSensorConfigs(configs []SerialSensorConfig) error {
 	if err != nil {
 		return err
 	}
+	if err := m.rejectSerialPhysicalDuplicates(configs); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	current, err := m.loadConfigLocked()
 	if err != nil {
@@ -492,13 +518,15 @@ func (m *Manager) SaveSerialSensorConfigs(configs []SerialSensorConfig) error {
 }
 
 // SerialSensorConfigStatus 一个配置行的运行态，嵌入配置本体的 JSON 字段。
+// LastAt 用指针：time.Time 的 omitempty 挡不住零值结构体，无读数时会下发
+// 0001-01-01，前端一减渲染成"63927157204 秒前"。
 type SerialSensorConfigStatus struct {
 	SerialSensorConfig
-	Open        bool      `json:"open"`
-	Key         string    `json:"key,omitempty"`
-	LastCelsius float64   `json:"last_celsius,omitempty"`
-	LastAt      time.Time `json:"last_at,omitempty"`
-	LastError   string    `json:"last_error,omitempty"`
+	Open        bool       `json:"open"`
+	Key         string     `json:"key,omitempty"`
+	LastCelsius float64    `json:"last_celsius,omitempty"`
+	LastAt      *time.Time `json:"last_at,omitempty"`
+	LastError   string     `json:"last_error,omitempty"`
 }
 
 // SerialSensorInfo 是随 /api/status 下发的串口传感器整体状态。
@@ -525,7 +553,8 @@ func (m *Manager) serialStatusLocked(configs []SerialSensorConfig) SerialSensorI
 			item.LastError = state.lastError
 			if !state.latest.At.IsZero() {
 				item.LastCelsius = state.latest.Celsius
-				item.LastAt = state.latest.At
+				at := state.latest.At
+				item.LastAt = &at
 			}
 		}
 		info.Configs = append(info.Configs, item)
