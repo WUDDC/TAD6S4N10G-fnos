@@ -1354,6 +1354,16 @@ function historySeriesEnabledFor(groupKey) {
 }
 let historyChildSelection = loadHistoryChildSelection(); // 组内勾选，null=全部显示
 
+// ---- 30 分钟档回看（监控录像机式拖动窗口）----
+// 拉取 7.5 小时分钟级原始数据：451 点落在服务端 480 点聚合上限内，保持
+// 1 分钟粒度不聚合；图表固定显示 30 点窗口，在这段数据上左右拖动回看。
+const HISTORY_SCRUB_FETCH_HOURS = 7.5;
+const HISTORY_SCRUB_POINTS = 30;
+let historyScrubEndTs = null;      // 回看窗口末端采样 ts；null=贴最新（实时跟随）
+let historyIntervalSeconds = 60;   // 渲染时缓存的服务端采样间隔，拖动吸附换算用
+let historyXDomain = { start: 0, end: 0 }; // 渲染时缓存的横轴时间域，供十字线换算
+let historyScrubDragging = false;  // 拖动中：抑制十字线与提示框
+
 function loadHistorySeriesEnabled() {
   try {
     const raw = JSON.parse(window.localStorage.getItem('tad-history-series') || '{}');
@@ -1517,6 +1527,26 @@ function historyFanLabel(fanID) {
 function historyFilterRange(samples, rangeHours, nowTs) {
   const cutoff = nowTs - rangeHours * 3600;
   return samples.filter((sample) => sample.ts >= cutoff);
+}
+
+// 30 分钟档的拉取范围：回看模式取 7.5 小时原始数据，其余档位原样。
+function historyFetchHoursFor(rangeHours) {
+  return rangeHours === 0.5 ? HISTORY_SCRUB_FETCH_HOURS : rangeHours;
+}
+
+// 回看窗口：固定 points 个采样槽位，末端吸附采样网格（以最旧样本为基准）
+// 并夹在 [最旧+span, 最新] 内。数据不足 points 个点时窗口覆盖全部数据。
+// 纯函数，node --test 直接断言。
+function historyScrubWindow(samples, intervalSeconds, endTs, points = HISTORY_SCRUB_POINTS) {
+  const interval = Math.max(1, intervalSeconds);
+  if (!samples.length) return { start: 0, end: 0, atLive: true };
+  const oldest = samples[0].ts;
+  const latest = samples[samples.length - 1].ts;
+  const span = (points - 1) * interval;
+  if (latest - oldest < span) return { start: oldest, end: latest, atLive: true };
+  const snapped = oldest + Math.round((endTs - oldest) / interval) * interval;
+  const end = Math.min(latest, Math.max(oldest + span, snapped));
+  return { start: end - span, end, atLive: end >= latest };
 }
 
 // 兜底抽稀（正常情况下服务端已聚合到 ≤480 点）：超出上限按固定步长取样
@@ -1771,14 +1801,26 @@ function renderHistoryChart() {
   if (!samples.length) {
     svg.replaceChildren();
     renderHistoryLegend();
+    renderHistoryScrubBar(false, null);
     if (status) status.textContent = '正在采样，曲线会随时间慢慢生成。';
     return;
   }
   const intervalSeconds = Math.max(1, Number(data.interval_seconds) || 60);
   const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
-  const ranged = historyFilterRange(samples, historyRangeHours, nowTs);
+  const ranged = historyFilterRange(samples, historyFetchHoursFor(historyRangeHours), nowTs);
   historyRangedSamples = ranged;
+  historyIntervalSeconds = intervalSeconds;
+  // 回看模式（30 分钟档）：横轴域是 30 点滑动窗口；末端贴最新时解除钉住，
+  // 让自动刷新继续跟随实时
+  const scrub = historyRangeHours === 0.5 && ranged.length > 0;
+  if (scrub && historyScrubEndTs !== null && historyScrubEndTs >= ranged[ranged.length - 1].ts) {
+    historyScrubEndTs = null;
+  }
+  const win = scrub
+    ? historyScrubWindow(ranged, intervalSeconds, historyScrubEndTs ?? ranged[ranged.length - 1].ts)
+    : null;
+  const domain = win ? { start: win.start, end: win.end } : { start: nowTs - historyRangeHours * 3600, end: nowTs };
+  historyXDomain = domain;
 
   // 逐父类构建曲线；温度类（CPU/SATA/NVMe/网卡/其它）走左轴，风扇走右轴
   const tempLines = [];
@@ -1810,7 +1852,8 @@ function renderHistoryChart() {
     bottom: CHART.bottom,
   };
   historyPlotBox = plot;
-  const x = (ts) => plot.left + ((clamp(ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
+  svg.classList.toggle('scrub', Boolean(win)); // 仅回看模式显示拖动光标与手势
+  const x = (ts) => plot.left + ((clamp(ts, domain.start, domain.end) - domain.start) / Math.max(1, domain.end - domain.start)) * (plot.right - plot.left);
   const yTemp = (value) => plot.bottom - ((clamp(value, bounds.lo, bounds.hi) - bounds.lo) / (bounds.hi - bounds.lo)) * (plot.bottom - plot.top);
   const yFan = (percent) => plot.bottom - (clamp(percent, 0, HISTORY_FAN_MAX_PERCENT) / HISTORY_FAN_MAX_PERCENT) * (plot.bottom - plot.top);
   svg.replaceChildren();
@@ -1822,7 +1865,7 @@ function renderHistoryChart() {
   [0, 25, 50, 75, 100].forEach((tick) => {
     svg.append(svgElement('text', { x: plot.right + axisPad, y: yFan(tick) + textSize * 0.35, class: 'chart-axis-text', 'font-size': textSize, 'text-anchor': 'start' }, `${tick}%`));
   });
-  const timeTicks = historyTimeTicks(startSec, nowTs, historyRangeHours);
+  const timeTicks = historyTimeTicks(domain.start, domain.end, win ? 0.5 : historyRangeHours);
   const tickStep = timeTicks.length > 1 ? timeTicks[1] - timeTicks[0] : 0;
   // 网格线按档位步长全画；刻度文字过密时抽稀，可容纳的标签数随缩放比例减少
   const maxLabels = Math.min(10, Math.max(5, Math.round(10 * chartScale)));
@@ -1845,9 +1888,11 @@ function renderHistoryChart() {
 
   const drawSeries = (line, yScale) => {
     line.segments.forEach((segment) => {
-      if (segment.length < 2) return;
+      // 回看模式只画窗口内的点：窗口外的点若靠 clamp 会堆在绘图区两缘
+      const visible = win ? segment.filter((point) => point.ts >= win.start && point.ts <= win.end) : segment;
+      if (visible.length < 2) return;
       svg.append(svgElement('polyline', {
-        points: segment.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
+        points: visible.map((point) => `${x(point.ts)},${yScale(point.value)}`).join(' '),
         fill: 'none', stroke: line.color, 'stroke-width': 2 / chartScale, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
       }));
     });
@@ -1856,6 +1901,7 @@ function renderHistoryChart() {
   fanLines.forEach((line) => drawSeries(line, yFan));
 
   renderHistoryLegend();
+  renderHistoryScrubBar(scrub, win);
 
   if (status) {
     status.textContent = `已记录 ${samples.length} 个采样点 · 更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
@@ -2001,10 +2047,10 @@ async function fetchHistory(force = false) {
     return historyCache;
   }
   try {
-    const requestedRange = historyRangeHours;
+    const requestedRange = historyFetchHoursFor(historyRangeHours);
     const data = await request(`api/history?range=${requestedRange}`);
     // 快速切换范围时丢弃过期响应：慢的旧请求不能覆盖当前范围的缓存
-    if (requestedRange !== historyRangeHours) return historyCache;
+    if (requestedRange !== historyFetchHoursFor(historyRangeHours)) return historyCache;
     if (data && Array.isArray(data.samples)) {
       historyCache = data;
       historyFetchedAt = Date.now();
@@ -2041,6 +2087,7 @@ function syncHistoryRangeUI() {
 function setHistoryRange(hours) {
   historyRangeTouched = true; // 本会话用户已手动选择，此后不被后端档位覆盖
   historyRangeHours = hours;
+  historyScrubEndTs = null; // 换档退出回看，窗口回到实时
   saveHistoryRangeHours(hours);
   syncHistoryRangeUI();
   fetchHistory(true);
@@ -2059,6 +2106,7 @@ function applyBackendHistoryRange(prefs) {
   const normalized = normalizeHistoryRangeHours(hours);
   if (normalized === historyRangeHours) return;
   historyRangeHours = normalized;
+  historyScrubEndTs = null;
   try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(normalized)); }
   catch (error) { /* 缓存镜像失败可忽略 */ }
   syncHistoryRangeUI();
@@ -2102,6 +2150,7 @@ function setupHistoryPanel() {
   }
   syncHistoryRangeUI(); // 应用 localStorage 记忆的范围
   setupHistoryCursor();
+  setupHistoryScrub();
 }
 
 // ---- 悬浮十字线：竖虚线 + 各曲线在该时刻的数值提示框 ----
@@ -2115,10 +2164,9 @@ function historyCursorTimeAt(event) {
   point.x = event.clientX;
   point.y = event.clientY;
   const local = point.matrixTransform(matrix.inverse());
-  const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
-  const raw = startSec + ((local.x - historyPlotBox.left) / (historyPlotBox.right - historyPlotBox.left)) * historyRangeHours * 3600;
-  return Math.round(Math.min(nowTs, Math.max(startSec, raw)));
+  const raw = historyXDomain.start
+    + ((local.x - historyPlotBox.left) / (historyPlotBox.right - historyPlotBox.left)) * (historyXDomain.end - historyXDomain.start);
+  return Math.round(Math.min(historyXDomain.end, Math.max(historyXDomain.start, raw)));
 }
 
 function historyNearestSample(ts) {
@@ -2160,10 +2208,9 @@ function drawHistoryCrosshair(sample) {
   if (!svg) return;
   svg.querySelectorAll('.history-crosshair').forEach((node) => node.remove());
   if (!sample) return;
-  const nowTs = Math.floor(Date.now() / 1000);
-  const startSec = nowTs - historyRangeHours * 3600;
   const plot = historyPlotBox;
-  const cx = plot.left + ((clamp(sample.ts, startSec, nowTs) - startSec) / (historyRangeHours * 3600)) * (plot.right - plot.left);
+  const span = Math.max(1, historyXDomain.end - historyXDomain.start);
+  const cx = plot.left + ((clamp(sample.ts, historyXDomain.start, historyXDomain.end) - historyXDomain.start) / span) * (plot.right - plot.left);
   // 竖虚线用 non-scaling-stroke（SVG 属性，CSP 安全）：viewBox 拉伸时线宽保持
   // styles.css 里设定的 1.5 屏幕像素，不会随窗口放大变粗
   svg.append(svgElement('line', { x1: cx, y1: plot.top, x2: cx, y2: plot.bottom, class: 'history-crosshair history-crosshair-line', 'vector-effect': 'non-scaling-stroke' }));
@@ -2179,7 +2226,7 @@ function drawHistoryCrosshair(sample) {
 }
 
 function showHistoryCursor(event) {
-  if (!historyRangedSamples.length) return;
+  if (historyScrubDragging || !historyRangedSamples.length) return;
   historyLastCursorEvent = { clientX: event.clientX, clientY: event.clientY };
   const ts = historyCursorTimeAt(event);
   if (ts == null) return;
@@ -2229,6 +2276,74 @@ function setupHistoryCursor() {
   if (!svg) return;
   svg.addEventListener('mousemove', showHistoryCursor);
   svg.addEventListener('mouseleave', hideHistoryCursor);
+}
+
+// ---- 30 分钟档回看：状态条 + 图表拖动 ----
+// 图表固定显示 30 点窗口；在图上左右拖动（鼠标/触摸）移动窗口，拖回最右
+// 跟随实时。回看状态条显示窗口时段，离开实时边缘时提供“回到最新”。
+
+function renderHistoryScrubBar(active, win) {
+  const bar = $('history-scrub-bar');
+  if (!bar) return;
+  if (!active || !win) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  const label = $('history-scrub-range');
+  if (label) {
+    const span = `${historyFormatClock(win.start)}–${historyFormatClock(win.end)}`;
+    label.textContent = win.atLive
+      ? `实时 ${span} · 在图上左右拖动回看历史`
+      : `回看 ${span}`;
+  }
+  const live = $('history-scrub-live');
+  if (live) live.hidden = win.atLive;
+}
+
+function setupHistoryScrub() {
+  const svg = $('history-chart');
+  if (!svg) return;
+  let drag = null; // { pointerId, startX, baseEndTs }
+  const pxPerSlot = () => Math.max(1, (historyPlotBox.right - historyPlotBox.left) / (HISTORY_SCRUB_POINTS - 1));
+  svg.addEventListener('pointerdown', (event) => {
+    if (historyRangeHours !== 0.5 || event.button > 0) return;
+    if (!historyRangedSamples.length) return;
+    drag = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      baseEndTs: historyScrubEndTs ?? historyRangedSamples[historyRangedSamples.length - 1].ts,
+    };
+    historyScrubDragging = true;
+    hideHistoryCursor();
+    try { svg.setPointerCapture(event.pointerId); } catch (error) { /* 已释放的指针 */ }
+    svg.classList.add('scrubbing');
+  });
+  svg.addEventListener('pointermove', (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    const oldest = historyRangedSamples[0].ts;
+    // 内容跟手：向右拖 = 看更早的数据，窗口末端随位移左移并吸附采样网格
+    const deltaSlots = (event.clientX - drag.startX) / pxPerSlot();
+    const rawEnd = drag.baseEndTs - deltaSlots * historyIntervalSeconds;
+    historyScrubEndTs = oldest + Math.round((rawEnd - oldest) / historyIntervalSeconds) * historyIntervalSeconds;
+    renderHistoryChart();
+  });
+  const endDrag = (event) => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    drag = null;
+    historyScrubDragging = false;
+    svg.classList.remove('scrubbing');
+  };
+  svg.addEventListener('pointerup', endDrag);
+  svg.addEventListener('pointercancel', endDrag);
+  const live = $('history-scrub-live');
+  if (live) {
+    live.addEventListener('click', () => {
+      historyScrubEndTs = null;
+      fetchHistory();
+      renderHistoryChart();
+    });
+  }
 }
 
 
