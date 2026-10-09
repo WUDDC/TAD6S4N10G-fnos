@@ -915,7 +915,9 @@ function deleteGPIOScript(scriptID) {
 }
 
 function activateTab(tabID, focus = false) {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 只遍历主导航标签：曲线编辑器等页内 [role=tab] 自成 tablist，
+  // 不归主页面切换管——全局遍历会把它们的 aria-controls 面板误隐藏
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab) => {
     const active = tab.id === tabID;
     tab.setAttribute('aria-selected', String(active));
@@ -931,7 +933,8 @@ function activateTab(tabID, focus = false) {
 }
 
 function setupTabs() {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+  // 同 activateTab：只接管主导航标签的点击与方向键导航
+  const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
   tabs.forEach((tab, index) => {
     tab.addEventListener('click', () => activateTab(tab.id));
     tab.addEventListener('keydown', (event) => {
