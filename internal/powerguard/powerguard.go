@@ -80,6 +80,13 @@ type Config struct {
 type UIPrefsConfig struct {
 	HistoryRangeHours float64 `json:"history_range_hours,omitempty"` // 历史温度时间范围档位（小时）
 	FanDebugVisible   bool    `json:"fan_debug_visible,omitempty"`   // 调试页风扇调试卡片是否显示（跨浏览器跟随账号）
+	// 历史温度曲线显隐偏好（跨浏览器跟随账号）：父类开关与组内勾选。
+	// HistorySeries 值为该父类是否画曲线；HistoryChildren 为组内勾选的子曲线
+	// ID 列表（cpu/sata/nvme 的 "__agg__" 是聚合"取最高"项），null/缺省键 =
+	// 前端默认（温度组只画聚合线、风扇组全画）；空列表 = 组开但一条不画，
+	// 不能丢键——omitempty 只在 map 整体为 nil 时省略字段，内层空列表保留。
+	HistorySeries   map[string]bool     `json:"history_series,omitempty"`
+	HistoryChildren map[string][]string `json:"history_children,omitempty"`
 }
 
 // LogConfig 运行日志的大小设置：与历史数据库大小上限解耦。日志体量小，

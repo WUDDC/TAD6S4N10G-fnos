@@ -1348,12 +1348,19 @@ let historyLastCursorEvent = null; // 最后悬停位置，自动刷新重绘后
 let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
 
-let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关，缺省全开
+let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关；未记录的组走默认（见 defaultHistoryGroupEnabled）
+// 历史曲线显隐默认（用户确认）：CPU/SATA/NVMe 只画"取最高"聚合线、风扇组
+// 全画；GPU/网卡/其它默认不画，进图例弹窗按需开——一张图不再默认铺满
+// 全部核心与单盘明细曲线。
+function defaultHistoryGroupEnabled(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' || groupKey === 'fan';
+}
 // 只读访问器（渲染与测试用）：直接写 historySeriesEnabled 的路径集中在 setHistoryGroupEnabled。
 function historySeriesEnabledFor(groupKey) {
-  return historySeriesEnabled[groupKey] !== false;
+  const value = historySeriesEnabled[groupKey];
+  return value === undefined ? defaultHistoryGroupEnabled(groupKey) : value;
 }
-let historyChildSelection = loadHistoryChildSelection(); // 组内勾选，null=全部显示
+let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
 
 // ---- 30 分钟档回看（监控录像机式拖动窗口）----
 // 拉取 7.5 小时分钟级原始数据：451 点落在服务端 480 点聚合上限内，保持
@@ -1490,10 +1497,32 @@ function loadHistoryRangeHours() {
 function saveHistoryRangeHours(hours) {
   try { window.localStorage.setItem(HISTORY_RANGE_STORAGE_KEY, String(hours)); }
   catch (error) { /* 隐私模式等场景下仅本次生效 */ }
-  // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）；
-  // ui_prefs 整段替换，必须带上当前开关值，否则会把调试卡显隐清掉。
-  // 保存失败静默——localStorage 兜底足够，不打扰用户
-  request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify({ history_range_hours: hours, fan_debug_visible: uiFanDebugVisible }) }).catch(() => {});
+  // 档位同时记到后端配置（随 /api/status 的 config.ui_prefs 下发，跨设备一致）
+  saveUIPrefsQuietly();
+}
+
+// ui_prefs 是整段替换：任何保存点都必须带上全部四个字段（档位/调试卡显隐/
+// 历史曲线父类开关/组内勾选），漏带会把其它偏好抹回默认。overrides 用于
+// 保存点自身的新值尚未落到全局变量时（如风扇卡开关的先改后存）。
+function uiPrefsBody(overrides = {}) {
+  const children = {};
+  for (const [groupKey, selection] of Object.entries(historyChildSelection)) {
+    children[groupKey] = selection === null ? null : [...selection]; // null=全部；空数组=组开但一条不画
+  }
+  return {
+    history_range_hours: historyRangeHours,
+    fan_debug_visible: uiFanDebugVisible,
+    history_series: { ...historySeriesEnabled },
+    history_children: children,
+    ...overrides,
+  };
+}
+
+// 勾选/档位类偏好保存：失败静默——localStorage 镜像兜底，不打扰用户。
+function saveUIPrefsQuietly(overrides = {}) {
+  try {
+    return request('api/config/ui-prefs', { method: 'POST', body: JSON.stringify(uiPrefsBody(overrides)) }).catch(() => {});
+  } catch (error) { return Promise.resolve(); }
 }
 
 // 范围标签：不足 1 小时显示分钟；无极区非整小时显示"N 小时 M 分"；
@@ -1508,15 +1537,24 @@ function historyRangeLabel(hours) {
   return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
 }
 
+// 组内默认（用户确认）：CPU/SATA/NVMe 只勾"取最高"聚合项（__agg__），
+// 其余组（风扇/GPU/网卡/其它）null=全部显示。未记录（新设备/清缓存）时生效；
+// 显式记录（含关组清空的空集合）优先于默认。
+function defaultHistoryChildSelection(groupKey) {
+  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' ? new Set(['__agg__']) : null;
+}
+
 function historyChildSelectionFor(groupKey) {
-  const selection = historyChildSelection[groupKey];
-  if (selection === null || selection === undefined) return null; // null = 全部显示（跟随数据）
-  return selection instanceof Set ? selection : new Set(selection); // 统一为 Set，调用方用 has()
+  const stored = historyChildSelection[groupKey];
+  if (stored === undefined) return defaultHistoryChildSelection(groupKey);
+  if (stored === null) return null; // 显式"全部显示"
+  return stored instanceof Set ? stored : new Set(stored); // 统一为 Set，调用方用 has()
 }
 
 function setHistoryChildSelection(groupKey, selection) {
   historyChildSelection[groupKey] = selection;
   saveHistoryChildSelection();
+  saveUIPrefsQuietly();
 }
 
 // 风扇 ID 缩写：it8613:it87.2608:fan3 → fan3
@@ -1827,7 +1865,7 @@ function renderHistoryChart() {
   const tempLines = [];
   const fanLines = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const lines = historyGroupSeries(group.key, ranged, intervalSeconds);
     lines.forEach((line) => {
       line.yScale = group.key === 'fan' ? 'fan' : 'temp';
@@ -1914,11 +1952,16 @@ function renderHistoryChart() {
 // 图例：六个父类行 = 复选框（整组显隐）+ 色点 + ▾（展开子类勾选弹窗）。
 // 父类勾选开关：取消时连带清空组内全部子类勾选（存为空 Set）——可见性是
 // "父类开 && 子类勾"两层与运算，父类关时子类残留会违背直觉；重新勾上父类
-// 后子类仍是空的，要恢复数据再手动勾或点聚合项。
+// 后子类仍是空的，要恢复数据再手动勾或点聚合项。偏好同时落服务端 ui_prefs
+// 与 localStorage（镜像兜底），跨浏览器/设备一致。
 function setHistoryGroupEnabled(groupKey, enabled) {
   historySeriesEnabled[groupKey] = enabled;
+  // 直接写组内选择（不走 setHistoryChildSelection）：清空与组开关是同一次
+  // 用户操作，合并成一次 ui_prefs 保存
+  if (!enabled) historyChildSelection[groupKey] = new Set();
   saveHistorySeriesEnabled();
-  if (!enabled) setHistoryChildSelection(groupKey, new Set());
+  saveHistoryChildSelection();
+  saveUIPrefsQuietly();
   renderHistoryChart();
 }
 
@@ -1939,7 +1982,7 @@ function renderHistoryLegend() {
       item.dataset.seriesKey = group.key;
       const box = document.createElement('input');
       box.type = 'checkbox';
-      box.checked = historySeriesEnabled[group.key] !== false;
+      box.checked = historySeriesEnabledFor(group.key);
       box.addEventListener('change', () => {
         setHistoryGroupEnabled(group.key, box.checked);
       });
@@ -2099,6 +2142,30 @@ function setHistoryRange(hours) {
 // 已操作过档位则不打扰。
 let historyRangeTouched = false;
 let historyRangeAdopted = false;
+
+// 历史曲线显隐偏好（父类开关+组内勾选）从服务端 ui_prefs 采纳：与档位同款，
+// 首次 render 后不再覆盖（用户进页后立刻点勾选不被轮询回来的旧值冲掉）。
+// 采纳后写 localStorage 镜像并重置图例标识，下次图例渲染用新勾选状态。
+let historySeriesAdopted = false;
+function applyBackendHistorySeries(prefs) {
+  if (historySeriesAdopted) return;
+  historySeriesAdopted = true;
+  const series = prefs?.history_series;
+  const children = prefs?.history_children;
+  if (!series && !children) return;
+  if (series && typeof series === 'object') historySeriesEnabled = { ...series };
+  if (children && typeof children === 'object') {
+    const merged = { ...historyChildSelection };
+    for (const [groupKey, list] of Object.entries(children)) {
+      merged[groupKey] = list === null ? null : new Set(list);
+    }
+    historyChildSelection = merged;
+  }
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  historyLegendIdentity = '';
+}
+
 function applyBackendHistoryRange(prefs) {
   if (historyRangeAdopted || historyRangeTouched) return;
   historyRangeAdopted = true;
@@ -2184,7 +2251,7 @@ function historyNearestSample(ts) {
 function historyCursorRows(sample) {
   const rows = [];
   HISTORY_GROUPS.forEach((group) => {
-    if (historySeriesEnabled[group.key] === false) return;
+    if (!historySeriesEnabledFor(group.key)) return;
     const selection = historyChildSelectionFor(group.key);
     const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
     childIDs.forEach((childID) => {
@@ -2614,7 +2681,7 @@ function setFanDebugVisible(visible) {
   // 失败静默恢复——开关状态以保存成功为准
   request('api/config/ui-prefs', {
     method: 'POST',
-    body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: visible }),
+    body: JSON.stringify(uiPrefsBody({ fan_debug_visible: visible })),
   }).catch(() => {
     uiFanDebugVisible = previous;
     applyFanDebugVisible();
@@ -2641,10 +2708,7 @@ function syncFanDebugVisibleFromStatus() {
   if (!serverVisible && legacy) {
     // 旧版开着 → 迁移为服务端开启(带档位,同一次保存),成功后清旧键
     try { window.localStorage.removeItem(FAN_DEBUG_VISIBLE_KEY); } catch (error) { /* 忽略 */ }
-    request('api/config/ui-prefs', {
-      method: 'POST',
-      body: JSON.stringify({ history_range_hours: historyRangeHours, fan_debug_visible: true }),
-    }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); }).catch(() => {});
+    saveUIPrefsQuietly({ fan_debug_visible: true }).then(() => { uiFanDebugVisible = true; applyFanDebugVisible(); });
     return;
   }
   uiFanDebugVisible = serverVisible;
@@ -3145,6 +3209,7 @@ function render(status, keepInputs = false) {
     fillFanInputs(status.config?.fan);
     fillGPIOInputs(status.config?.gpio);
     applyBackendHistoryRange(status.config?.ui_prefs); // 后端档位先采纳，保留天数钳制随后生效
+    applyBackendHistorySeries(status.config?.ui_prefs); // 曲线显隐偏好同批采纳（跨浏览器一致）
     fillHistoryInputs(status.config?.history);
     syncRunLogInputs(status);
   }

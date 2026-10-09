@@ -517,7 +517,7 @@ test('档位记忆挂后端：切档 POST api/config/ui-prefs；首帧采纳后�
   const prefPosts = wrote.requests.filter((req) => req.url.includes('api/config/ui-prefs'));
   assert.equal(prefPosts.length, 1, '切档应 POST 一次 ui-prefs');
   assert.equal(prefPosts[0].init.method, 'POST');
-  assert.deepEqual(JSON.parse(prefPosts[0].init.body), { history_range_hours: 6, fan_debug_visible: false }, 'ui_prefs 整段替换,必须带上当前开关值');
+  assert.deepEqual(JSON.parse(prefPosts[0].init.body), { history_range_hours: 6, fan_debug_visible: false, history_series: {}, history_children: {} }, 'ui_prefs 整段替换,必须带上当前全部偏好字段');
 
   // 独立上下文（未手动切档）：后端下发 2 小时 → 采纳并按新档位取数
   const adopt = recordingFetch(() => ({ samples: [] }));
@@ -564,10 +564,14 @@ test('历史分组子类：空通道过滤、组别归类、聚合项与勾选�
   assert.equal(historyChildValue('cpu', 'Core 0', samples[1]), 57);
   assert.equal(historyChildValue('nic', 'igc:PHY', samples[0]), 62);
 
-  // 组曲线可见性：默认全选（null）→ 全部子类；只勾聚合项 → 一条线
+  // 组曲线可见性：未记录走默认（温度组只勾聚合）→ 一条线；显式 null=全部
+  const defaultSeries = historyGroupSeries('sata', samples, 60);
+  assert.equal(defaultSeries.length, 1);
+  assert.equal(defaultSeries[0].id, 'sata:__agg__', '默认只画聚合线');
+  const setHistoryChildSelection = resolve('setHistoryChildSelection');
+  setHistoryChildSelection('sata', null);
   const allSeries = historyGroupSeries('sata', samples, 60);
   assert.equal(allSeries.length, 2);
-  const setHistoryChildSelection = resolve('setHistoryChildSelection');
   setHistoryChildSelection('sata', new Set(['__agg__']));
   const aggOnly = historyGroupSeries('sata', samples, 60);
   setHistoryChildSelection('sata', null);
@@ -784,4 +788,78 @@ test('串口传感器状态行：未启用/等待/已连接/失败与读数年�
     serialSensorStatusText({ config: { enabled: true }, open: true, last_celsius: 26, last_at: '2026-10-09T12:00:10Z' }, now),
     '已连接；最近读数 26.0 °C（0 秒前）。',
   );
+});
+
+test('历史曲线默认显隐：温度组只开聚合线+风扇全开，GPU/网卡/其它默认关', () => {
+  const defaultHistoryGroupEnabled = resolve('defaultHistoryGroupEnabled');
+  const defaultHistoryChildSelection = resolve('defaultHistoryChildSelection');
+  for (const key of ['cpu', 'sata', 'nvme', 'fan']) {
+    assert.equal(defaultHistoryGroupEnabled(key), true, `${key} 默认应展示`);
+  }
+  for (const key of ['gpu', 'nic', 'other']) {
+    assert.equal(defaultHistoryGroupEnabled(key), false, `${key} 默认应关闭`);
+  }
+  // 温度组默认只勾聚合项
+  for (const key of ['cpu', 'sata', 'nvme']) {
+    const selection = defaultHistoryChildSelection(key);
+    assert.equal(selection.size, 1, `${key} 默认只勾聚合`);
+    assert.equal(selection.has('__agg__'), true, `${key} 默认勾 __agg__`);
+  }
+  // 风扇等组默认全部显示
+  for (const key of ['fan', 'gpu', 'nic', 'other']) {
+    assert.equal(defaultHistoryChildSelection(key), null, `${key} 默认全部显示`);
+  }
+});
+
+test('历史曲线显隐：未记录走默认，显式记录优先', () => {
+  const historySeriesEnabledFor = resolve('historySeriesEnabledFor');
+  const historyChildSelectionFor = resolve('historyChildSelectionFor');
+  // 未记录：默认（温度组开+聚合、其它组关）；用 nvme 验证——共享 vm 状态
+  // 里 sata 已被前序测试写过显式值
+  assert.equal(historySeriesEnabledFor('nvme'), true);
+  assert.equal(historySeriesEnabledFor('gpu'), false);
+  const nvmeDefault = historyChildSelectionFor('nvme');
+  assert.equal(nvmeDefault.has('__agg__'), true);
+  // 显式记录：优先于默认
+  const setHistoryGroupEnabled = resolve('setHistoryGroupEnabled');
+  setHistoryGroupEnabled('gpu', true);
+  assert.equal(historySeriesEnabledFor('gpu'), true);
+  setHistoryGroupEnabled('nvme', false); // 关组连带清空子类勾选（原设计）
+  assert.equal(historySeriesEnabledFor('nvme'), false);
+  const cleared = historyChildSelectionFor('nvme');
+  assert.equal(cleared.size, 0, '关组后子类勾选应为空集合');
+});
+
+test('历史曲线偏好：服务端 ui_prefs 采纳一次，轮询/旧值不冲掉本地修改', () => {
+  const applyBackendHistorySeries = resolve('applyBackendHistorySeries');
+  const historySeriesEnabledFor = resolve('historySeriesEnabledFor');
+  const historyChildSelectionFor = resolve('historyChildSelectionFor');
+  // 采纳服务端记录
+  applyBackendHistorySeries({ history_series: { gpu: true }, history_children: { cpu: ['__agg__', 'Core 0'], nic: null } });
+  assert.equal(historySeriesEnabledFor('gpu'), true, '服务端 gpu=true 应生效');
+  const cpu = historyChildSelectionFor('cpu');
+  assert.equal(cpu.has('__agg__'), true);
+  assert.equal(cpu.has('Core 0'), true);
+  assert.equal(historyChildSelectionFor('nic'), null, 'null=全部显示');
+  // 本地再改后，第二次采纳（轮询回来的同值）不得覆盖
+  const setHistoryGroupEnabled = resolve('setHistoryGroupEnabled');
+  setHistoryGroupEnabled('gpu', false);
+  applyBackendHistorySeries({ history_series: { gpu: true } });
+  assert.equal(historySeriesEnabledFor('gpu'), false, '二次采纳不得覆盖本地修改');
+});
+
+test('ui_prefs 保存体：整段替换语义下四个字段全量带上，overrides 最后生效', () => {
+  const uiPrefsBody = resolve('uiPrefsBody');
+  const setHistoryChildSelection = resolve('setHistoryChildSelection');
+  setHistoryChildSelection('cpu', new Set(['__agg__']));
+  const body = uiPrefsBody({ fan_debug_visible: true });
+  assert.equal(typeof body.history_range_hours, 'number');
+  assert.equal(body.fan_debug_visible, true, 'overrides 应覆盖全局值');
+  // history_series 只含显式改过的键（前序测试留下 gpu:false）；未记录键
+  // 由前端按默认处理，不落盘。字段级断言：vm 跨 realm 对象的原型与外部
+  // Object.prototype 不同，deepStrictEqual 会误报
+  assert.equal(body.history_series.gpu, false);
+  assert.equal(Object.keys(body.history_series).length, 1);
+  assert.equal(body.history_children.cpu.length, 1);
+  assert.equal(body.history_children.cpu[0], '__agg__');
 });
