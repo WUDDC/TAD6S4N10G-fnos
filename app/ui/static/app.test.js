@@ -762,3 +762,26 @@ test('30 分钟档回看：拉取范围、窗口吸附/夹取/贴最新与数据
   // 空数据兜底
   assertWindow(historyScrubWindow([], 60, 0), 0, 0, true, '空数据兜底');
 });
+
+test('串口传感器状态行：未启用/等待/已连接/失败与读数年龄', () => {
+  const serialSensorStatusText = resolve('serialSensorStatusText');
+  const now = Date.parse('2026-10-09T12:00:00Z');
+  assert.equal(serialSensorStatusText({ config: { enabled: false } }, now), '串口温度传感器未启用。');
+  assert.equal(
+    serialSensorStatusText({ config: { enabled: true, path: '/dev/ttyUSB0' } }, now),
+    '等待连接…。',
+  );
+  assert.equal(
+    serialSensorStatusText({ config: { enabled: true }, open: true, key: 'usb:tty:ttyUSB0', last_celsius: 25.6, last_at: '2026-10-09T11:59:40Z' }, now),
+    '已连接；最近读数 25.6 °C（20 秒前）；曲线键 usb:tty:ttyUSB0。',
+  );
+  assert.equal(
+    serialSensorStatusText({ config: { enabled: true }, last_error: 'permission denied' }, now),
+    '连接失败：permission denied。',
+  );
+  // 时钟倒挂（轮询间隙设备时间漂移）不出现负数年龄
+  assert.equal(
+    serialSensorStatusText({ config: { enabled: true }, open: true, last_celsius: 26, last_at: '2026-10-09T12:00:10Z' }, now),
+    '已连接；最近读数 26.0 °C（0 秒前）。',
+  );
+});

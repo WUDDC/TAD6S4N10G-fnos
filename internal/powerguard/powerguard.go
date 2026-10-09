@@ -69,6 +69,7 @@ type Config struct {
 	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
 	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
 	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	Serial         SerialSensorConfig     `json:"serial"`                  // USB 串口外置温度传感器（usb_serial.go：文本行源）
 	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
 	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
 	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
@@ -198,6 +199,7 @@ type Status struct {
 	FanControl        FanControlStatus     `json:"fan_control"`
 	Storage           StorageStatus        `json:"storage"`
 	GPIO              GPIOStatus           `json:"gpio"`
+	Serial            SerialSensorInfo     `json:"serial"`
 	LastApply         time.Time            `json:"last_apply,omitempty"`
 	LastError         string               `json:"last_error,omitempty"`
 }
@@ -260,6 +262,13 @@ type Manager struct {
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
 	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
+
+	// USB 串口温度传感器（usb_serial.go）：SerialSensorLoop 常驻 goroutine
+	// 的运行状态，全部随 m.mu 保护。
+	serialKick      chan struct{} // 配置保存后踢断当前连接（容量 1，非阻塞）
+	serialLatest    serialReading // 最近一次有效读数（At 零值 = 尚无数据）
+	serialOpen      bool          // 读取器当前是否持有已打开的串口
+	serialLastError string        // 最近一次读取错误（变化才记日志，恢复清空）
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -1076,6 +1085,7 @@ func (m *Manager) Status() Status {
 	} else {
 		status.Config = cfg
 	}
+	status.Serial = m.serialStatusLocked(status.Config.Serial)
 	packages, err := m.DiscoverPackages()
 	if err != nil {
 		status.LastError = combineError(status.LastError, err)
@@ -1182,8 +1192,9 @@ var knownUSBTempDrivers = map[string]bool{
 // ACPI 温区等），Label 以芯片名做前缀供前端分组。GPU（amdgpu/i915）单列。
 // 硬盘芯片（nvme/drivetemp）除外：盘温只走槽位采样（history_slots），
 // hwmon 读数与 SATA/NVMe 组的单盘曲线重复。
-// 末尾并入无内核驱动的 USB 温度计（TEMPer 系列，key 前缀 "usb:"），同样
-// 归「其它」组，共享改名与父类归属覆盖链路。
+// 末尾并入无内核驱动的 USB 温度计（TEMPer 系列，key 前缀 "usb:"）与 USB
+// 串口温度传感器（key 前缀 "usb:tty:"），同样归「其它」组，共享改名与父类
+// 归属覆盖链路。
 func (m *Manager) extraTemperatures() []Temperature {
 	namePaths, _ := filepath.Glob(m.rooted("/sys/class/hwmon/hwmon*/name"))
 	var result []Temperature
@@ -1217,6 +1228,9 @@ func (m *Manager) extraTemperatures() []Temperature {
 	}
 	for _, reading := range m.usbTemperatureReadings() {
 		result = append(result, Temperature{Label: reading.Key, Celsius: reading.Celsius})
+	}
+	if reading, ok := m.serialTemperatureReadingLocked(); ok {
+		result = append(result, reading)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Label < result[j].Label })
 	return result

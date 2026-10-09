@@ -1224,6 +1224,27 @@ body.modal-open { overflow: hidden; }
 @media (max-width: 599px) {
   .sensor-name-row { grid-template-columns: 1fr; gap: 4px; }
 }
+
+/* ---- 调试页：USB 串口温度传感器 ---- */
+.serial-sensor-toggle { margin: 4px 0 12px; }
+.serial-sensor-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+.serial-sensor-row > label { font-size: 12px; color: var(--muted); }
+.serial-sensor-row select {
+  min-width: 0;
+  max-width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+}
+@media (max-width: 599px) {
+  .serial-sensor-row { grid-template-columns: 1fr; gap: 4px; }
+}
 .history-dot {
   width: 10px;
   height: 10px;
