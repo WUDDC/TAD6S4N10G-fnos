@@ -784,6 +784,16 @@ test('串口传感器状态行（多设备）：未保存/未启用/等待/已�
     serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', last_error: 'permission denied' }, now),
     '连接失败：permission denied。',
   );
+  // 有错误但读数还新鲜（≤60 秒）：按瞬断重连表述，不吓唬用户
+  assert.equal(
+    serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', last_error: 'usb:tty:ttyUSB0: read: hangup: EOF', last_celsius: 29.3, last_at: '2026-10-09T11:59:50Z' }, now),
+    '读数中断，正在自动重连（usb:tty:ttyUSB0: read: hangup: EOF）；最近读数 29.3 °C（10 秒前）。',
+  );
+  // 错误持续超过 60 秒无新读数：升级为连接失败
+  assert.equal(
+    serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', last_error: 'open /dev/ttyUSB0: no such device', last_celsius: 29.3, last_at: '2026-10-09T11:55:00Z' }, now),
+    '连接失败：open /dev/ttyUSB0: no such device；最近读数 29.3 °C（300 秒前）。',
+  );
   // 时钟倒挂（轮询间隙设备时间漂移）不出现负数年龄
   assert.equal(
     serialSensorStatusText({ enabled: true, path: '/dev/ttyUSB0', open: true, last_celsius: 26, last_at: '2026-10-09T12:00:10Z' }, now),

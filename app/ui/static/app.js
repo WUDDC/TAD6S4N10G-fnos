@@ -3587,16 +3587,23 @@ function fillSerialDeviceOptions(select, devices, selected) {
 }
 
 // serialSensorStatusText 把一行配置的运行态拼成一句话；now 参数便于离线
-// 单测注入时钟。
+// 单测注入时钟。有错误但读数还新鲜（<60 秒）时按"瞬断重连中"表述——USB
+// 串口偶发 EOF 会自动快速重连，不该吓唬用户；重连失败持续无读数才升级为
+// "连接失败"。
 function serialSensorStatusText(config, now = Date.now()) {
   if (!config) return '尚未保存。';
   if (!config.enabled) return '未启用（保留配置，不再读取）。';
+  const age = config.last_at
+    ? Math.max(0, Math.round((now - new Date(config.last_at).getTime()) / 1000))
+    : null;
   const parts = [];
   if (config.open) parts.push('已连接');
-  else if (config.last_error) parts.push(`连接失败：${config.last_error}`);
-  else parts.push('等待连接…');
-  if (config.last_at) {
-    const age = Math.max(0, Math.round((now - new Date(config.last_at).getTime()) / 1000));
+  else if (config.last_error) {
+    parts.push(age !== null && age <= 60
+      ? `读数中断，正在自动重连（${config.last_error}）`
+      : `连接失败：${config.last_error}`);
+  } else parts.push('等待连接…');
+  if (age !== null) {
     parts.push(`最近读数 ${formatTemperature(config.last_celsius, true)}（${age} 秒前）`);
   }
   if (config.key) parts.push(`曲线键 ${config.key}`);

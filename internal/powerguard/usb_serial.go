@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -36,13 +37,14 @@ import (
 )
 
 const (
-	serialDefaultBaud  = 9600             // 波特率缺省值（DIY 固件事实标准）
-	serialReadTimeout  = 3 * time.Second  // 单次 Read deadline，也是断连检查周期
-	serialStaleAfter   = 30 * time.Second // 超过此时长无新行视为失效，读数不入采样
-	serialRetryWait    = 10 * time.Second // 连接失败/失效后的重连间隔
-	serialIdleWait     = 15 * time.Second // 无启用设备时监督者空转间隔
-	serialReconcileGap = 60 * time.Second // 监督者周期对账间隔（kick 之外的兜底）
-	serialMaxDevices   = 8                // 配置行数上限（防手滑/脏数据堆积）
+	serialDefaultBaud     = 9600             // 波特率缺省值（DIY 固件事实标准）
+	serialReadTimeout     = 3 * time.Second  // 单次 Read deadline，也是断连检查周期
+	serialStaleAfter      = 30 * time.Second // 超过此时长无新行视为失效，读数不入采样
+	serialRetryWait       = 10 * time.Second // 连接失败/失效后的重连间隔
+	serialHangupRetryWait = 2 * time.Second  // EOF 瞬断的快速重连间隔（设备大概率还在）
+	serialIdleWait        = 15 * time.Second // 无启用设备时监督者空转间隔
+	serialReconcileGap    = 60 * time.Second // 监督者周期对账间隔（kick 之外的兜底）
+	serialMaxDevices      = 8                // 配置行数上限（防手滑/脏数据堆积）
 )
 
 // serialBaudRates 配置界面与校验共用的波特率白名单。
@@ -270,7 +272,14 @@ func (m *Manager) runSerialReader(ctx context.Context, cfg SerialSensorConfig) {
 		if err != nil {
 			m.noteSerialReaderError(state, err)
 		}
-		if !serialSleep(readerCtx, serialRetryWait) {
+		// EOF 是读取流被挂断（USB 串口内核层偶发瞬断/复位），设备大概率
+		// 还在：走 2 秒快速重连，别按拔线的 10 秒节奏干等——读数中断窗口
+		// 从最坏 ~13 秒缩到 ~5 秒。其它错误（打不开/无数据）保持 10 秒。
+		wait := serialRetryWait
+		if errors.Is(err, errSerialHangup) {
+			wait = serialHangupRetryWait
+		}
+		if !serialSleep(readerCtx, wait) {
 			return
 		}
 	}
@@ -321,6 +330,11 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *s
 				}
 				continue // 行间静默属正常：继续等下一包
 			}
+			// 读取流挂断（EOF）：USB 串口内核层偶发瞬断/复位，设备大概率
+			// 还在，用独立哨兵让重连走快速通道
+			if errors.Is(err, io.EOF) {
+				return fmt.Errorf("%s: read: %w", state.key, fmt.Errorf("%w: %w", errSerialHangup, io.EOF))
+			}
 			return fmt.Errorf("%s: read: %w", state.key, err)
 		}
 	}
@@ -328,6 +342,9 @@ func (m *Manager) readSerialLines(ctx context.Context, port serialPort, state *s
 
 // errNoSerialData 连接成立但持续无数据的失效原因，与 IO 错误区分开。
 var errNoSerialData = errors.New("no data")
+
+// errSerialHangup 读取流挂断（EOF）：瞬断，重连走快速通道。
+var errSerialHangup = errors.New("hangup")
 
 // serialTempPattern 数字片段（允许正负号与小数；ParseFloat 兼容 "+25.6"）。
 // 取值时再过滤合理区间，因为 "0 25.6"（地址+温度）这类行首数字不是温度。

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -283,6 +284,19 @@ func TestReadSerialLinesStale(t *testing.T) {
 	}
 	if !state.latest.At.IsZero() {
 		t.Fatalf("stale loop must not store readings, got %v", state.latest.Celsius)
+	}
+}
+
+func TestReadSerialLinesEOFAliasHangup(t *testing.T) {
+	m := &Manager{}
+	state := newSerialState("/dev/ttyUSB0")
+	port := &fakeSerialPort{reads: [][]byte{[]byte("25.6\n")}, readErr: io.EOF}
+	err := m.readSerialLines(context.Background(), port, state)
+	if !errors.Is(err, errSerialHangup) || !errors.Is(err, io.EOF) {
+		t.Fatalf("readSerialLines() err=%v, want errSerialHangup wrapping io.EOF", err)
+	}
+	if state.latest.Celsius != 25.6 {
+		t.Fatalf("EOF before error must keep stored reading, got %v", state.latest.Celsius)
 	}
 }
 
