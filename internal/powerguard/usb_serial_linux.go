@@ -76,13 +76,12 @@ func configureSerial(file *os.File, baud int) error {
 	// 清 DTR/RTS：open() 默认会把两条线拉起，Arduino 类板子把 DTR 接到
 	// RESET——间歇轮询每次开口都复位一次传感器就读不到数了。清掉后开口
 	// 不再触发对端复位（需要复位的烧录器自己会拉，不受影响）。
-	bits, err := unix.IoctlGetInt(int(file.Fd()), unix.TIOCMGET)
-	if err != nil {
-		return fmt.Errorf("tiocmget: %w", err)
-	}
-	bits &^= unix.TIOCM_DTR | unix.TIOCM_RTS
-	if err := unix.IoctlSetInt(int(file.Fd()), unix.TIOCMSET, bits); err != nil {
-		return fmt.Errorf("tiocmset: %w", err)
+	// best-effort：个别 usb-serial 驱动/内核组合不支持这两个 ioctl（真机
+	// CH340 出过 tiocmset 返回 EFAULT），丢掉的只是防复位优化，串口读数
+	// 不受影响——静默放行，不能让整个传感器因此打不开。
+	if bits, err := unix.IoctlGetInt(int(file.Fd()), unix.TIOCMGET); err == nil {
+		bits &^= unix.TIOCM_DTR | unix.TIOCM_RTS
+		_ = unix.IoctlSetInt(int(file.Fd()), unix.TIOCMSET, bits)
 	}
 	return nil
 }
