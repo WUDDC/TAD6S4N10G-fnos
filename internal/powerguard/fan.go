@@ -725,14 +725,22 @@ func (m *Manager) rpmToPWMEstimateLocked(id string, target int) int {
 		points = append(points, point{rpm, slot})
 	}
 	sort.Slice(points, func(i, j int) bool { return points[i].rpm < points[j].rpm })
+	if target <= 0 {
+		return 0
+	}
 	if target <= points[0].rpm {
-		return points[0].slot
+		// 表内最低档以下：(0,0)–最低档线性插值（与 pwmToRPMEstimateLocked 互逆）
+		return points[0].slot * target / points[0].rpm
 	}
 	last := points[len(points)-1]
 	if target >= last.rpm {
-		// 表外高转速：满转基准线性外推（255×目标/基准），钳 255
-		base := m.fanDebugRPMBaseLocked(id)
-		return clampInt((target*255+base/2)/base, 0, 255)
+		// 表外高转速：在 (最高档, 实测) 与 (255, 满转基准) 之间线性插值，
+		// 与 pwmToRPMEstimateLocked 用同一外推规则，表顶两侧连续
+		topRPM := max(m.fanDebugRPMBaseLocked(id), last.rpm)
+		if target >= topRPM || topRPM == last.rpm {
+			return 255
+		}
+		return clampInt(last.slot+((target-last.rpm)*(255-last.slot)+(topRPM-last.rpm)/2)/(topRPM-last.rpm), 0, 255)
 	}
 	for i := 1; i < len(points); i++ {
 		hi := points[i]
@@ -1675,6 +1683,105 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	return nil
 }
 
+// fanDebugValueToPWMLocked 把某单位的调试值换算为物理 PWM(0–255)。rpm 优先
+// 用标定特性表插值,无表时按满转基准(未标定为默认 2000)线性换算。调用方须持 m.mu。
+func (m *Manager) fanDebugValueToPWMLocked(id string, value int, unit string) int {
+	switch unit {
+	case "pwm":
+		return clampInt(value, 0, 255)
+	case "rpm":
+		return m.rpmToPWMEstimateLocked(id, value)
+	default:
+		return clampInt(percentToPWM(clampInt(value, 0, 100)), 0, 255)
+	}
+}
+
+// pwmToRPMEstimateLocked 是 rpmToPWMEstimateLocked 的反向:特性表内按档位夹逼
+// 插值,表外与空表按满转基准线性换算。调用方须持 m.mu。
+func (m *Manager) pwmToRPMEstimateLocked(id string, pwm int) int {
+	pwm = clampInt(pwm, 0, 255)
+	base := m.fanDebugRPMBaseLocked(id)
+	linear := (pwm*base + 127) / 255
+	table := m.fanRPMLearnedLocked(id)
+	if len(table) == 0 {
+		return linear
+	}
+	slots := make([]int, 0, len(table))
+	for slot := range table {
+		slots = append(slots, slot)
+	}
+	sort.Ints(slots)
+	if rpm, ok := table[pwm]; ok {
+		return rpm
+	}
+	if pwm < slots[0] {
+		// 低于表内最低档:在 (0,0) 与最低档之间线性插值
+		lo := slots[0]
+		return table[lo] * pwm / lo
+	}
+	last := slots[len(slots)-1]
+	if pwm > last {
+		// 表外高档:在 (最高档, 实测) 与 (255, 满转基准) 之间线性插值,
+		// 与 rpmToPWMEstimateLocked 同一外推规则,表顶两侧连续
+		topRPM := max(base, table[last])
+		return table[last] + ((pwm-last)*(topRPM-table[last])+(255-last)/2)/(255-last)
+	}
+	for i := 1; i < len(slots); i++ {
+		lo, hi := slots[i-1], slots[i]
+		if pwm < hi {
+			return table[lo] + (pwm-lo)*(table[hi]-table[lo])/(hi-lo)
+		}
+	}
+	return linear
+}
+
+// convertFanDebugValueLocked 把调试值从 from 单位换算到 to 单位,保持同一
+// 物理输出(经 PWM 中转)。调用方须持 m.mu。
+func (m *Manager) convertFanDebugValueLocked(id string, value int, from, to string) int {
+	if from == "" {
+		from = "percent"
+	}
+	if from == to {
+		return value
+	}
+	pwm := m.fanDebugValueToPWMLocked(id, value, from)
+	switch to {
+	case "pwm":
+		return pwm
+	case "rpm":
+		return clampInt(m.pwmToRPMEstimateLocked(id, pwm), 0, m.fanDebugUnitMaxFor(id, "rpm"))
+	default:
+		return clampInt(pwmToPercent(int64(pwm)), 0, 100)
+	}
+}
+
+// convertFanDebugTakenOverLocked 单位变化时把 fanDebugTakenOver[id] 换算到
+// newUnit;切到 rpm 时重置闭环计数让其按新目标重新收敛。调用方须持 m.mu。
+func (m *Manager) convertFanDebugTakenOverLocked(id, newUnit string) {
+	value, taken := m.fanDebugTakenOver[id]
+	if !taken {
+		return
+	}
+	oldUnit := m.fanDebugUnits[id]
+	if oldUnit == "" {
+		oldUnit = "percent"
+	}
+	if oldUnit == newUnit {
+		return
+	}
+	m.fanDebugTakenOver[id] = m.convertFanDebugValueLocked(id, value, oldUnit, newUnit)
+	if newUnit == "rpm" {
+		if m.fanRPMLoopMiss == nil {
+			m.fanRPMLoopMiss = map[string]int{}
+		}
+		if m.fanRPMLoopLocked == nil {
+			m.fanRPMLoopLocked = map[string]bool{}
+		}
+		m.fanRPMLoopMiss[id] = 0
+		m.fanRPMLoopLocked[id] = false
+	}
+}
+
 // SetFanDebugAuto 单风扇自动递增的开/关:开启后以该风扇当前调试转速为基础,
 // 每 interval 秒 +step 递增到单位上限自动完成(停在上限);关闭即停在当前转速
 // 并保留步进/间隔,便于原样重新打开。各风扇互相独立——一个风扇递增时另一个
@@ -1706,6 +1813,9 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 	}
 	entry := m.fanDebugAuto.entries[id]
 	if running {
+		// 单位切换(百分比 ↔ rpm ↔ pwm)时先把已接管的基准值换算到新单位,
+		// 否则 50% 会被当成 50 RPM,风扇骤降到极低转速(#30)
+		m.convertFanDebugTakenOverLocked(id, unit)
 		// 基准已在单位上限(上次跑完):归零重跑,避免开了立刻又完成
 		if base, ok := m.fanDebugTakenOver[id]; ok && base >= m.fanDebugUnitMaxFor(id, unit) {
 			m.fanDebugTakenOver[id] = 0
