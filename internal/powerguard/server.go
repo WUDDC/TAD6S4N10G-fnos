@@ -142,7 +142,10 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rangeHours := parseFloatQuery(r, "range", 24)
-	samples, interval, err := s.History.Aggregated(r.Context(), rangeHours, historyMaxPoints, time.Now())
+	// 窗口式回看（30 分钟–24 小时档）会拉取数倍跨度的数据，靠大 max_points
+	// 保住窗口内密度；Aggregated 内部钳制到 [10, 2000]。
+	maxPoints := parseFloatQuery(r, "max_points", historyMaxPoints)
+	samples, interval, err := s.History.Aggregated(r.Context(), rangeHours, maxPoints, time.Now())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "读取历史数据失败: "+err.Error())
 		return
