@@ -914,7 +914,38 @@ function deleteGPIOScript(scriptID) {
   showGPIOScriptMessage(`脚本“${script.name}”已从本页草稿删除。`);
 }
 
+// 切换主标签页: CRPS 页首次切入时懒加载 iframe 并按内容高度自适应
 function activateTab(tabID, focus = false) {
+  // CRPS 页 iframe 懒加载：首次切到该页才加载，避免常驻轮询耗电 API。
+  // 加载后按内容高度自适应 iframe，页面内部不滚动，滚动交给主应用整页（滚动条直达底部）。
+  if (tabID === 'tab-crps') {
+    const frame = $('crps-frame');
+    if (frame && !frame.src && frame.dataset.src) {
+      frame.src = frame.dataset.src;
+      frame.addEventListener('load', () => {
+        const mobileMQ = window.matchMedia('(max-width: 640px)');
+        const fit = () => {
+          try {
+            // 手机端: iframe 固定为可视高度, 内部自滚动。
+            // 若撑成内容全高, 移动 WebView 会把 iframe 区域内的滑动手势
+            // 消费在无滚可滚的内部文档上, 整页无法滑动。
+            if (mobileMQ.matches) {
+              const top = Math.max(0, frame.getBoundingClientRect().top);
+              frame.style.height = Math.max(320, Math.round(window.innerHeight - top - 4)) + 'px';
+              return;
+            }
+            const doc = frame.contentDocument;
+            if (doc && doc.documentElement) {
+              frame.style.height = doc.documentElement.scrollHeight + 'px';
+            }
+          } catch (e) { /* 同源保护, 不可读时保持 CSS 高度 */ }
+        };
+        fit();
+        if (frame._crpsFitTimer) clearInterval(frame._crpsFitTimer);
+        frame._crpsFitTimer = setInterval(fit, 3000); // 内容随数据刷新高度会变, 周期校准
+      });
+    }
+  }
   // 只遍历主导航标签：曲线编辑器等页内 [role=tab] 自成 tablist，
   // 不归主页面切换管——全局遍历会把它们的 aria-controls 面板误隐藏
   const tabs = [...document.querySelectorAll('.app-tabs [role="tab"]')];
