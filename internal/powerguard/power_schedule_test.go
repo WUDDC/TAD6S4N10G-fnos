@@ -178,8 +178,9 @@ func TestPowerScheduleStatus(t *testing.T) {
 	if status.NextTrigger != "2026-10-23 10:00 开机" {
 		t.Fatalf("下次执行文案错误: %q", status.NextTrigger)
 	}
-	if status.RTCTime != "2026-10-23 00:00:00" {
-		t.Fatalf("RTC 时间错误: %q", status.RTCTime)
+	wantRTC := time.Unix(time.Date(2026, 10, 23, 0, 0, 0, 0, time.UTC).Unix(), 0).Local().Format("2006-01-02 15:04:05")
+	if status.RTCTime != wantRTC {
+		t.Fatalf("RTC 时间错误: %q（应按系统时区显示 %q）", status.RTCTime, wantRTC)
 	}
 	if status.RTCAlarmIRQ != "yes" {
 		t.Fatalf("alarm_IRQ 错误: %q", status.RTCAlarmIRQ)
@@ -193,6 +194,33 @@ func TestPowerScheduleStatus(t *testing.T) {
 	status2 := m2.PowerScheduleStatus()
 	if status2.Error == "" {
 		t.Fatalf("缺 RTC 应在状态里报错: %+v", status2)
+	}
+}
+
+func TestPowerScheduleStatusShowsLocalTime(t *testing.T) {
+	prev := time.Local
+	time.Local = time.FixedZone("CST", 8*3600)
+	defer func() { time.Local = prev }()
+
+	now := time.Date(2026, 10, 23, 9, 0, 0, 0, powerScheduleTestZone) // 周五 09:00 (+08)
+	m := newPowerScheduleTestManager(t, &now)
+	cfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "daily", Time: "10:00", Action: "poweron"},
+	}}
+	if err := m.SavePowerScheduleConfig(cfg); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	status := m.PowerScheduleStatus()
+	// 假 RTC 是 UTC 00:00，系统时区 +08 → 08:00
+	if status.RTCTime != "2026-10-23 08:00:00" {
+		t.Fatalf("RTC 时间应按系统时区显示: %q", status.RTCTime)
+	}
+	// 计划 10:00 (+08) = UTC 02:00，展示也应回到 10:00
+	if status.WakeAlarm != "2026-10-23 10:00:00" {
+		t.Fatalf("已写入的唤醒时刻应按系统时区显示: %q", status.WakeAlarm)
+	}
+	if !status.Applied {
+		t.Fatalf("计划应判定为已写入: %+v", status)
 	}
 }
 

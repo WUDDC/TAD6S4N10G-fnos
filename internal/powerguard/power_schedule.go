@@ -61,9 +61,9 @@ type PowerScheduleStatus struct {
 	EnabledCount int                  `json:"enabled_count"`
 	Entries      []PowerScheduleEntry `json:"entries"`
 	NextTrigger  string               `json:"next_trigger"`  // 例：2026-10-23 01:00 关机；空 = 无启用计划
-	RTCTime      string               `json:"rtc_time"`      // RTC 芯片当前时间（UTC），读不到为空
+	RTCTime      string               `json:"rtc_time"`      // RTC 芯片当前时间（按 NAS 系统时区显示），读不到为空
 	RTCAlarmIRQ  string               `json:"rtc_alarm_irq"` // /proc/driver/rtc 的 alarm_IRQ（yes/no），读不到为空
-	WakeAlarm    string               `json:"wakealarm"`     // 当前已写入的唤醒时刻（UTC），未设置为空
+	WakeAlarm    string               `json:"wakealarm"`     // 当前已写入的唤醒时刻（按 NAS 系统时区显示），未设置为空
 	Applied      bool                 `json:"applied"`       // wakealarm 与下次开机计划一致 = 计划写入成功
 	Error        string               `json:"error"`
 }
@@ -330,7 +330,8 @@ func (m *Manager) PowerScheduleStatus() PowerScheduleStatus {
 		status.NextTrigger = fmt.Sprintf("%s %s", at.Format("2006-01-02 15:04"), powerScheduleActionLabel(entry.Action))
 	}
 	if rtcNow := m.readRTCNow(); !rtcNow.IsZero() {
-		status.RTCTime = rtcNow.Format("2006-01-02 15:04:05")
+		// RTC 读出来是 UTC，展示时换算到 NAS 系统时区（与飞牛桌面时间一致）。
+		status.RTCTime = rtcNow.Local().Format("2006-01-02 15:04:05")
 	}
 	status.RTCAlarmIRQ = m.readRTCAlarmIRQ()
 	wake, wakeErr := m.readWakeAlarm()
@@ -340,7 +341,9 @@ func (m *Manager) PowerScheduleStatus() PowerScheduleStatus {
 			status.Error = errPowerScheduleNoRTC.Error()
 		}
 	} else if !wake.IsZero() {
-		status.WakeAlarm = wake.Format("2006-01-02 15:04:05")
+		// wakealarm 存的是 Unix 时间戳，同样按系统时区展示；
+		// 与计划是否同步仍用时刻比较（不受时区影响）。
+		status.WakeAlarm = wake.Local().Format("2006-01-02 15:04:05")
 		if next, ok := m.nextPowerOnAt(now); ok && wake.Equal(next.UTC()) {
 			status.Applied = true
 		}
