@@ -57,6 +57,7 @@ type StorageSlot struct {
 	Serial       string   `json:"serial,omitempty"`
 	SizeBytes    int64    `json:"size_bytes,omitempty"`
 	Purpose      string   `json:"purpose,omitempty"`
+	DeviceType   string   `json:"device_type,omitempty"` // "HDD" / "SSD" / "NVMe"，未知则省略
 	Health       string   `json:"health,omitempty"`
 	TemperatureC float64  `json:"temperature_c,omitempty"`
 	Warning      string   `json:"warning,omitempty"`
@@ -67,6 +68,10 @@ type StorageStatus struct {
 	Slots     []StorageSlot `json:"slots"`
 	UpdatedAt time.Time     `json:"updated_at,omitempty"`
 	LastError string        `json:"last_error,omitempty"`
+	// Mobile 是当前插着的移动设备（U 盘 / SD 卡），硬盘面板「移动设备」区块用。
+	// 每次取状态现场枚举：插入/拔出要在下一次轮询就反映出来，不能等 60 秒一次的
+	// 全量扫描（那个只刷槽位与 SMART）。
+	Mobile []MobileDevice `json:"mobile,omitempty"`
 }
 
 type storageSlotSpec struct {
@@ -134,6 +139,9 @@ type smartResult struct {
 	Critical       int64
 	PercentageUsed int64
 	PowerMode      string
+	// AttrWarnings 从 SATA SMART 属性（Reallocated_Sector_Ct 等）解析出的告警，
+	// raw.value > 0 或 when_failed 非空即计入。整体 Passed=true 不代表属性全为 0。
+	AttrWarnings []string
 }
 
 type blockIOSample struct {
@@ -157,8 +165,11 @@ func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 
 func (m *Manager) StorageStatus() StorageStatus {
 	m.storageMu.RLock()
-	defer m.storageMu.RUnlock()
 	status := cloneStorageStatus(m.storageStatus)
+	m.storageMu.RUnlock()
+	// 移动设备每次现场枚举（只读几个 sysfs 小文件）：插拔要在下一次轮询就体现，
+	// 不能挂在 60 秒一次的全量扫描上。
+	status.Mobile = m.MobileDevices()
 	if len(status.Slots) != 0 {
 		return status
 	}
@@ -241,6 +252,7 @@ func activityHasIOEvidence(activity string) bool {
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
 	status.Slots = append([]StorageSlot(nil), status.Slots...)
+	status.Mobile = append([]MobileDevice(nil), status.Mobile...)
 	return status
 }
 
@@ -316,6 +328,7 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		}
 		slot.State = StoragePresent
 		slot.Device = device
+		slot.DeviceType = m.detectStorageDeviceType(kname, spec.Kind)
 		info, ok := blocks[kname]
 		if !ok {
 			info = m.readBlockInfoFromSysfs(kname)
@@ -372,7 +385,11 @@ func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 		if result.PercentageUsed >= 100 {
 			warnings = append(warnings, fmt.Sprintf("NVMe 寿命使用率 %d%%", result.PercentageUsed))
 		}
-		if result.Passed == nil && result.Critical == 0 {
+		// SATA SMART 属性告警（Reallocated 等）。整体 Passed=true 不代表属性全为 0。
+		if len(result.AttrWarnings) != 0 {
+			warnings = append(warnings, result.AttrWarnings...)
+		}
+		if result.Passed == nil && result.Critical == 0 && len(result.AttrWarnings) == 0 {
 			slot.Health = "未读取"
 		}
 		if len(warnings) != 0 {
@@ -642,6 +659,34 @@ func (m *Manager) readBlockInfoFromSysfs(kname string) blockInfo {
 	return info
 }
 
+// detectStorageDeviceType 根据块设备名与 /sys/block/<kname>/queue/rotational 判断盘类型。
+// nvme 前缀 → NVMe（PCIe 协议 M.2）。
+// rotational=0 且 front 槽 → SSD（SATA 接口的固态盘）；rotational=1 → HDD。
+// rotational=0 且 m2 槽 → SATA（M.2 槽走 SATA 协议）。
+func (m *Manager) detectStorageDeviceType(kname, kind string) string {
+	if strings.HasPrefix(kname, "nvme") {
+		return "NVMe"
+	}
+	rota, err := readTrim(filepath.Join(m.rooted("/sys/block"), kname, "queue", "rotational"))
+	if err != nil {
+		if kind == "m2" {
+			return "NVMe"
+		}
+		return "HDD"
+	}
+	switch strings.TrimSpace(rota) {
+	case "0":
+		if kind == "m2" {
+			return "SATA"
+		}
+		return "SSD"
+	case "1":
+		return "HDD"
+	default:
+		return "HDD"
+	}
+}
+
 func activityFromUtilization(util float64) string {
 	switch {
 	case util >= storageUtilFullMin:
@@ -836,6 +881,16 @@ func parseSMART(data []byte) (smartResult, error) {
 			Temperature     float64 `json:"temperature"`
 			PercentageUsed  int64   `json:"percentage_used"`
 		} `json:"nvme_smart_health_information_log"`
+		AtaSmartAttributes struct {
+			Table []struct {
+				ID         int    `json:"id"`
+				Name       string `json:"name"`
+				WhenFailed string `json:"when_failed"`
+				Raw        struct {
+					Value int64 `json:"value"`
+				} `json:"raw"`
+			} `json:"table"`
+		} `json:"ata_smart_attributes"`
 		PowerMode smartPowerMode `json:"power_mode"`
 		Smartctl  struct {
 			ExitStatus int64 `json:"exit_status"`
@@ -850,6 +905,28 @@ func parseSMART(data []byte) (smartResult, error) {
 	temperature := document.Temperature.Current
 	if temperature == 0 {
 		temperature = document.NVMe.Temperature
+	}
+	// SATA SMART 故障属性列表（与飞牛 OS 对齐）：
+	// 属性名必须精确匹配，不同厂商同一 id 可能表示不同含义
+	// （比如 id=177 在 SSD 上可能是 Wear_Leveling_Count，不是 Reserved_Block_Count）。
+	problemAttrs := map[string]bool{
+		"Reallocated_Sector_Ct":  true, // 5
+		"Reported_Uncorrect":     true, // 187
+		"Reallocated_Event_Count":true, // 196
+		"Current_Pending_Sector": true, // 197
+		"Offline_Uncorrectable":  true, // 198
+		"Reserved_Block_Count":   true, // 177（SSD 真正的预留块用尽）
+	}
+	var attrWarnings []string
+	for _, entry := range document.AtaSmartAttributes.Table {
+		if !problemAttrs[entry.Name] {
+			continue
+		}
+		whenFailed := strings.TrimSpace(entry.WhenFailed)
+		if entry.Raw.Value > 0 || whenFailed != "" {
+			attrWarnings = append(attrWarnings, fmt.Sprintf("SMART 属性 %s(id=%d) 异常: raw=%d when_failed=%q",
+				entry.Name, entry.ID, entry.Raw.Value, whenFailed))
+		}
 	}
 	// smartctl -n standby reports sleeping drives via smartctl.messages
 	// ("Device is in STANDBY mode, exit(2)") rather than a power_mode field.
@@ -871,6 +948,6 @@ func parseSMART(data []byte) (smartResult, error) {
 	return smartResult{
 		Passed: document.SmartStatus.Passed, TemperatureC: temperature,
 		Critical: document.NVMe.CriticalWarning, PercentageUsed: document.NVMe.PercentageUsed,
-		PowerMode: powerMode,
+		PowerMode: powerMode, AttrWarnings: attrWarnings,
 	}, nil
 }

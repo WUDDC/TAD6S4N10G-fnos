@@ -19,23 +19,26 @@ try {
     recordPageError(`rejection: ${reason}`);
   });
 } catch (collectorError) { /* 采集器自身失败不影响页面 */ }
+// 默认曲线：第一档就等于默认最低转速（40%），0.10.37 起由 60% 下调
 const DEFAULT_CPU_CURVE = [
-  { temp_c: 40, pwm_percent: 60 },
+  { temp_c: 40, pwm_percent: 40 },
   { temp_c: 55, pwm_percent: 70 },
   { temp_c: 70, pwm_percent: 85 },
   { temp_c: 80, pwm_percent: 100 },
 ];
 const DEFAULT_STORAGE_CURVE = [
-  { temp_c: 25, pwm_percent: 60 },
+  { temp_c: 25, pwm_percent: 40 },
   { temp_c: 35, pwm_percent: 85 },
   { temp_c: 50, pwm_percent: 100 },
 ];
+const DEFAULT_MIN_PWM_PERCENT = 40;
 const GPIO_ACTIONS = [
   ['none', '无动作'],
   ['log', '仅记录日志'],
   ['refresh_storage', '刷新硬盘仓位'],
   ['smart_check', '刷新仓位并检查 SMART'],
   ['reapply_plugin', '重新应用插件配置'],
+  ['refresh_sdcard', '刷新SD卡（重新识别USB读卡器）'],
 ];
 const GITHUB_LATEST_RELEASE_API = 'https://api.github.com/repos/luodaoyi/TAD6S4N10G-fnos/releases/latest';
 const GPIO_SCRIPT_MAX_COUNT = 32;
@@ -51,7 +54,8 @@ const STORAGE_HOT_C = { front: 55, m2: 70 };
 const CURVE_MIN_POINTS = 2;
 const CURVE_MAX_POINTS = 8;
 const CHART = { left: 48, right: 600, top: 28, bottom: 218 };
-const CURVE_KINDS = ['cpu', 'hdd', 'nvme'];
+// 曲线编辑器标签顺序 = 标签栏顺序 = HDD/SATA → NVMe → CPU；默认停在第一张
+const CURVE_KINDS = ['hdd', 'nvme', 'cpu'];
 const FAN_SLOT_GROUPS = {
   hdd: {
     containerID: 'hdd-slot-options', configField: 'hdd_slot_ids',
@@ -107,6 +111,41 @@ let currentStatus = null;
 let uiBusy = false;
 let gpioScripts = [];
 let gpioEditingScriptID = '';
+// 备份任务（backup.go）：图形化配置源/目标/复制方式，动作 backup:<id> 引用。
+let gpioBackups = [];
+// 自动备份规则（backup_auto.go）：按键动作 auto_backup:<id>，触发时扫描打标卷。
+let gpioAutos = [];
+// 打标列表（GET /api/backup/auto 的 devices）：在线存储设备 + 已打标但离线的记录。
+let autoDevices = [];
+// 打标文件在卷内的相对路径（后端下发，只用于提示文案）。
+let autoMarkerDirFile = '.tad-backup/mark.json';
+// 后端记录的一次性默认值补位标记。保存时要原样带回，否则用户手动清空过的
+// 档位会在下次升级时被重新填上默认动作。
+let gpioMigrations = [];
+let backupEditingJobID = '';
+// 关掉标识开关时暂存原来的内容：再打开时沿用，不重新生成随机值——否则同一块盘上
+// 被别的任务引用的标识会悄悄变掉，那些任务下次就会因为「对不上」被拒绝。
+let backupMarkerStash = '';
+let autoEditingRuleID = '';
+// 「NAS → 打标卷 + 移动类」的确认项是否处于「还没确认就想保存」的告警状态：
+// 只有真的拦过一次才高亮，用户勾上或换到别的档位就复位。
+let autoMoveConfirmAlert = false;
+let backupPollTimer = null;
+// 编辑中的源/目标位置（完整结构，输入框里只显示摘要文本）。
+const backupEditorLocations = { source: null, target: null };
+// 自动备份编辑器里的 NAS 侧固定位置。
+const autoEditorLocations = { fixed: null };
+// 目录浏览对话框状态；volume 选择状态。
+const pathPicker = {
+  role: 'source',
+  path: '',
+  scope: 'places',
+  allowFile: true,
+  selectedFile: '',
+  places: [],
+  currentPlace: null,
+};
+const volumePicker = { role: 'source', selected: null, volumes: [], loading: false };
 let storageVisualReady = false;
 let fanSelectorSignature = null;
 let debugReportText = '';
@@ -123,8 +162,10 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     ...options,
   });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  // 2xx 但响应体不是合法 JSON（截断/网关改写等）：结果不确定，不得当成成功
+  if (body === null) throw new Error(`响应体解析失败（HTTP ${response.status}）`);
   return body;
 }
 
@@ -215,8 +256,11 @@ function storageChip(text, tone = 'muted', options = {}) {
 }
 
 function storageHealthLabel(slot = {}) {
-  if (slot.warning) return '告警';
-  return slot.health || '—';
+  // 健康状态行优先级：高温 > SMART / RM / purpose 等告警 > 后端 health 字段
+  if (isStorageHot(slot)) return '高温';
+  if (slot.warning || slot.state === 'warning') return '告警';
+  // 后端没给健康结果（如 smartctl 缺失）时如实显示未读取，不能推断成正常
+  return slot.health || '未读取';
 }
 
 function storageHealthDetail(slot = {}) {
@@ -272,15 +316,19 @@ function storageTempTone(slot = {}) {
 }
 
 function storageSlotStatusLabel(slot = {}, tone = '') {
+  // 活动行规则：
+  // - empty → 空置
+  // - present → 未使用（已插未挂，确实没负载）
+  // - used → 活动词（空闲/休眠/轻载/繁忙等真实负载）
+  // - warning/hot → 告警不等于没在干活：后端先记录真实活动再叠加告警，
+  //   有活动读数时透传真实活动词，读数缺失才显示「未读取」
+  // - unknown → 未读取（状态未知不能推导出未使用）
   if (tone === 'empty') return '空置';
-  if (slot.state === 'warning') return STORAGE_STATE_LABELS.warning;
-  if (isStorageHot(slot)) return '高温';
+  if (slot.state === 'used') {
+    return STORAGE_ACTIVITY_LABELS[slot.activity] || '';
+  }
   if (slot.state === 'present') return '未使用';
-  if (slot.state === 'unknown') return STORAGE_STATE_LABELS.unknown;
-  // used 只代表"已使用"，不等于 SMART 健康；无活动读数时回退状态标签。
-  return STORAGE_ACTIVITY_LABELS[slot.activity]
-    || STORAGE_STATE_LABELS[slot.state]
-    || STORAGE_STATE_LABELS.unknown;
+  return STORAGE_ACTIVITY_LABELS[slot.activity] || '未读取';
 }
 
 function connectedFans(fanStatus = {}, limit = 0) {
@@ -449,14 +497,26 @@ function initializeStorageVisual() {
       const text = document.createElement('div');
       text.className = 'storage-slot-text';
       const name = document.createElement('b');
-      const temperature = document.createElement('span');
+      const type = document.createElement('em');
+      type.className = 'slot-type';
+      type.hidden = true;
       const status = document.createElement('small');
-      text.append(name, temperature, status);
+      const health = document.createElement('small');
+      health.className = 'health-label';
+      health.hidden = true;
+      const temperature = document.createElement('span');
+      text.append(name, type, status, health, temperature);
       marker.append(overlay, text);
       frame.append(marker);
     });
     figure.append(frame);
     target.append(figure);
+    if (group.kind === 'm2') {
+      // 「移动设备」区块挂在 M.2 面板正下方：SD 卡 / U 盘不在机箱仓位里，
+      // 但用户的心理位置就是内置 M.2 插槽旁边那一块。
+      const mobile = $('storage-mobile');
+      if (mobile) figure.append(mobile);
+    }
     frame.addEventListener('click', (event) => {
       const marker = event.target.closest('.storage-visual-slot');
       if (!marker?.dataset.detail) return;
@@ -475,9 +535,42 @@ function storageVisualTone(slot = {}) {
   return 'green';
 }
 
+// 硬盘槽位状态 demo：方便在不插盘时预览 all 状态的暗色主题效果。
+// 触发方式（任选其一，动态生效——设完不用刷新，下一次状态轮询就切换）：
+//   1) 模块页面里 F12 打开控制台，执行 localStorage.setItem('storage-demo','1')
+//   2) 直接访问模块时 URL 加 ?storage-demo=1
+// 关闭：localStorage.removeItem('storage-demo')
+function storageDemoSlots() {
+  let enabled = false;
+  try {
+    const q = new URLSearchParams(window.location.search);
+    enabled = q.get('storage-demo') === '1' || localStorage.getItem('storage-demo') === '1';
+  } catch (e) { /* localStorage 不可用时忽略 */ }
+  if (!enabled) return null;
+  const map = new Map();
+  // 6 SATA：空/健康/休眠/未用/报警/空
+  [
+    ['front-6',  { kind: 'front', slot: 6,  state: 'empty',   activity: 'unknown', temperature_c: 0 }],
+    ['front-5',  { kind: 'front', slot: 5,  state: 'present', activity: 'busy',     temperature_c: 38.5, health_status: 'ok' }],
+    ['front-4',  { kind: 'front', slot: 4,  state: 'present', activity: 'sleeping', temperature_c: 28.0, health_status: 'ok' }],
+    ['front-3',  { kind: 'front', slot: 3,  state: 'present', activity: 'idle',     temperature_c: 32.0, health_status: 'ok' }],
+    ['front-2',  { kind: 'front', slot: 2,  state: 'warning', activity: 'heavy',    temperature_c: 62.0, health_status: 'critical' }],
+    ['front-1',  { kind: 'front', slot: 1,  state: 'empty',   activity: 'unknown', temperature_c: 0 }],
+    // 4 M.2：健康/报警/休眠/未用
+    ['m2-4',     { kind: 'm2',    slot: 4,  state: 'present', activity: 'busy',     temperature_c: 45.0, health_status: 'ok' }],
+    ['m2-2',     { kind: 'm2',    slot: 2,  state: 'warning', activity: 'busy',     temperature_c: 78.0, health_status: 'critical' }],
+    ['m2-3',     { kind: 'm2',    slot: 3,  state: 'present', activity: 'sleeping', temperature_c: 30.0, health_status: 'ok' }],
+    ['m2-1',     { kind: 'm2',    slot: 1,  state: 'present', activity: 'unknown',  temperature_c: 35.0, health_status: 'ok' }],
+  ].forEach(([id, slot]) => map.set(id, slot));
+  return map;
+}
+
 function renderStorageVisual(storage = {}) {
   initializeStorageVisual();
-  const slots = new Map((storage.slots || []).map((slot) => [slot.id || `${slot.kind}-${slot.slot}`, slot]));
+  const demo = storageDemoSlots();
+  const slots = demo
+    ? demo
+    : new Map((storage.slots || []).map((slot) => [slot.id || `${slot.kind}-${slot.slot}`, slot]));
   STORAGE_VISUAL_GROUPS.forEach((group) => {
     group.ids.forEach((id) => {
       const slot = slots.get(id) || { id, kind: group.kind, state: 'unknown', activity: 'unknown' };
@@ -503,29 +596,107 @@ function renderStorageVisual(storage = {}) {
       }
       overlay.hidden = false;
       const temperature = marker.querySelector('.storage-slot-text span');
-      const status = marker.querySelector('.storage-slot-text small');
+      const status = marker.querySelector('.storage-slot-text small:not(.health-label)');
+      const health = marker.querySelector('.storage-slot-text .health-label');
+      const slotType = marker.querySelector('.storage-slot-text .slot-type');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
+      // 盘类型行仅前置仓显示（2026-10-23 用户要求 M.2 面板退回旧版三行布局，
+      // 不再显示盘类型/健康行，暂时维持不变）：front 槽 → SSD / HDD
+      if (slotType) {
+        if (group.kind === 'front' && tone !== 'empty') {
+          slotType.textContent = (slot.device_type || '').toUpperCase() || 'HDD';
+          slotType.hidden = false;
+        } else {
+          slotType.hidden = true;
+        }
+      }
+      // 健康状态行：显示在活动状态和温度之间。同样仅前置仓显示，M.2 面板维持旧版。
+      // 优先级：高温 → SMART/RM 等告警 → 后端 health 字段
+      if (health) {
+        if (group.kind === 'front' && tone !== 'empty') {
+          const healthVal = storageHealthLabel(slot); // 已内含高温/告警/正常优先级
+          const isHot = isStorageHot(slot);
+          const isWarn = !isHot && (slot.state === 'warning' || Boolean(slot.warning) || healthVal === '告警');
+          const isBad = isHot || isWarn;
+          health.textContent = healthVal;
+          health.classList.toggle('is-warning', isBad);
+          health.classList.toggle('is-unknown', !isBad && healthVal === '未读取');
+          health.classList.toggle('is-hot', isHot);
+          health.hidden = false;
+        } else {
+          health.hidden = true;
+        }
+      }
       const hasTemperature = Number(slot.temperature_c) > 0;
-      // 前置仓固定三行槽位（数字/状态/温度，与 M.2 顺序一致），温度为空
-      // 也保留槽位：空仓的"空置"与在位盘的状态词落在同一高度，不随内容行数漂移。
       if (tone === 'empty' || !hasTemperature) {
         temperature.textContent = '';
       } else if (group.kind === 'front') {
-        // 前置仓窄（12.5% 宽），单行"35.5 °C"必被省略号截断：数值（一位
-        // 小数，与详情表格一致）与单位分两行完整显示
         temperature.textContent = `${Number(slot.temperature_c).toFixed(1)}\n°C`;
       } else {
         temperature.textContent = formatTemperature(slot.temperature_c);
       }
       if (status) {
         status.textContent = storageSlotStatusLabel(slot, tone);
+        // 空仓隐藏状态词只应用于前置仓；M.2 面板维持旧版「空置」占位。
+        status.hidden = group.kind === 'front' && tone === 'empty';
       }
     });
   });
 }
 
-function renderDiagnosticChips(targetID, items, emptyText = '—') {
-  const target = $(targetID);
+// 移动设备区块：插了几个就画几个图标（SD 卡 / U 盘），悬停显示设备名称、
+// 容量与挂载点。容量 0 的空读卡器后端已经过滤掉，这里只负责铺图标。
+function mobileDeviceIcon(kind) {
+  const svg = svgElement('svg', {
+    viewBox: '0 0 24 24',
+    class: 'storage-mobile-icon',
+    'aria-hidden': 'true',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.6',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+  });
+  if (kind === 'sd') {
+    // 缺角卡片 + 三根触点
+    svg.append(svgElement('path', { d: 'M8 3h6.6L18 6.4V20a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z' }));
+    svg.append(svgElement('path', { d: 'M10.6 8.4v3.2M12.9 8.4v3.2M15.2 8.4v3.2' }));
+  } else {
+    // U 盘：金属口 + 塑料壳
+    svg.append(svgElement('rect', { x: '8', y: '9', width: '8', height: '12', rx: '1.6' }));
+    svg.append(svgElement('path', { d: 'M11 9V5h2v4M10.5 13.5h3' }));
+  }
+  return svg;
+}
+
+function renderStorageMobile(storage = {}) {
+  const list = $('storage-mobile-list');
+  if (!list) return;
+  const devices = Array.isArray(storage.mobile) ? storage.mobile : [];
+  list.replaceChildren();
+  // 没有设备时这里什么都不画：整块只有一行高，空状态由右边的计数说明，
+  // 不再单独占一行写长句。
+  devices.forEach((device) => {
+    const kind = device.kind === 'sd' ? 'sd' : 'usb';
+    const item = document.createElement('div');
+    item.className = `storage-mobile-item kind-${kind}`;
+    item.title = [device.name, device.size_label, device.device, device.mount_point ? `挂载 ${device.mount_point}` : '']
+      .filter(Boolean).join(' · ');
+    const caption = document.createElement('span');
+    caption.textContent = device.kind_label || (kind === 'sd' ? 'SD 卡' : 'U 盘');
+    const name = document.createElement('small');
+    name.textContent = device.name || '';
+    item.append(mobileDeviceIcon(kind), caption, name);
+    list.append(item);
+  });
+  const count = $('storage-mobile-count');
+  if (count) {
+    count.textContent = devices.length ? `${devices.length} 个设备` : '未检测到';
+    count.title = devices.length ? '' : '插好介质后最多 5 秒出现；换卡认不出来时点「刷新 SD 卡」';
+  }
+}
+
+function renderDiagnosticChips(targetID, items, emptyText = '—') {  const target = $(targetID);
   target.replaceChildren();
   if (!items.length) {
     target.textContent = emptyText;
@@ -598,6 +769,37 @@ function renderDiagnostics(status, fanStatus) {
   renderDiagnosticChips('fan-control', chips);
 }
 
+// 「关停」档下 0 转是设置出来的结果，不是接线/驱动故障：文案要说明白并催用户尽快退出
+const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警；最长 5 分钟后会自动恢复原曲线并起转。请尽快取消此模式以免损坏硬件。';
+
+// 后端 status 里带 off_mode；老状态没这个字段时退回读配置，两种来源都认
+function fanOffModeActive(fanStatus = {}) {
+  if (typeof fanStatus.off_mode === 'boolean') return fanStatus.off_mode;
+  return Boolean(currentStatus?.config?.fan?.off_mode);
+}
+
+const FAN_ALARM_MUTE_HELP = '仅屏蔽关停档下每 20 秒一次的蜂鸣；界面报警与日志保留，退出「关停」后自动恢复。';
+
+// 关停档报警临时静音：后端只接受关停档下的请求（其他档位没有 20 秒报警可静音），
+// 静音状态是运行时字段、退出关停自动解除，所以每次 render 都以 status 回填。
+function syncFanAlarmMute(fanStatus = {}) {
+  const input = $('fan-alarm-mute');
+  const row = $('fan-alarm-mute-row');
+  const target = $('fan-alarm-mute-status');
+  if (!input || !row || !target) return;
+  const offMode = fanOffModeActive(fanStatus);
+  input.checked = Boolean(fanStatus.alarm_muted);
+  input.disabled = !offMode;
+  row.classList.toggle('is-inactive', !offMode);
+  if (!offMode) {
+    target.textContent = '仅「关停」档下有效：该档位才有每 20 秒一次的故障/超温蜂鸣。';
+    return;
+  }
+  target.textContent = input.checked
+    ? '已临时静音：蜂鸣暂停，界面报警与日志仍保留；退出「关停」后自动恢复。'
+    : FAN_ALARM_MUTE_HELP;
+}
+
 function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   const issues = [];
   if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
@@ -606,7 +808,9 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   if (fanStatus.driver_detected === true && !fans.length) {
     issues.push('IT87 驱动已检测，但未发现可读取 PWM/RPM 的风扇通道');
   } else if (fanStatus.driver_detected === true && fans.length && !fans.some((fan) => Number(fan.rpm) > 0)) {
-    issues.push('已发现风扇通道，但当前转速反馈均为 0 RPM；请检查风扇接线或驱动状态');
+    issues.push(fanOffModeActive(fanStatus)
+      ? FAN_OFF_RPM_NOTICE
+      : '已发现风扇通道，但当前转速反馈均为 0 RPM；请检查风扇接线或驱动状态');
   }
   if (status.cpu_temperature?.available === false) {
     issues.push('未读取到 CPU coretemp 温度；请检查 coretemp 内核驱动是否已加载');
@@ -659,8 +863,11 @@ function renderFanHardwareWarning(fanStatus = {}) {
     $('fan-warning-title').textContent = '未发现可控风扇通道';
     $('fan-warning-description').textContent = 'IT87 驱动已检测，但没有同时暴露 fan、pwm 与 pwm_enable 的通道，请检查驱动适配。';
   } else if (noRPM) {
-    $('fan-warning-title').textContent = '风扇转速反馈为 0 RPM';
-    $('fan-warning-description').textContent = '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
+    // 关停档下 0 转是设置出来的结果，不是接线/驱动故障，别再把用户往接线方向带
+    $('fan-warning-title').textContent = fanOffModeActive(fanStatus) ? '风扇已按「关停」档停转' : '风扇转速反馈为 0 RPM';
+    $('fan-warning-description').textContent = fanOffModeActive(fanStatus)
+      ? FAN_OFF_RPM_NOTICE
+      : '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
   }
 }
 
@@ -723,7 +930,15 @@ function gpioScriptAction(scriptID) {
   return `script:${scriptID}`;
 }
 
-function setupGPIOActions(scripts = gpioScripts, preserveValues = true) {
+function gpioBackupAction(jobID) {
+  return `backup:${jobID}`;
+}
+
+function gpioAutoBackupAction(ruleID) {
+  return `auto_backup:${ruleID}`;
+}
+
+function setupGPIOActions(scripts = gpioScripts, preserveValues = true, backups = gpioBackups, autos = gpioAutos) {
   document.querySelectorAll('.gpio-action').forEach((select) => {
     const prior = preserveValues ? select.value : 'none';
     select.replaceChildren();
@@ -736,6 +951,28 @@ function setupGPIOActions(scripts = gpioScripts, preserveValues = true) {
       builtInGroup.append(option);
     });
     select.append(builtInGroup);
+    if (backups.length) {
+      const backupGroup = document.createElement('optgroup');
+      backupGroup.label = '备份任务';
+      backups.forEach((job) => {
+        const option = document.createElement('option');
+        option.value = gpioBackupAction(job.id);
+        option.textContent = `备份：${job.name}`;
+        backupGroup.append(option);
+      });
+      select.append(backupGroup);
+    }
+    if (autos.length) {
+      const autoGroup = document.createElement('optgroup');
+      autoGroup.label = '自动备份';
+      autos.forEach((rule) => {
+        const option = document.createElement('option');
+        option.value = gpioAutoBackupAction(rule.id);
+        option.textContent = `自动备份：${rule.name}`;
+        autoGroup.append(option);
+      });
+      select.append(autoGroup);
+    }
     if (scripts.length) {
       const scriptGroup = document.createElement('optgroup');
       scriptGroup.label = 'Shell 脚本';
@@ -896,7 +1133,7 @@ function commitGPIOScriptEditor() {
   return true;
 }
 
-function deleteGPIOScript(scriptID) {
+async function deleteGPIOScript(scriptID) {
   const script = gpioScripts.find((item) => item.id === scriptID);
   if (!script) return;
   const action = gpioScriptAction(scriptID);
@@ -906,7 +1143,13 @@ function deleteGPIOScript(scriptID) {
     binding.focus();
     return;
   }
-  if (!window.confirm(`确定删除脚本“${script.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`)) return;
+  const ok = await showAppConfirm({
+    title: '删除脚本',
+    message: `确定删除脚本“${script.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
   gpioScripts = gpioScripts.filter((item) => item.id !== scriptID);
   if (gpioEditingScriptID === scriptID) closeGPIOScriptEditor();
   setupGPIOActions(gpioScripts, true);
@@ -914,7 +1157,2504 @@ function deleteGPIOScript(scriptID) {
   showGPIOScriptMessage(`脚本“${script.name}”已从本页草稿删除。`);
 }
 
-// 切换主标签页: CRPS 页首次切入时懒加载 iframe 并按内容高度自适应
+// ---------------------------------------------------------------------------
+// 备份任务：图形化选择「源 → 目标」，对应后端 backup.go
+// ---------------------------------------------------------------------------
+
+const BACKUP_MODE_LABELS = {
+  copy: '直接复制覆盖',
+  sync: '同步文件',
+  archive: '按日期增量归档',
+  move_overwrite: '移动覆盖',
+  move_archive: '按日期转移归档',
+};
+
+const AUTO_DIRECTION_LABELS = {
+  from_volume: '打标卷 → NAS',
+  to_volume: 'NAS → 打标卷',
+};
+
+function normalizeBackupLocation(location) {
+  if (!location || typeof location !== 'object') return null;
+  if (location.kind === 'volume') {
+    const uuid = String(location.uuid || '').trim();
+    const label = String(location.label || '').trim();
+    if (!uuid && !label) return null;
+    return { kind: 'volume', uuid, label, sub: String(location.sub || '').trim() };
+  }
+  const path = String(location.path || '').trim();
+  return path ? { kind: 'path', path } : null;
+}
+
+function backupLocationSummary(location) {
+  if (!location) return '';
+  if (location.kind === 'volume') {
+    const name = location.label || location.uuid;
+    return location.sub ? `卷 ${name} / ${location.sub}` : `卷 ${name}`;
+  }
+  return location.path;
+}
+
+function formatByteSize(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return `${value} B`;
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB'];
+  let scaled = value / 1024;
+  let index = 0;
+  while (scaled >= 1024 && index < units.length - 1) { scaled /= 1024; index += 1; }
+  return `${scaled >= 100 ? scaled.toFixed(0) : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function formatClock(iso) {
+  const date = iso ? new Date(iso) : null;
+  if (!date || Number.isNaN(date.getTime())) return '—';
+  return date.toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function formatDuration(milliseconds) {
+  const seconds = Math.max(0, Math.round((Number(milliseconds) || 0) / 1000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function showBackupStatus(message, error = false) {
+  const target = $('backup-status');
+  target.textContent = message;
+  target.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function showBackupJobMessage(message, error = false) {
+  const target = $('backup-job-message');
+  target.textContent = message;
+  target.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function generateBackupJobID() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `backup-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function backupJobBindings(jobID) {
+  const action = gpioBackupAction(jobID);
+  return [...document.querySelectorAll('.gpio-action')]
+    .filter((select) => select.value === action)
+    .map((select) => {
+      const row = select.closest('tr');
+      const labels = { short: '短按', hold_3s: '长按3秒', hold_9s: '长按9秒', hold_15s: '长按15秒' };
+      return `${row?.dataset.button || '按键'}·${labels[select.dataset.stage] || select.dataset.stage}`;
+    });
+}
+
+function renderBackupJobList() {
+  const list = $('backup-job-list');
+  list.replaceChildren();
+  if (!gpioBackups.length) {
+    const empty = document.createElement('p');
+    empty.className = 'gpio-script-empty';
+    empty.textContent = '尚未创建备份任务。点击「新增备份任务」，选好源和目标即可。';
+    list.append(empty);
+    return;
+  }
+  gpioBackups.forEach((job) => {
+    const card = document.createElement('article');
+    card.className = 'backup-job-card';
+
+    const title = document.createElement('strong');
+    title.textContent = job.name;
+    card.append(title);
+
+    const flow = document.createElement('p');
+    flow.className = 'backup-job-flow';
+    flow.textContent = `${backupLocationSummary(job.source)} → ${backupLocationSummary(job.target)}`;
+    card.append(flow);
+
+    const meta = document.createElement('small');
+    const bindings = backupJobBindings(job.id);
+    meta.textContent = [
+      BACKUP_MODE_LABELS[job.mode] || job.mode,
+      job.mode === 'archive' ? (job.keep > 0 ? `保留 ${job.keep} 份` : '不限份数') : '',
+      job.mode !== 'archive' ? (job.overwrite ? '覆盖同名文件' : '跳过已存在') : '',
+      bindings.length ? `已绑定：${bindings.join('、')}` : '未绑定按键',
+    ].filter(Boolean).join(' · ');
+    card.append(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const runButton = document.createElement('button');
+    runButton.type = 'button';
+    runButton.className = 'run-backup';
+    runButton.textContent = '立即运行';
+    runButton.addEventListener('click', () => runBackupJob(job.id, false));
+    const editButton = document.createElement('button');
+    editButton.type = 'button';
+    editButton.textContent = '编辑';
+    editButton.addEventListener('click', () => openBackupJobEditor(job.id));
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'delete-script';
+    removeButton.textContent = '删除';
+    removeButton.addEventListener('click', () => deleteBackupJob(job.id));
+    actions.append(runButton, editButton, removeButton);
+    card.append(actions);
+
+    list.append(card);
+  });
+}
+
+function backupModeFromEditor() {
+  const checked = document.querySelector('input[name="backup-mode"]:checked');
+  return checked ? checked.value : 'copy';
+}
+
+// backupKeepAnchorID 归档保留份数该贴在哪一行下面：两个「归档」档位各自一个锚点，
+// 其它档位用不到这个输入框（返回空字符串表示整行藏起来）。
+function backupKeepAnchorID(mode, prefix) {
+  if (mode === 'archive') return `${prefix}-mode-archive`;
+  if (mode === 'move_archive') return `${prefix}-mode-move-archive`;
+  return '';
+}
+
+// syncBackupKeepRow 把保留份数那一行挪到当前选中的归档档位正下方——选中哪个归档档位，
+// 它就在哪个下面出现，不选就藏起来。
+function syncBackupKeepRow(rowID, anchorID) {
+  const row = $(rowID);
+  if (!row) return;
+  if (!anchorID) {
+    row.hidden = true;
+    return;
+  }
+  const anchor = $(anchorID);
+  row.hidden = false;
+  // 已经在位就不动它，免得每次刷新控件都重建一次 DOM。
+  if (anchor && anchor.nextElementSibling !== row) anchor.insertAdjacentElement('afterend', row);
+}
+
+function updateBackupModeControls() {
+  const mode = backupModeFromEditor();
+  const moveMode = mode === 'move_overwrite' || mode === 'move_archive';
+  $('backup-job-overwrite').disabled = mode !== 'copy';
+  $('backup-job-keep').disabled = mode !== 'archive' && mode !== 'move_archive';
+  syncBackupKeepRow('backup-job-keep-row', backupKeepAnchorID(mode, 'backup-job'));
+  const hint = $('backup-job-mode-hint');
+  if (moveMode) {
+    hint.textContent = '移动类模式固定覆盖同名文件，并在复制成功后删除源里的文件（只删已成功复制的，目录结构保留）。源不能是整个「我的文件」「团队文件」或远程挂载根目录，也不能是系统目录。';
+  } else {
+    hint.textContent = '';
+  }
+}
+
+function refreshBackupLocationHints() {
+  ['source', 'target'].forEach((role) => {
+    const hint = $(role === 'source' ? 'backup-job-source-hint' : 'backup-job-target-hint');
+    const location = backupEditorLocations[role];
+    if (!location) {
+      hint.textContent = role === 'source'
+        ? '还没有选择源：可以选硬盘上的目录，也可以选一个可移动卷。'
+        : '还没有选择目标：备份会放到这个目录里。';
+      return;
+    }
+    if (location.kind === 'volume') {
+      hint.textContent = `按卷标/UUID 记住介质本身，换接口或换挂载路径后仍能自动找到。`;
+      return;
+    }
+    hint.textContent = '';
+  });
+}
+
+// resetBackupMarkerForSourceChange 换了源介质，原标识就作废：清掉内容并关掉开关，
+// 免得把 A 盘的标识写进 B 盘——那反而让「防插错盘」失效。
+function resetBackupMarkerForSourceChange() {
+  const hadMarker = !!backupMarkerStash || !!$('backup-job-marker').value.trim() || $('backup-job-marker-write').checked;
+  backupMarkerStash = '';
+  $('backup-job-marker').value = '';
+  $('backup-job-marker-write').checked = false;
+  if (hadMarker) showBackupJobMessage('已切换源介质：原标识作废，需要时请重新打开「在源中创建标识文件」。');
+}
+
+function setBackupEditorLocation(role, location) {
+  backupEditorLocations[role] = location;
+  $(role === 'source' ? 'backup-job-source' : 'backup-job-target').value = backupLocationSummary(location) || '';
+  if (role === 'source') resetBackupMarkerForSourceChange();
+  refreshBackupLocationHints();
+}
+
+function openBackupJobEditor(jobID = '') {
+  const job = gpioBackups.find((item) => item.id === jobID);
+  backupEditingJobID = job ? job.id : generateBackupJobID();
+  $('backup-job-id').value = backupEditingJobID;
+  $('backup-job-name').value = job ? job.name : '';
+  $('backup-job-marker').value = job ? (job.marker || '') : '';
+  backupMarkerStash = job ? String(job.marker || '').trim() : '';
+  $('backup-job-marker-write').checked = !!backupMarkerStash;
+  $('backup-job-keep').value = job ? String(job.keep || 0) : '0';
+  $('backup-job-overwrite').checked = job ? job.overwrite !== false : true;
+  document.querySelectorAll('input[name="backup-mode"]').forEach((radio) => {
+    radio.checked = radio.value === (job ? job.mode : 'copy');
+  });
+  backupEditorLocations.source = job ? job.source : null;
+  backupEditorLocations.target = job ? job.target : null;
+  $('backup-job-source').value = backupLocationSummary(backupEditorLocations.source);
+  $('backup-job-target').value = backupLocationSummary(backupEditorLocations.target);
+  $('backup-job-editor').hidden = false;
+  updateBackupModeControls();
+  refreshBackupLocationHints();
+  showBackupJobMessage(job ? `正在编辑「${job.name}」` : '正在创建新的备份任务');
+  $('backup-job-name').focus();
+}
+
+function closeBackupJobEditor() {
+  backupEditingJobID = '';
+  backupEditorLocations.source = null;
+  backupEditorLocations.target = null;
+  $('backup-job-editor').hidden = true;
+  $('backup-job-id').value = '';
+  $('backup-job-name').value = '';
+  $('backup-job-source').value = '';
+  $('backup-job-target').value = '';
+  $('backup-job-marker').value = '';
+  backupMarkerStash = '';
+  $('backup-job-marker-write').checked = false;
+  $('backup-job-keep').value = '0';
+  $('backup-job-overwrite').checked = true;
+  showBackupJobMessage('');
+}
+
+function backupJobFromEditor() {
+  const mode = backupModeFromEditor();
+  return {
+    id: backupEditingJobID || generateBackupJobID(),
+    name: $('backup-job-name').value.trim(),
+    source: backupEditorLocations.source,
+    target: backupEditorLocations.target,
+    mode,
+    overwrite: mode === 'copy' ? $('backup-job-overwrite').checked : true,
+    keep: mode === 'archive' || mode === 'move_archive' ? Math.max(0, Math.round(Number($('backup-job-keep').value) || 0)) : 0,
+    // 标识校验由开关决定：关掉 = 留空 = 不校验；开着时内容就是输入框里的值。
+    marker: $('backup-job-marker-write').checked ? $('backup-job-marker').value.trim() : '',
+  };
+}
+
+function validateBackupJobDraft(job) {
+  if (!job.name) {
+    showBackupJobMessage('任务名称不能为空。', true);
+    $('backup-job-name').focus();
+    return false;
+  }
+  if (gpioBackups.some((item) => item.id !== job.id && item.name.trim().toLowerCase() === job.name.toLowerCase())) {
+    showBackupJobMessage(`任务名称“${job.name}”已存在。`, true);
+    $('backup-job-name').focus();
+    return false;
+  }
+  if (!job.source) {
+    showBackupJobMessage('请先选择源（要备份的目录或可移动卷）。', true);
+    return false;
+  }
+  if (!job.target) {
+    showBackupJobMessage('请先选择目标（备份放到哪个目录）。', true);
+    return false;
+  }
+  if (job.source.kind === 'path' && job.target.kind === 'path' && job.source.path === job.target.path) {
+    showBackupJobMessage('源与目标不能是同一个位置。', true);
+    return false;
+  }
+  // 同步模式会把目标里多余的文件删掉，直接指到整个「我的文件」等于清空个人空间。
+  if (job.target.kind === 'path' && /^\/vol[0-9]+\/[0-9]+\/?$/.test(job.target.path)) {
+    showBackupJobMessage('目标不能直接是整个「我的文件」根目录，请在它下面新建一个备份目录。', true);
+    return false;
+  }
+  // 开关开着却没有标识内容，说明写入没成功（比如写的时候没选源），别把「半开」的状态存下来。
+  if ($('backup-job-marker-write').checked && !job.marker) {
+    showBackupJobMessage('标识还没写进源介质：请重新打开「在源中创建标识文件」完成写入。', true);
+    return false;
+  }
+  return true;
+}
+
+// onBackupMarkerToggleChange 开关的 change 处理器（返回 promise 便于测试等待）。
+function onBackupMarkerToggleChange() {
+  return applyBackupMarkerToggle($('backup-job-marker-write').checked);
+}
+
+// applyBackupMarkerToggle 「在源中创建标识文件」开关：打开＝把标识写进源介质并把内容
+// 回填到输入框（留空时由后端自动生成），关掉＝不校验（清空标识）。
+// 刻意做成「用户明确打开才写」：若在执行备份时自动补写，插错盘也会被写成「对的盘」，
+// 这项校验就完全失去意义了。
+async function applyBackupMarkerToggle(enabled) {
+  const toggle = $('backup-job-marker-write');
+  if (!enabled) {
+    backupMarkerStash = $('backup-job-marker').value.trim();
+    $('backup-job-marker').value = '';
+    showBackupJobMessage('已关闭标识校验：以后不再核对源介质，源里已有的标识文件保持原样。');
+    return;
+  }
+  const source = backupEditorLocations.source;
+  if (!source) {
+    toggle.checked = false;
+    showBackupJobMessage('请先选择源，再打开「在源中创建标识文件」。', true);
+    return;
+  }
+  // 沿用输入框里的内容；输入框空着就用关掉开关时暂存的那一份（同一块盘＝同一个标识）。
+  const marker = $('backup-job-marker').value.trim() || backupMarkerStash;
+  toggle.disabled = true;
+  showBackupJobMessage('正在写入标识文件…');
+  try {
+    const result = await request('api/backup/marker', {
+      method: 'POST',
+      body: JSON.stringify({ job: { source, marker } }),
+    });
+    backupMarkerStash = result.marker;
+    $('backup-job-marker').value = result.marker;
+    showBackupJobMessage(`已写入 ${result.path}，标识内容：${result.marker}（记得点「保存任务」持久化）`);
+  } catch (error) {
+    toggle.checked = false;
+    showBackupJobMessage(`写入失败：${error.message}`, true);
+  } finally {
+    toggle.disabled = false;
+  }
+}
+
+function commitBackupJobEditor() {
+  if ($('backup-job-editor').hidden) return true;
+  const job = backupJobFromEditor();
+  if (!validateBackupJobDraft(job)) return false;
+  const index = gpioBackups.findIndex((item) => item.id === job.id);
+  if (index >= 0) gpioBackups[index] = job;
+  else gpioBackups.push(job);
+  closeBackupJobEditor();
+  setupGPIOActions(gpioScripts, true, gpioBackups);
+  renderBackupJobList();
+  showBackupStatus(`任务“${job.name}”已加入草稿。别忘了点击下方的「保存按钮控制」持久化。`);
+  return true;
+}
+
+async function deleteBackupJob(jobID) {
+  const job = gpioBackups.find((item) => item.id === jobID);
+  if (!job) return;
+  const bindings = backupJobBindings(jobID);
+  if (bindings.length) {
+    showBackupStatus(`任务“${job.name}”仍被按键（${bindings.join('、')}）引用，请先在上方下拉框改成其他动作。`, true);
+    return;
+  }
+  const ok = await showAppConfirm({
+    title: '删除备份任务',
+    message: `确定删除备份任务“${job.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
+  gpioBackups = gpioBackups.filter((item) => item.id !== jobID);
+  if (backupEditingJobID === jobID) closeBackupJobEditor();
+  setupGPIOActions(gpioScripts, true, gpioBackups);
+  renderBackupJobList();
+  showBackupStatus(`任务“${job.name}”已从本页草稿删除。`);
+}
+
+// ---------------------------------------------------------------------------
+// 自动备份（打标卷）：对应后端 backup_auto.go
+// ---------------------------------------------------------------------------
+
+function showAutoBackupStatus(message, error = false) {
+  const target = $('auto-backup-status');
+  target.textContent = message;
+  target.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function showAutoBackupEditorMessage(message, error = false) {
+  const target = $('auto-backup-message');
+  target.textContent = message;
+  target.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function generateAutoBackupRuleID() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `auto-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function autoBackupBindings(ruleID) {
+  const action = gpioAutoBackupAction(ruleID);
+  return [...document.querySelectorAll('.gpio-action')]
+    .filter((select) => select.value === action)
+    .map((select) => {
+      const row = select.closest('tr');
+      const labels = { short: '短按', hold_3s: '长按3秒', hold_9s: '长按9秒', hold_15s: '长按15秒' };
+      return `${row?.dataset.button || '按键'}·${labels[select.dataset.stage] || select.dataset.stage}`;
+    });
+}
+
+function renderAutoBackupList() {
+  const list = $('auto-backup-list');
+  list.replaceChildren();
+  if (!gpioAutos.length) {
+    const empty = document.createElement('p');
+    empty.className = 'gpio-script-empty';
+    empty.textContent = '尚未创建自动备份规则。先给 U 盘打标，再点「新增自动备份规则」。';
+    list.append(empty);
+    return;
+  }
+  gpioAutos.forEach((rule) => {
+    const card = document.createElement('article');
+    card.className = 'backup-job-card';
+
+    const title = document.createElement('strong');
+    title.textContent = rule.name;
+    card.append(title);
+
+    const flow = document.createElement('p');
+    flow.className = 'backup-job-flow';
+    flow.textContent = rule.direction === 'to_volume'
+      ? `${backupLocationSummary(rule.fixed)} → 打标卷${rule.volume_sub ? `／${rule.volume_sub}` : '根目录'}`
+      : `打标卷（按打标子目录；整卷打标即整块盘） → ${backupLocationSummary(rule.fixed)}`;
+    card.append(flow);
+
+    const meta = document.createElement('small');
+    const bindings = autoBackupBindings(rule.id);
+    const moveMode = rule.mode === 'move_overwrite' || rule.mode === 'move_archive';
+    meta.textContent = [
+      AUTO_DIRECTION_LABELS[rule.direction] || rule.direction,
+      BACKUP_MODE_LABELS[rule.mode] || rule.mode,
+      rule.mode === 'archive' || rule.mode === 'move_archive' ? (rule.keep > 0 ? `保留 ${rule.keep} 份` : '不限份数') : '',
+      rule.mode === 'copy' ? (rule.overwrite ? '覆盖同名文件' : '跳过已存在') : '',
+      moveMode ? (autoRuleDeletesNasSource(rule) ? '移动模式：会删除 NAS 上的源文件' : '复制成功后删源') : '',
+      bindings.length ? `已绑定：${bindings.join('、')}` : '未绑定按键',
+    ].filter(Boolean).join(' · ');
+    card.append(meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    const runButton = document.createElement('button');
+    runButton.type = 'button';
+    runButton.className = 'run-backup';
+    runButton.textContent = '立即运行';
+    runButton.addEventListener('click', () => runAutoBackup(rule.id, false));
+    const editButton = document.createElement('button');
+    editButton.type = 'button';
+    editButton.textContent = '编辑';
+    editButton.addEventListener('click', () => openAutoBackupEditor(rule.id));
+    const removeButton = document.createElement('button');
+    removeButton.type = 'button';
+    removeButton.className = 'delete-script';
+    removeButton.textContent = '删除';
+    removeButton.addEventListener('click', () => deleteAutoBackupRule(rule.id));
+    actions.append(runButton, editButton, removeButton);
+    card.append(actions);
+
+    list.append(card);
+  });
+}
+
+// --- 打标管理（在线 / 离线设备列表）-----------------------------------------
+
+async function refreshAutoBackupDevices() {
+  const container = $('auto-backup-devices');
+  try {
+    const data = await request('api/backup/auto');
+    autoDevices = Array.isArray(data.devices) ? data.devices : [];
+    if (data.marker_dir) autoMarkerDirFile = String(data.marker_dir);
+    renderAutoBackupDevices();
+  } catch (error) {
+    container.replaceChildren();
+    const failed = document.createElement('p');
+    failed.className = 'auto-device-empty';
+    failed.textContent = `打标设备列表加载失败：${error.message}`;
+    container.append(failed);
+  }
+}
+
+function autoDeviceName(device) {
+  return device.alias || device.label || device.identity || device.device || '未知设备';
+}
+
+// 内置存储没有别名/卷标可言，identity 往往是 /dev/mapper/trim_…-0 这类内部名字，
+// 对用户毫无意义，也永远不能打标 —— 列表里只留一句「内置存储 · 不支持打标」，
+// 多块内置卷合并成同一行（这块盘本身不需要被识别，反正不参与自动备份）。
+function builtinStorageLabel(devices) {
+  const count = devices.filter((device) => device.removable === false).length;
+  if (!count) return '';
+  return count > 1 ? `内置存储（${count} 块）· 不支持打标` : '内置存储 · 不支持打标';
+}
+
+function renderAutoBackupDevices() {
+  const container = $('auto-backup-devices');
+  container.replaceChildren();
+  if (!autoDevices.length) {
+    const empty = document.createElement('p');
+    empty.className = 'auto-device-empty';
+    empty.textContent = '没有检测到存储设备。插上 U 盘 / 移动硬盘后点「刷新列表」。';
+    container.append(empty);
+    return;
+  }
+  autoDevices
+    .filter((device) => device.removable !== false)
+    .forEach((device) => container.append(buildAutoDeviceItem(device)));
+  const builtin = builtinStorageLabel(autoDevices);
+  if (builtin) {
+    const item = document.createElement('article');
+    item.className = 'auto-device-item builtin';
+    const name = document.createElement('strong');
+    name.textContent = builtin;
+    item.append(name);
+    container.append(item);
+  }
+}
+
+function buildAutoDeviceItem(device) {
+  const item = document.createElement('article');
+  item.className = `auto-device-item${device.online ? '' : ' offline'}`;
+
+  const head = document.createElement('div');
+  head.className = 'auto-device-head';
+  const name = document.createElement('strong');
+  name.textContent = autoDeviceName(device);
+  head.append(name);
+
+  const badge = document.createElement('span');
+  if (!device.online) {
+    badge.className = 'auto-device-badge off';
+    badge.textContent = device.pending_clear ? '离线 · 已预约清除打标' : '离线';
+  } else if (device.removable === false) {
+    badge.className = 'auto-device-badge';
+    badge.textContent = '内置存储 · 不支持打标';
+  } else if (device.marked) {
+    badge.className = 'auto-device-badge on';
+    badge.textContent = device.legacy ? '已打标（旧格式，下次打标自动升级）' : '已打标';
+  } else {
+    badge.className = 'auto-device-badge';
+    badge.textContent = '未打标';
+  }
+  head.append(badge);
+  if (device.online && device.read_only) {
+    const ro = document.createElement('span');
+    ro.className = 'auto-device-badge';
+    ro.textContent = '只读';
+    head.append(ro);
+  }
+  // 副标题只补充标题里没有的信息，并按介质区分：
+  // 设备节点名（/dev/sdc1）只对可移动介质有意义；内置卷的 /dev/mapper/trim_…-0
+  // 是内部实现，配上挂载点与标题会重复三遍同一串字，一律不展示。
+  const meta = document.createElement('small');
+  const where = device.online ? device.mount_point : `${device.mount_point || '—'}（上次挂载）`;
+  const title = autoDeviceName(device);
+  const parts = [];
+  if (device.removable && device.device) parts.push(device.device);
+  if (where && where !== title) parts.push(where);
+  if (device.identity && device.identity !== title && device.identity !== device.device) {
+    parts.push(device.identity);
+  }
+  meta.textContent = parts.filter(Boolean).join(' · ');
+  if (meta.textContent) head.append(meta);
+  item.append(head);
+
+  const subsRow = document.createElement('div');
+  subsRow.className = 'auto-device-subs';
+  const subs = Array.isArray(device.subs) ? device.subs : [];
+  if (!device.marked) {
+    const hint = document.createElement('span');
+    hint.className = 'empty';
+    hint.textContent = '打标后这块盘才会参与自动备份（可整块卷，也可只标其中几个子目录）。';
+    subsRow.append(hint);
+  } else if (!subs.length) {
+    const whole = document.createElement('span');
+    whole.className = 'empty';
+    whole.textContent = '操作范围：整块卷';
+    subsRow.append(whole);
+  } else {
+    const label = document.createElement('span');
+    label.className = 'empty';
+    label.textContent = '只操作这些子目录：';
+    subsRow.append(label);
+    subs.forEach((sub) => {
+      const chip = document.createElement('span');
+      chip.className = 'auto-device-sub';
+      chip.append(document.createTextNode(sub));
+      if (device.online && device.removable && !device.read_only) {
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '×';
+        remove.title = `取消 ${sub} 的打标`;
+        remove.addEventListener('click', () => autoBackupMarkerAction('sub_remove', {
+          path: `${device.mount_point}/${sub}`,
+        }));
+        chip.append(remove);
+      }
+      subsRow.append(chip);
+    });
+  }
+  item.append(subsRow);
+
+  const actions = document.createElement('div');
+  actions.className = 'auto-device-actions';
+  if (!device.online) {
+    const forget = document.createElement('button');
+    forget.type = 'button';
+    forget.className = device.pending_clear ? '' : 'danger';
+    forget.textContent = device.pending_clear ? '撤销「下次上线清除」' : '取消打标（设备不在，下次上线自动清除）';
+    forget.addEventListener('click', () => autoBackupMarkerAction(
+      device.pending_clear ? 'offline_keep' : 'offline_unmark', { identity: device.identity }));
+    actions.append(forget);
+  } else if (device.read_only) {
+    const note = document.createElement('small');
+    note.className = 'empty';
+    note.textContent = '只读挂载，无法打标；请先以可读写方式重新挂载这块盘。';
+    actions.append(note);
+  } else if (device.marked) {
+    const addSub = document.createElement('button');
+    addSub.type = 'button';
+    addSub.textContent = '添加子目录打标…';
+    addSub.addEventListener('click', () => openPathPicker('submark', { kind: 'path', path: device.mount_point }));
+    const rename = document.createElement('button');
+    rename.type = 'button';
+    rename.textContent = '设置别名';
+    rename.addEventListener('click', () => promptAutoBackupAlias(device));
+    const unmark = document.createElement('button');
+    unmark.type = 'button';
+    unmark.className = 'danger';
+    unmark.textContent = '取消打标（整块卷）';
+    unmark.addEventListener('click', () => autoBackupMarkerAction('unmark', { path: device.mount_point }));
+    actions.append(addSub, rename, unmark);
+  } else {
+    const mark = document.createElement('button');
+    mark.type = 'button';
+    mark.textContent = '给整块卷打标';
+    mark.addEventListener('click', () => promptAutoBackupMark(device.mount_point));
+    const markSub = document.createElement('button');
+    markSub.type = 'button';
+    markSub.textContent = '给子目录打标…';
+    markSub.addEventListener('click', () => openPathPicker('submark', { kind: 'path', path: device.mount_point }));
+    actions.append(mark, markSub);
+  }
+  // 内置卷没有任何可执行动作，空行不占位
+  if (actions.childElementCount) item.append(actions);
+  return item;
+}
+
+// autoBackupMarkerAction 调打标接口：成功后直接用后端回传的设备列表重绘，
+// 失败时把后端的原话（只读 / 没权限 / 空间不足…）显示出来并重新拉一次列表。
+async function autoBackupMarkerAction(action, payload = {}) {
+  const pending = {
+    mark: '正在打标…',
+    sub_add: '正在给子目录打标…',
+    sub_remove: '正在取消子目录打标…',
+    unmark: '正在取消打标…',
+    offline_unmark: '正在登记「下次上线清除」…',
+    offline_keep: '正在撤销…',
+    rename: '正在保存别名…',
+  }[action] || '正在处理…';
+  showAutoBackupStatus(pending);
+  try {
+    const result = await request('api/backup/auto/marker', {
+      method: 'POST',
+      body: JSON.stringify({ action, ...payload }),
+    });
+    if (Array.isArray(result.devices)) {
+      autoDevices = result.devices;
+      renderAutoBackupDevices();
+    } else {
+      await refreshAutoBackupDevices();
+    }
+    showAutoBackupStatus(result.message || '已更新打标状态。');
+  } catch (error) {
+    showAutoBackupStatus(`打标失败：${error.message}`, true);
+    await refreshAutoBackupDevices();
+  }
+}
+
+async function promptAutoBackupMark(path, displayName = '') {
+  const alias = await showAppConfirm({
+    title: displayName ? `给 ${displayName} 打标` : '给整块卷打标',
+    message: `打标信息写在卷内的 ${autoMarkerDirFile}（不会往卷根丢文件），整块盘都会参与自动备份。只备份卡里某几个目录时，改用「给子目录打标…」。`,
+    input: {
+      label: '别名（可选，列表里一眼认出是哪块盘）',
+      value: '',
+      placeholder: '例如：相机SD卡',
+      maxLength: 32,
+    },
+    confirmText: '打标',
+  });
+  if (alias === null || alias === undefined) return;
+  await autoBackupMarkerAction('mark', { path, alias });
+}
+
+async function promptAutoBackupAlias(device) {
+  const alias = await showAppConfirm({
+    title: `设置 ${autoDeviceName(device)} 的别名`,
+    message: '别名只用于在列表与日志里区分设备，留空则回落到卷标。',
+    input: {
+      label: '别名（留空 = 用卷标）',
+      value: device.alias || '',
+      placeholder: '例如：相机SD卡',
+      maxLength: 32,
+    },
+    confirmText: '保存',
+  });
+  if (alias === null || alias === undefined) return;
+  await autoBackupMarkerAction('rename', { path: device.mount_point, alias });
+}
+
+// --- 规则编辑器 -------------------------------------------------------------
+
+function autoDirectionFromEditor() {
+  const checked = document.querySelector('input[name="auto-backup-direction"]:checked');
+  return checked ? checked.value : 'from_volume';
+}
+
+function autoModeFromEditor() {
+  const checked = document.querySelector('input[name="auto-backup-mode"]:checked');
+  return checked ? checked.value : 'archive';
+}
+
+// setAutoMoveConfirmAlert 打开/收起确认项的告警高亮（配合 styles.css 里的 .needs-confirm）。
+function setAutoMoveConfirmAlert(on) {
+  const next = on === true;
+  if (autoMoveConfirmAlert === next) return;
+  autoMoveConfirmAlert = next;
+  $('auto-backup-allow-move-field').classList.toggle('needs-confirm', next);
+}
+
+// pulseAutoBackupConfirm 用户没勾确认就去保存/试跑时抖一下那一行，并把焦点送过去。
+function pulseAutoBackupConfirm() {
+  const field = $('auto-backup-allow-move-field');
+  setAutoMoveConfirmAlert(true);
+  // 连续点两次也要重新播放动画：先去掉类、读一次布局强制回流，再加回去。
+  field.classList.remove('shake');
+  void field.offsetWidth;
+  field.classList.add('shake');
+  setTimeout(() => field.classList.remove('shake'), 700);
+  if (typeof field.scrollIntoView === 'function') field.scrollIntoView({ block: 'nearest' });
+  const input = $('auto-backup-allow-move');
+  if (typeof input.focus === 'function') input.focus({ preventScroll: true });
+}
+
+function updateAutoBackupModeControls() {
+  const direction = autoDirectionFromEditor();
+  const toVolume = direction === 'to_volume';
+  const effectiveMode = autoModeFromEditor();
+  const effectiveMove = effectiveMode === 'move_overwrite' || effectiveMode === 'move_archive';
+  // 移动类模式两个方向都能用，但「NAS → 打标卷」的源是 NAS 上的原始资料，删源不可逆，
+  // 而且按键触发时没有界面能弹窗——所以这条规则必须逐条勾选确认（后端同样校验），
+  // 页面上手动运行时还会再弹一次确认框。
+  const riskyMove = effectiveMove && toVolume;
+  $('auto-backup-allow-move-field').hidden = !riskyMove;
+  if (!riskyMove) {
+    $('auto-backup-allow-move').checked = false;
+    setAutoMoveConfirmAlert(false);
+  }
+  $('auto-backup-overwrite').disabled = effectiveMode !== 'copy';
+  $('auto-backup-keep').disabled = effectiveMode !== 'archive' && effectiveMode !== 'move_archive';
+  syncBackupKeepRow('auto-backup-keep-row', backupKeepAnchorID(effectiveMode, 'auto-backup'));
+  $('auto-backup-fixed-label').textContent = toVolume
+    ? 'NAS 侧源（要备份的目录）'
+    : 'NAS 侧目标（导入到哪里）';
+  // 「打标卷 → NAS」方向：卷内范围由打标时标记的子目录决定，规则的子目录输入框
+  // 隐藏（老配置里填过的值后端仍然尊重，见 autoBackupJobForVolume）。
+  $('auto-backup-sub-field').hidden = !toVolume;
+  $('auto-backup-sub-hint').hidden = toVolume;
+  const hint = $('auto-backup-mode-hint');
+  hint.className = riskyMove ? 'backup-hint danger' : 'backup-hint';
+  if (riskyMove) {
+    hint.textContent = '注意：移动模式会删掉源里的文件，这条规则的源在 NAS 上——复制成功一个删一个，跑完 NAS 上就只剩没传成功的文件。同一时间只能插一块打标盘，多块盘同时插着时这条规则会被拒绝运行。';
+  } else if (effectiveMove) {
+    hint.textContent = '移动模式复制成功一个删一个，只删已成功复制的文件；打标子目录模式下也只删这些子目录里的文件。';
+  } else if (effectiveMode === 'sync' && toVolume && !$('auto-backup-sub').value.trim()) {
+    hint.textContent = '注意：同步模式 + 留空子目录 = 清空整块打标卷，保存时会被拒绝；请填写一个子目录。';
+  } else {
+    hint.textContent = '';
+  }
+}
+
+function refreshAutoBackupFixedHints() {
+  const hint = $('auto-backup-fixed-hint');
+  const location = autoEditorLocations.fixed;
+  if (!location) {
+    hint.textContent = '';
+    return;
+  }
+  if (location.kind === 'volume') {
+    hint.textContent = '按卷标/UUID 记住介质本身，换接口或换挂载路径后仍能自动找到。';
+    return;
+  }
+  hint.textContent = '';
+}
+
+function setAutoBackupFixedLocation(location) {
+  autoEditorLocations.fixed = location;
+  $('auto-backup-fixed').value = backupLocationSummary(location) || '';
+  refreshAutoBackupFixedHints();
+}
+
+function openAutoBackupEditor(ruleID = '') {
+  const rule = gpioAutos.find((item) => item.id === ruleID);
+  autoEditingRuleID = rule ? rule.id : generateAutoBackupRuleID();
+  $('auto-backup-id').value = autoEditingRuleID;
+  $('auto-backup-name').value = rule ? rule.name : '';
+  $('auto-backup-sub').value = rule ? (rule.volume_sub || '') : '';
+  $('auto-backup-keep').value = rule ? String(rule.keep || 0) : '0';
+  $('auto-backup-overwrite').checked = rule ? rule.overwrite !== false : true;
+  $('auto-backup-allow-move').checked = rule ? rule.allow_move_to_volume === true : false;
+  document.querySelectorAll('input[name="auto-backup-direction"]').forEach((radio) => {
+    radio.checked = radio.value === (rule ? rule.direction : 'from_volume');
+  });
+  document.querySelectorAll('input[name="auto-backup-mode"]').forEach((radio) => {
+    radio.checked = radio.value === (rule ? rule.mode : 'archive');
+  });
+  autoEditorLocations.fixed = rule ? rule.fixed : null;
+  $('auto-backup-fixed').value = backupLocationSummary(autoEditorLocations.fixed);
+  $('auto-backup-editor').hidden = false;
+  updateAutoBackupModeControls();
+  setAutoMoveConfirmAlert(false);
+  refreshAutoBackupFixedHints();
+  showAutoBackupEditorMessage(rule ? `正在编辑「${rule.name}」` : '正在创建新的自动备份规则');
+  $('auto-backup-name').focus();
+}
+
+function closeAutoBackupEditor() {
+  autoEditingRuleID = '';
+  autoEditorLocations.fixed = null;
+  $('auto-backup-editor').hidden = true;
+  $('auto-backup-id').value = '';
+  $('auto-backup-name').value = '';
+  $('auto-backup-fixed').value = '';
+  $('auto-backup-sub').value = '';
+  $('auto-backup-keep').value = '0';
+  $('auto-backup-overwrite').checked = true;
+  $('auto-backup-allow-move').checked = false;
+  setAutoMoveConfirmAlert(false);
+  showAutoBackupEditorMessage('');
+}
+
+function autoRuleFromEditor() {
+  const mode = autoModeFromEditor();
+  const direction = autoDirectionFromEditor();
+  const keepEnabled = mode === 'archive' || mode === 'move_archive';
+  const moveMode = mode === 'move_overwrite' || mode === 'move_archive';
+  return {
+    id: autoEditingRuleID || generateAutoBackupRuleID(),
+    name: $('auto-backup-name').value.trim(),
+    direction,
+    fixed: autoEditorLocations.fixed,
+    // 卷内子目录只在「NAS → 打标卷」方向有意义；「打标卷 → NAS」的范围由打标时
+    // 标记的子目录决定。这里必须清空，否则残留值会在后端压过打标子目录。
+    volume_sub: direction === 'to_volume' ? $('auto-backup-sub').value.trim() : '',
+    mode,
+    overwrite: mode === 'copy' ? $('auto-backup-overwrite').checked : true,
+    keep: keepEnabled ? Math.max(0, Math.round(Number($('auto-backup-keep').value) || 0)) : 0,
+    // 只有「NAS → 打标卷 + 移动类」这个组合需要显式确认，其它情况一律不带这个标记。
+    allow_move_to_volume: direction === 'to_volume' && moveMode ? $('auto-backup-allow-move').checked : false,
+  };
+}
+
+// autoRuleDeletesNasSource 规则会不会删掉 NAS 上的文件（也就是需要额外确认的那一类）。
+function autoRuleDeletesNasSource(rule) {
+  if (!rule || rule.direction !== 'to_volume') return false;
+  return rule.mode === 'move_overwrite' || rule.mode === 'move_archive';
+}
+
+// 卷内子目录清理后是否等于卷根本身：空、"."、"./"、"././" 都算。这类输入等于
+// 「没选子目录」，同步模式会带 --delete 清空整块盘，后端也会拒绝。
+function autoVolumeSubIsVolumeRoot(sub) {
+  return String(sub || '').trim().split('/').every((part) => part === '' || part === '.');
+}
+
+function validateAutoRuleDraft(rule) {
+  if (!rule.name) {
+    showAutoBackupEditorMessage('规则名称不能为空。', true);
+    $('auto-backup-name').focus();
+    return false;
+  }
+  if (gpioAutos.some((item) => item.id !== rule.id && item.name.trim().toLowerCase() === rule.name.toLowerCase())) {
+    showAutoBackupEditorMessage(`规则名称“${rule.name}”已存在。`, true);
+    $('auto-backup-name').focus();
+    return false;
+  }
+  if (!rule.fixed) {
+    showAutoBackupEditorMessage('请先选择 NAS 侧位置。', true);
+    return false;
+  }
+  // from_volume（打标卷 → NAS）时 rule.fixed 才是 NAS 侧的目标；to_volume 时它是
+  // NAS 侧的源（见 backup_auto.go 里 Fixed 字段的说明）。目标直接落在整个「我的
+  // 文件」根目录上，同步模式会把个人空间清空，必须在保存前拦住。
+  const target = rule.direction === 'from_volume' ? rule.fixed : null;
+  if (target && target.kind === 'path' && /^\/vol[0-9]+\/[0-9]+\/?$/.test(target.path)) {
+    showAutoBackupEditorMessage('NAS 侧目标不能直接是整个「我的文件」根目录，请在它下面新建一个备份目录。', true);
+    return false;
+  }
+  // 卷内子目录按「清理后的路径」判断：空、"."、"./"、"././" 都落在卷根。
+  // 同步模式会 --delete 清空整块盘；其它模式下点目录也等于把规则作用到整卷，
+  // 与用户填了子目录的预期不符，一起拦住（后端规则校验与执行入口有同样的闸）。
+  if (rule.direction === 'to_volume' && autoVolumeSubIsVolumeRoot(rule.volume_sub)) {
+    if (rule.mode === 'sync') {
+      showAutoBackupEditorMessage('同步模式请填写打标卷内的目标子目录（留空、. 或 ./ 都会清空整块盘）。', true);
+      return false;
+    }
+    if (rule.volume_sub) {
+      showAutoBackupEditorMessage('卷内子目录不能是 . 或 ./（等同于整块盘的根目录）。', true);
+      return false;
+    }
+  }
+  if (autoRuleDeletesNasSource(rule) && !rule.allow_move_to_volume) {
+    // 只说不做没用：抖一下那一行、把焦点送过去，让用户知道要勾的是哪里。
+    pulseAutoBackupConfirm();
+    showAutoBackupEditorMessage('还没有确认风险：这条规则会删除 NAS 上的源文件，请勾选下方的「我确认：这条规则可以删除 NAS 上的源文件」再保存。', true);
+    return false;
+  }
+  return true;
+}
+
+function commitAutoBackupEditor() {
+  if ($('auto-backup-editor').hidden) return true;
+  const rule = autoRuleFromEditor();
+  if (!validateAutoRuleDraft(rule)) return false;
+  const index = gpioAutos.findIndex((item) => item.id === rule.id);
+  if (index >= 0) gpioAutos[index] = rule;
+  else gpioAutos.push(rule);
+  closeAutoBackupEditor();
+  setupGPIOActions(gpioScripts, true, gpioBackups, gpioAutos);
+  renderAutoBackupList();
+  showAutoBackupStatus(`规则“${rule.name}”已加入草稿。别忘了点击下方的「保存按钮控制」持久化。`);
+  return true;
+}
+
+async function deleteAutoBackupRule(ruleID) {
+  const rule = gpioAutos.find((item) => item.id === ruleID);
+  if (!rule) return;
+  const bindings = autoBackupBindings(ruleID);
+  if (bindings.length) {
+    showAutoBackupStatus(`规则“${rule.name}”仍被按键（${bindings.join('、')}）引用，请先在上方下拉框改成其他动作。`, true);
+    return;
+  }
+  const ok = await showAppConfirm({
+    title: '删除自动备份规则',
+    message: `确定删除自动备份规则“${rule.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
+  gpioAutos = gpioAutos.filter((item) => item.id !== ruleID);
+  if (autoEditingRuleID === ruleID) closeAutoBackupEditor();
+  setupGPIOActions(gpioScripts, true, gpioBackups, gpioAutos);
+  renderAutoBackupList();
+  showAutoBackupStatus(`规则“${rule.name}”已从本页草稿删除。`);
+}
+
+async function runAutoBackup(ruleID, dryRun = false, definition = null) {
+  const rule = definition || gpioAutos.find((item) => item.id === ruleID);
+  const name = rule ? rule.name : ruleID;
+  // 「NAS → 打标卷 + 移动类」会删掉 NAS 上的源文件：正式运行前再确认一次。
+  // 按键触发那一路没有界面（保存规则时的勾选已经确认过一次），这里只覆盖页面上的运行按钮。
+  // 试跑不写不删任何文件，不需要确认。
+  if (!dryRun && autoRuleDeletesNasSource(rule)) {
+    const confirmed = await showAppConfirm({
+      title: '确认删除 NAS 上的源文件',
+      message: `规则「${name}」用的是移动类模式：运行后会把 ${backupLocationSummary(rule.fixed)} 里已成功复制的文件从 NAS 上删除（复制成功一个删一个，目录结构保留，没传完的文件不删）。同时插着多块打标卷时这条规则会被拒绝运行。`,
+      confirmText: '确认运行',
+      danger: true,
+    });
+    if (!confirmed) {
+      showAutoBackupStatus('已取消运行：移动模式会删除 NAS 上的源文件。');
+      return;
+    }
+  }
+  showAutoBackupStatus(dryRun ? `正在试跑「${name}」…` : `正在启动「${name}」…`);
+  try {
+    const payload = definition
+      ? { rule: definition, dry_run: dryRun }
+      : { rule_id: ruleID, dry_run: dryRun };
+    const result = await request('api/backup/auto/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (dryRun) {
+      showAutoBackupStatus(`试跑完成：找到 ${result.volumes} 块打标卷，将处理 ${result.files} 个文件（${formatByteSize(result.bytes)}）。均为演练，未写入任何文件。`);
+    } else {
+      showAutoBackupStatus(`「${name}」已开始自动备份，结束后会闪灯并滴滴滴提示。`);
+      startBackupPolling();
+    }
+  } catch (error) {
+    showAutoBackupStatus(`执行失败：${error.message}`, true);
+  }
+}
+
+// --- 位置 / 目录选择对话框 ---------------------------------------------------
+//
+// 默认只让用户在飞牛的四类位置里选（我的文件 / 团队文件 / 外接存储 / 远程挂载），
+// 不暴露系统目录，避免小白把备份目标指到乱七八糟的地方；确有需要时可用
+// 「高级」模式浏览整个文件系统（有明确的风险提示与二次确认）。
+
+async function openPathPicker(role, startLocation = null) {
+  pathPicker.role = role;
+  pathPicker.allowFile = role === 'source';
+  pathPicker.selectedFile = '';
+  pathPicker.scope = 'places';
+  $('path-picker-title').textContent = role === 'source'
+    ? '选择源目录或文件'
+    : role === 'marker' ? '选择要打标的可移动卷（选卷内任意目录即可）'
+      : role === 'submark' ? '选择要打标的卷内子目录（只操作它的内容）'
+        : '选择目标目录';
+  $('path-picker').hidden = false;
+  const start = (role === 'marker' || role === 'submark') ? startLocation : backupEditorLocations[role];
+  await browsePathTo(start && start.kind === 'path' ? start.path : '', 'places');
+}
+
+function closePathPicker() {
+  $('path-picker').hidden = true;
+  pathPicker.selectedFile = '';
+}
+
+async function browsePathTo(path, scope) {
+  if (scope) pathPicker.scope = scope;
+  const message = $('path-picker-message');
+  message.textContent = '正在读取…';
+  message.className = 'inline-status';
+  try {
+    const query = `path=${encodeURIComponent(path || '')}&scope=${encodeURIComponent(pathPicker.scope)}`;
+    const data = await request(`api/backup/browse?${query}`);
+    const places = Array.isArray(data.places) ? data.places : [];
+    pathPicker.path = data.path || '';
+    pathPicker.places = places;
+    pathPicker.currentPlace = places.find((item) => item.id === data.inside) || null;
+    pathPicker.selectedFile = '';
+    renderPathPicker(data);
+    if (data.mode !== 'browse') {
+      message.textContent = places.length ? `共 ${places.length} 个可用位置` : '没有检测到可用位置，可用「高级」手动指定路径';
+    } else {
+      message.textContent = data.entries && data.entries.length ? `该目录下有 ${data.entries.length} 项` : '该目录为空';
+    }
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = 'inline-status error';
+  }
+}
+
+function renderPathPicker(data) {
+  const placesMode = data.mode !== 'browse';
+  renderPathPlaces(data.places || [], data.inside || '');
+  renderPathCrumbs(data);
+  renderPathEntries(data, placesMode);
+  $('path-picker-up').disabled = !data.parent;
+  $('path-picker-up').dataset.parent = data.parent || '';
+  // 位置总览还没有「当前目录」，新建文件夹无从落脚。
+  $('path-picker-mkdir').disabled = placesMode;
+  const advanced = data.scope === 'all';
+  document.querySelector('.path-picker-body').classList.toggle('advanced', advanced);
+  const advancedButton = $('path-picker-advanced');
+  advancedButton.textContent = advanced ? '退出原生目录模式' : '高级：原生目录模式';
+  advancedButton.classList.toggle('active', advanced);
+  const warning = $('path-picker-warning');
+  warning.hidden = !advanced;
+  if (advanced) {
+    warning.textContent = '原生目录模式：正在浏览整个文件系统。系统目录不是数据盘，把备份目标放在这里可能损坏系统，请确认你清楚自己在做什么。';
+  }
+  updatePathPickerSelectLabel();
+}
+
+// 容量文字与硬盘测试工具完全一套：「63.1 GB 可用 36%」；网盘虚标容量
+// （rclone 一律报 ~1 PiB）按「容量未知」处理。
+const TIB = 1024 * 1024 * 1024 * 1024;
+const FAKE_CAPACITY_MIN = 900 * TIB;
+const CAPACITY_WHY = {
+  cloud: '网盘挂载不上报可用空间（rclone / WebDAV 对网盘一律返回空容量），所以只能显示「容量未知」。',
+  cache: '这个远程挂载走本地缓存，不上报可用空间，所以只能显示「容量未知」。',
+  direct: '挂载端没有上报可用空间，所以显示「容量未知」。',
+};
+
+function isFakeCapacity(bytes) {
+  return bytes >= FAKE_CAPACITY_MIN;
+}
+
+function placeCapacityText(place) {
+  const free = place.free_bytes || 0;
+  const total = place.total_bytes || 0;
+  if (free > 0 && !isFakeCapacity(free)) {
+    const pct = total > 0 ? Math.round(free / total * 100) : 0;
+    return {
+      text: `${formatByteSize(free)} 可用 ${pct}%`,
+      title: `可用 ${formatByteSize(free)} / 共 ${formatByteSize(total)}`,
+      unknown: false,
+    };
+  }
+  if (place.kind === 'remote') {
+    return { text: '容量未知', title: CAPACITY_WHY[place.mode] || CAPACITY_WHY.direct, unknown: true };
+  }
+  return { text: '—', title: '没能读到这个位置的容量信息。', unknown: true };
+}
+
+function placeMetaText(place) {
+  const parts = [];
+  if (place.subtitle) parts.push(place.subtitle);
+  if (place.read_only) parts.push('只读');
+  return parts.join(' · ');
+}
+
+function renderPathPlaces(places, insideID) {
+  const list = $('path-picker-places');
+  list.replaceChildren();
+  if (!places.length) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = '没有找到可用的存储卷';
+    list.append(empty);
+    return;
+  }
+  places.forEach((place) => {
+    const li = document.createElement('li');
+    li.className = `place-item${insideID && place.id === insideID ? ' active' : ''}${place.kind === 'external' ? ' removable' : ''}`;
+    li.title = `${place.path}${place.read_only ? '（只读）' : ''}`;
+    // 第一行：名称 + 剩余容量（右对齐），与硬盘测试工具的选目录列表同一套排法
+    const row = document.createElement('div');
+    row.className = 'pl-row';
+    const name = document.createElement('span');
+    name.className = 'pl-name';
+    name.textContent = place.name;
+    row.append(name);
+    const cap = placeCapacityText(place);
+    if (cap.text) {
+      const free = document.createElement('span');
+      free.className = `pl-free${cap.unknown ? ' unknown' : ''}`;
+      free.textContent = cap.text;
+      free.title = cap.title;
+      row.append(free);
+    }
+    li.append(row);
+    // 第二行：身份信息（用户名 / 可移动介质 / 远程挂载 · 只读），远程挂载右侧带改名
+    const meta = placeMetaText(place);
+    if (meta || place.kind === 'remote') {
+      const subRow = document.createElement('div');
+      subRow.className = 'pl-row sub';
+      const sub = document.createElement('span');
+      sub.className = 'pl-sub';
+      sub.textContent = meta;
+      sub.hidden = !meta;
+      subRow.append(sub);
+      if (place.kind === 'remote') {
+        const rename = document.createElement('button');
+        rename.type = 'button';
+        rename.className = 'rename';
+        rename.textContent = '改名';
+        rename.title = '给这个远程挂载设置一个看得懂的名字（例如：夸克网盘）';
+        rename.addEventListener('click', (event) => {
+          event.stopPropagation();
+          promptRemoteAlias(place);
+        });
+        subRow.append(rename);
+      }
+      li.append(subRow);
+    }
+    // 与硬盘测试工具一致：点存储空间直接进入卷内用户目录（home），不停在卷根
+    li.addEventListener('click', () => browsePathTo(place.home || place.path, 'places'));
+    // 键盘可达：Enter / 空格 触发与点击相同的行为（target 限定 li 本身，避免劫持内部改名按钮）
+    li.tabIndex = 0;
+    li.addEventListener('keydown', (event) => {
+      if (event.target !== li || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      li.click();
+    });
+    list.append(li);
+  });
+}
+
+// 路径栏照搬硬盘测试工具：一条灰底横条里放当前完整路径（单行省略）。
+function renderPathCrumbs(data) {
+  const code = $('path-picker-path');
+  const hint = $('path-picker-hint');
+  const placesMode = data.mode !== 'browse';
+  code.textContent = placesMode ? '从左侧选择存储位置' : (data.path || '/');
+  code.title = placesMode ? '从左侧选择存储位置' : (data.path || '/');
+  if (hint) {
+    const place = (data.places || []).find((item) => item.id === data.inside);
+    const readOnly = !placesMode && place && place.read_only;
+    hint.textContent = readOnly ? '该位置只读' : '';
+    hint.hidden = !readOnly;
+  }
+}
+
+function renderPathEntries(data, placesMode) {
+  const list = $('path-picker-entries');
+  list.replaceChildren();
+  if (placesMode) {
+    const guide = document.createElement('li');
+    guide.className = 'empty';
+    guide.textContent = '请从左侧选择一个存储位置';
+    list.append(guide);
+    return;
+  }
+  const entries = data.entries || [];
+  if (!entries.length) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = '（没有子目录）';
+    list.append(empty);
+    return;
+  }
+  entries.forEach((entry) => {
+    const row = document.createElement('li');
+    row.className = `path-entry${entry.is_dir ? ' is-dir' : ' is-file'}${entry.read_only ? ' locked' : ''}`;
+    const name = document.createElement('span');
+    name.className = 'path-entry-name';
+    name.textContent = entry.name;
+    row.append(name);
+    if (!entry.is_dir) {
+      const size = document.createElement('span');
+      size.className = 'path-entry-meta';
+      size.textContent = formatByteSize(entry.size);
+      row.append(size);
+    }
+    if (entry.is_place) {
+      const badge = document.createElement('span');
+      badge.className = 'path-entry-badge';
+      badge.textContent = '位置';
+      row.append(badge);
+    } else if (entry.is_volume) {
+      const badge = document.createElement('span');
+      badge.className = 'path-entry-badge';
+      badge.textContent = entry.read_only ? '只读卷' : '卷';
+      row.append(badge);
+    }
+    if (entry.read_only && entry.is_dir) row.title = '无写权限';
+    row.addEventListener('click', () => {
+      if (entry.is_dir) browsePathTo(entry.path, pathPicker.scope);
+      else if (pathPicker.allowFile) selectPathFile(entry.path, row);
+    });
+    // 键盘可达：列表是 role="listbox"，每行作为 option 可聚焦，Enter / 空格 同点击
+    row.tabIndex = 0;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', 'false');
+    row.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      row.click();
+    });
+    list.append(row);
+  });
+}
+
+function selectPathFile(path, row) {
+  pathPicker.selectedFile = path;
+  document.querySelectorAll('.path-entry.selected').forEach((item) => {
+    item.classList.remove('selected');
+    item.setAttribute('aria-selected', 'false');
+  });
+  row.classList.add('selected');
+  row.setAttribute('aria-selected', 'true');
+  updatePathPickerSelectLabel();
+}
+
+function updatePathPickerSelectLabel() {
+  const button = $('path-picker-select');
+  if (!pathPicker.path) {
+    button.disabled = true;
+    button.textContent = pathPicker.role === 'source' ? '使用当前目录作为源' : '使用当前目录作为目标';
+    return;
+  }
+  button.disabled = false;
+  if (!pathPicker.allowFile || !pathPicker.selectedFile) {
+    button.textContent = pathPicker.role === 'source' ? '使用当前目录作为源' : '使用当前目录作为目标';
+    return;
+  }
+  button.textContent = `选择文件：${pathPicker.selectedFile.split('/').pop()}`;
+}
+
+// promptCreateDirectory 在当前浏览目录下新建一个子文件夹，建完直接进去。
+// 只建一层且由后端校验（位置范围 / 只读卷 / 重名 / 非法名字），前端只做提示。
+async function promptCreateDirectory() {
+  const message = $('path-picker-message');
+  if (!pathPicker.path) {
+    message.textContent = '请先进入一个目录，再新建文件夹。';
+    message.className = 'inline-status error';
+    return;
+  }
+  const name = await showAppConfirm({
+    title: '新建文件夹',
+    message: `将在 ${pathPicker.path} 下新建一个文件夹。`,
+    input: {
+      label: '文件夹名称',
+      value: '',
+      placeholder: '例如：备份',
+      maxLength: 40,
+    },
+    confirmText: '创建',
+  });
+  const trimmed = String(name === null || name === undefined ? '' : name).trim();
+  if (!trimmed) return;
+  message.textContent = '正在创建…';
+  message.className = 'inline-status';
+  try {
+    const result = await request('api/backup/mkdir', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: pathPicker.path,
+        name: trimmed,
+        scope: pathPicker.scope || 'places',
+      }),
+    });
+    const created = (result && result.path) || '';
+    // 建完直接进去：用户点「选择当前目录」就是它，少一次点击。
+    await browsePathTo(created, pathPicker.scope || 'places');
+    message.textContent = `已新建文件夹「${(result && result.name) || trimmed}」`;
+    message.className = 'inline-status';
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = 'inline-status error';
+  }
+}
+
+// --- 内置确认 / 输入对话框 --------------------------------------------------
+// 替代 window.confirm：浏览器原生弹窗与应用风格不搭，也没法做警示美化。
+// 用法：const ok = await showAppConfirm({ title, message, confirmText, danger });
+// 输入模式再传 input: { label, value, placeholder, maxLength }，确定时回传输入值。
+// 需要第三个动作时传 secondaryText，点它返回字符串 'secondary'。
+// 风扇曲线的模式弹窗靠这个多出「应用并保存风扇控制」。
+// hideConfirm 把主按钮藏起来（只留副按钮当唯一动作），secondaryDanger 让副按钮走红底。
+
+const appConfirm = { onOk: null, resolve: null };
+
+function showAppConfirm(options = {}) {
+  return new Promise((resolve) => {
+    appConfirm.onOk = typeof options.onOk === 'function' ? options.onOk : null;
+    appConfirm.resolve = resolve;
+    $('confirm-title').textContent = options.title || '确认操作';
+    const message = $('confirm-message');
+    message.textContent = options.message || '';
+    message.hidden = !options.message;
+    const ok = $('confirm-ok');
+    ok.textContent = options.confirmText || '确定';
+    ok.className = options.danger ? 'danger' : 'primary';
+    ok.hidden = Boolean(options.hideConfirm);
+    $('confirm-icon').hidden = !options.danger;
+    const secondary = $('confirm-secondary');
+    secondary.hidden = !options.secondaryText;
+    secondary.textContent = options.secondaryText || '';
+    secondary.className = `confirm-secondary${options.secondaryDanger ? ' danger' : ''}`;
+    const inputRow = $('confirm-input-row');
+    inputRow.hidden = !options.input;
+    if (options.input) {
+      $('confirm-input-label').textContent = options.input.label || '';
+      const input = $('confirm-input');
+      input.value = options.input.value || '';
+      input.placeholder = options.input.placeholder || '';
+      input.maxLength = options.input.maxLength || 64;
+    }
+    $('app-confirm').hidden = false;
+    if (options.input) {
+      const input = $('confirm-input');
+      input.focus();
+      input.select();
+    }
+  });
+}
+
+function closeAppConfirm(result) {
+  if ($('app-confirm').hidden) return;
+  $('app-confirm').hidden = true;
+  if (appConfirm.resolve) {
+    appConfirm.resolve(result);
+    appConfirm.resolve = null;
+  }
+}
+
+$('confirm-cancel').addEventListener('click', () => closeAppConfirm(null));
+document.querySelectorAll('[data-confirm-close]').forEach((el) => {
+  el.addEventListener('click', () => closeAppConfirm(null));
+});
+// 副按钮（「应用并保存风扇控制」）回传 { secondary: true, value }，
+// value 带上输入框内容，手动填百分比时点它也能用用户填的数
+$('confirm-secondary').addEventListener('click', () => {
+  const inputMode = !$('confirm-input-row').hidden;
+  closeAppConfirm({ secondary: true, value: inputMode ? $('confirm-input').value.trim() : undefined });
+});
+$('confirm-ok').addEventListener('click', () => {
+  const onOk = appConfirm.onOk;
+  const inputMode = !$('confirm-input-row').hidden;
+  const value = inputMode ? $('confirm-input').value.trim() : undefined;
+  closeAppConfirm(inputMode ? value : true);
+  if (onOk) onOk(value);
+});
+$('confirm-input').addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    // 主按钮被藏起来的弹窗（关停只有一个红色动作）里，回车走副按钮
+    if ($('confirm-ok').hidden && !$('confirm-secondary').hidden) $('confirm-secondary').click();
+    else $('confirm-ok').click();
+  }
+});
+
+async function togglePathPickerAdvanced() {
+  if (pathPicker.scope === 'all') {
+    await browsePathTo('', 'places');
+    return;
+  }
+  const ok = await showAppConfirm({
+    title: '进入原生目录模式',
+    message: '该模式可以浏览并选择整个文件系统（包含系统目录）。系统目录不是数据盘，把备份目标放在这里可能损坏系统，请确认你清楚自己在做什么。',
+    confirmText: '进入原生目录模式',
+    danger: true,
+  });
+  if (!ok) return;
+  await browsePathTo('/', 'all');
+}
+
+// --- 远程挂载显示名 ---------------------------------------------------------
+
+async function promptRemoteAlias(place) {
+  const defaultName = place.path.split('/').pop();
+  const isDefault = place.name === defaultName;
+  const value = await showAppConfirm({
+    title: '设置远程挂载显示名',
+    message: `${place.path}\n当前显示：${isDefault ? `${defaultName}（系统自动命名）` : place.name}`,
+    input: {
+      label: '显示名（留空恢复系统命名）',
+      value: isDefault ? '' : place.name,
+      placeholder: '例如：夸克网盘',
+      maxLength: 64,
+    },
+    confirmText: '保存',
+  });
+  if (value === null || value === undefined) return;
+  const message = $('path-picker-message');
+  try {
+    await request('api/backup/alias', {
+      method: 'POST',
+      body: JSON.stringify({ mount_point: place.path, name: value }),
+    });
+    message.textContent = value ? `已改名为「${value}」` : '已恢复系统命名';
+    message.className = 'inline-status';
+    await browsePathTo(pathPicker.path || '', pathPicker.scope || 'places');
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = 'inline-status error';
+  }
+}
+
+// backupLocationForChosenPath 选到外接存储里的路径时，按卷标/UUID 记录介质本身，
+// 再加上卷内子目录；这样 U 盘换接口、换挂载路径后任务依然能自动找到。
+function backupLocationForChosenPath(path) {
+  const place = pathPicker.currentPlace;
+  if (place && place.kind === 'external' && place.uuid) {
+    const root = place.path.replace(/\/+$/, '');
+    let sub = '';
+    if (path !== root && path.startsWith(root + '/')) sub = path.slice(root.length + 1);
+    return { kind: 'volume', uuid: place.uuid, label: place.label || '', sub };
+  }
+  return { kind: 'path', path };
+}
+
+function confirmPathPicker() {
+  const chosen = pathPicker.selectedFile || pathPicker.path;
+  if (!chosen) return;
+  if ((pathPicker.role === 'target' || pathPicker.role === 'fixed') && pathPicker.selectedFile) return;
+  if (pathPicker.role === 'marker') {
+    // 打标不经过草稿：选完先问别名，再把打标信息写进该卷的打标目录。
+    closePathPicker();
+    promptAutoBackupMark(chosen);
+    return;
+  }
+  if (pathPicker.role === 'submark') {
+    // 子目录打标：选中的目录成为这块盘的「操作范围」之一。
+    closePathPicker();
+    autoBackupMarkerAction('sub_add', { path: chosen });
+    return;
+  }
+  if (pathPicker.role === 'fixed') {
+    setAutoBackupFixedLocation(backupLocationForChosenPath(chosen));
+    closePathPicker();
+    return;
+  }
+  setBackupEditorLocation(pathPicker.role, backupLocationForChosenPath(chosen));
+  closePathPicker();
+}
+
+// --- 可移动卷选择 -----------------------------------------------------------
+
+async function openVolumePicker(role) {
+  volumePicker.role = role;
+  volumePicker.selected = null;
+  $('volume-picker-sub').value = '';
+  $('volume-picker').hidden = false;
+  await loadVolumeList();
+}
+
+function closeVolumePicker() {
+  $('volume-picker').hidden = true;
+  volumePicker.selected = null;
+}
+
+async function loadVolumeList() {
+  const list = $('volume-picker-list');
+  const message = $('volume-picker-message');
+  list.replaceChildren();
+  message.textContent = '正在读取…';
+  message.className = 'inline-status';
+  try {
+    const data = await request('api/backup/volumes');
+    volumePicker.volumes = Array.isArray(data.volumes) ? data.volumes : [];
+    renderVolumeList();
+    message.textContent = volumePicker.volumes.length
+      ? `共 ${volumePicker.volumes.length} 个卷，点击选择`
+      : '没有检测到可用卷：请先插好设备并等它挂载完成';
+  } catch (error) {
+    message.textContent = error.message;
+    message.className = 'inline-status error';
+  }
+}
+
+function renderVolumeList() {
+  const list = $('volume-picker-list');
+  list.replaceChildren();
+  if (!volumePicker.volumes.length) {
+    const empty = document.createElement('p');
+    empty.className = 'gpio-script-empty';
+    empty.textContent = '（没有可用卷）';
+    list.append(empty);
+    return;
+  }
+  volumePicker.volumes.forEach((volume) => {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = `path-entry is-dir${volume.removable ? ' is-volume' : ''}`;
+    const icon = document.createElement('span');
+    icon.className = 'path-entry-icon';
+    const name = document.createElement('span');
+    name.className = 'path-entry-name';
+    name.textContent = volume.label || volume.mount_point;
+    const meta = document.createElement('span');
+    meta.className = 'path-entry-meta';
+    meta.textContent = [
+      volume.mount_point,
+      volume.uuid ? `UUID ${volume.uuid}` : '',
+      volume.total_bytes ? `可用 ${formatByteSize(volume.free_bytes)} / ${formatByteSize(volume.total_bytes)}` : '',
+    ].filter(Boolean).join(' · ');
+    row.append(icon, name, meta);
+    if (volume.removable) {
+      const badge = document.createElement('span');
+      badge.className = 'path-entry-badge';
+      badge.textContent = '可移动';
+      row.append(badge);
+    }
+    row.addEventListener('click', () => {
+      volumePicker.selected = volume;
+      document.querySelectorAll('#volume-picker-list .path-entry.selected').forEach((item) => item.classList.remove('selected'));
+      row.classList.add('selected');
+      $('volume-picker-message').textContent = `已选择：${volume.label || volume.mount_point}`;
+    });
+    list.append(row);
+  });
+}
+
+function confirmVolumePicker() {
+  if (!volumePicker.selected) {
+    $('volume-picker-message').textContent = '请先点击上方列表选择一个卷';
+    $('volume-picker-message').className = 'inline-status error';
+    return;
+  }
+  const volume = volumePicker.selected;
+  setBackupEditorLocation(volumePicker.role, {
+    kind: 'volume',
+    uuid: volume.uuid || '',
+    label: volume.label || '',
+    sub: $('volume-picker-sub').value.trim(),
+  });
+  closeVolumePicker();
+}
+
+// --- 运行与状态 -------------------------------------------------------------
+
+async function runBackupJob(jobID, dryRun = false, definition = null) {
+  const job = definition || gpioBackups.find((item) => item.id === jobID);
+  const name = job ? job.name : jobID;
+  showBackupStatus(dryRun ? `正在试跑「${name}」…` : `正在启动「${name}」…`);
+  try {
+    const payload = definition
+      ? { job: definition, dry_run: dryRun }
+      : { job_id: jobID, dry_run: dryRun };
+    const result = await request('api/backup/run', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (dryRun) {
+      showBackupStatus(`试跑完成：将复制 ${result.files} 个文件（${formatByteSize(result.bytes)}）`
+        + `${result.deleted ? `，将删除 ${result.deleted} 项` : ''}。均为演练，未写入任何文件。`);
+    } else {
+      showBackupStatus(`「${name}」已开始备份，结束后会闪灯并滴滴滴提示。`);
+      startBackupPolling();
+    }
+  } catch (error) {
+    showBackupStatus(`执行失败：${error.message}`, true);
+  }
+}
+
+function startBackupPolling() {
+  clearTimeout(backupPollTimer);
+  const tick = async () => {
+    try {
+      const status = await request('api/backup/status');
+      renderBackupStatus(status);
+      if (status.running) backupPollTimer = setTimeout(tick, 2000);
+    } catch (error) {
+      // 轮询失败不打扰用户：下一轮继续
+    }
+  };
+  backupPollTimer = setTimeout(tick, 1500);
+}
+
+function renderBackupStatus(status) {
+  if (!status) return;
+  renderAutoBackupStatusSummary(status);
+  if (status.running) {
+    showBackupStatus(`正在备份「${status.job_name}」…（${formatClock(status.started_at)} 开始，完成后会闪灯 + 滴滴滴）`);
+    return;
+  }
+  if (status.last_error) {
+    showBackupStatus(`上次备份失败：${status.last_error}`, true);
+    return;
+  }
+  const last = status.last;
+  if (!last) return;
+  showBackupStatus([
+    `上次备份完成：${last.job_name}`,
+    BACKUP_MODE_LABELS[last.mode] || last.mode,
+    `复制 ${last.files} 个文件 / ${formatByteSize(last.bytes)}`,
+    last.deleted ? `删除 ${last.deleted} 项` : '',
+    last.pruned ? `清理 ${last.pruned} 份旧快照` : '',
+    last.snapshot ? `快照 ${String(last.snapshot).split('/').pop()}` : '',
+    `用时 ${formatDuration(last.duration_ms)}`,
+    last.warning ? `注意：${last.warning}` : '',
+  ].filter(Boolean).join(' · '), Boolean(last.warning));
+}
+
+// renderAutoBackupStatusSummary 把自动备份的汇总（含失败时逐卷结果）渲染到
+// 自动备份卡片的状态行；普通任务的结果不会出现在这里（互斥存储）。
+function renderAutoBackupStatusSummary(status) {
+  const target = $('auto-backup-status');
+  if (!target) return;
+  const auto = status.auto;
+  if (!auto) {
+    target.textContent = '';
+    target.className = 'inline-status';
+    return;
+  }
+  const failedVolumes = (Array.isArray(auto.results) ? auto.results : [])
+    .filter((item) => item.warning).length;
+  const summary = [
+    `上次自动备份「${auto.rule_name}」${auto.dry_run ? '（试跑）' : ''}：`,
+    `${auto.volumes} 块打标卷`,
+    `处理 ${auto.files} 个文件（${formatByteSize(auto.bytes)}）`,
+    failedVolumes ? `${failedVolumes} 块卷有告警` : '',
+  ].filter(Boolean).join(' · ');
+  const error = Boolean(status.last_error);
+  target.textContent = error ? `${summary}；失败原因：${status.last_error}` : summary;
+  target.className = `inline-status${error ? ' error' : ''}`;
+}
+
+async function refreshBackupStatus() {
+  try {
+    renderBackupStatus(await request('api/backup/status'));
+  } catch (error) {
+    // 状态接口不可用时保持静默
+  }
+}
+
+// ---- 固件升级：BIOS（Intel FPT）与网卡（Mellanox MFT） ----
+// 刷写是后台任务，页面只轮询 api/firmware 拿任务步骤与日志；GET 返回缓存，
+// 不会反复触发 lspci/flint 等外部命令。
+const FIRMWARE_POLL_MS = 2000;
+const STRESS_POLL_MS = 1000;
+const NIC_TARGET_FW = '14.32.1900';
+let firmwarePollTimer = null;
+let stressPollTimer = null;
+
+async function postForm(path, formData) {
+  // multipart 不能手动设 Content-Type：浏览器需要自己带 boundary
+  const response = await fetch(baseUrl(path), { method: 'POST', cache: 'no-store', body: formData });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  // 2xx 但响应体损坏时结果不确定（刷写类操作尤其不能当成成功）
+  if (body === null) throw new Error(`响应体解析失败（HTTP ${response.status}）`);
+  return body;
+}
+
+function firmwareFile(inputID) {
+  const input = $(inputID);
+  const files = input && input.files;
+  return files && files.length ? files[0] : null;
+}
+
+// 手动升级 BIOS 默认折叠：只有显式打开开关才显示本地刷写入口。
+// 在线刷写进行中会自动展开，否则进度日志被藏在折叠区里看不见。
+function setManualBIOSVisible(visible) {
+  const card = document.querySelector('.firmware-bios-manual-card');
+  const body = $('firmware-bios-manual-body');
+  const toggle = $('firmware-bios-manual-toggle');
+  if (toggle) toggle.checked = Boolean(visible);
+  if (card) card.hidden = !visible;
+  if (body) body.hidden = !visible;
+}
+
+function firmwareLogText(job) {
+  const logs = job && Array.isArray(job.logs) ? job.logs : [];
+  return logs.length ? logs.join('\n') : '等待操作…';
+}
+
+function showFirmwareLog(kind, message, error = false) {
+  const target = $(kind === 'nic' ? 'firmware-nic-log' : 'firmware-bios-log');
+  if (!target) return;
+  target.textContent = message;
+  target.className = `firmware-log${error ? ' error' : ''}`;
+}
+
+function showFirmwareHint(message, error = false) {
+  const hint = $('firmware-nic-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function renderFirmwareJob(job) {
+  if (!job) return;
+  const target = $(job.kind === 'nic' ? 'firmware-nic-log' : 'firmware-bios-log');
+  if (!target) return;
+  const state = job.state || 'idle';
+  // 在线升级的日志也在手动升级卡片里：刷写期间自动展开，避免进度被折叠隐藏
+  if (job.kind !== 'nic' && state === 'running') setManualBIOSVisible(true);
+  target.textContent = firmwareLogText(job);
+  target.className = `firmware-log${state === 'success' ? ' success' : state === 'failed' ? ' error' : ''}`;
+  const running = state === 'running';
+  ['firmware-fpt-upload', 'firmware-bios-flash', 'firmware-nic-check', 'firmware-nic-flash', 'firmware-nic-flash-force', 'firmware-nic-mft-install', 'bios-online-check'].forEach((id) => {
+    const button = $(id);
+    if (!button) return;
+    // 网卡升级键的 disabled 归 renderFirmwareStatus 的同版本逻辑管，空闲时不得强制放开
+    if (!running && id === 'firmware-nic-flash') return;
+    button.disabled = running;
+  });
+  if (running) {
+    const onlineFlash = $('bios-online-flash');
+    if (onlineFlash) onlineFlash.disabled = true;
+  } else {
+    updateBIOSOnlineFlashButton();
+  }
+}
+
+function renderFirmwareStatus(status) {
+  if (!status) return;
+  const fpt = status.fpt || {};
+  const flashrom = status.flashrom || {};
+  const badge = $('firmware-tool-badge');
+  if (badge) {
+    if (flashrom.present) {
+      badge.textContent = 'flashrom 可用';
+      badge.className = 'inline-status';
+      badge.title = flashrom.path || 'flashrom';
+    } else if (fpt.present && fpt.builtin) {
+      badge.textContent = 'FPT 内置';
+      badge.className = 'inline-status';
+      badge.title = [fpt.path, fpt.size ? formatByteSize(fpt.size) : ''].filter(Boolean).join(' · ');
+    } else if (fpt.present) {
+      badge.textContent = '自定义 FPT';
+      badge.className = 'inline-status';
+      badge.title = [fpt.path, fpt.size ? formatByteSize(fpt.size) : '', fpt.uploaded_at ? formatClock(fpt.uploaded_at) : '']
+        .filter(Boolean).join(' · ');
+    } else {
+      badge.textContent = '刷写工具缺失';
+      badge.className = 'inline-status error';
+      badge.title = '未找到 flashrom，也未上传 Linux 版 FPT';
+    }
+  }
+  const nic = status.nic || {};
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value || '—';
+  };
+  setText('firmware-nic-model', nic.model);
+  setText('firmware-nic-pci', nic.pci_address);
+  setText('firmware-nic-fw', nic.fw_version);
+  setText('firmware-nic-psid', nic.psid);
+  setText('firmware-nic-mft', nic.mft_installed ? '已安装' : '未安装（可手动安装，升级时也会自动安装）');
+  setText('firmware-nic-target', nic.target_fw || NIC_TARGET_FW);
+  const flash = $('firmware-nic-flash');
+  const force = $('firmware-nic-flash-force');
+  const mftBtn = $('firmware-nic-mft-install');
+  // 三个操作按钮都只在检测到网卡之后才出现（2026-10-23 用户要求）
+  if (!nic.present) {
+    if (nic.error) {
+      showFirmwareHint(`检测失败：${nic.error}`, true);
+    } else {
+      showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
+    }
+    if (flash) flash.hidden = true;
+    if (force) force.hidden = true;
+    if (mftBtn) mftBtn.hidden = true;
+  } else {
+    const hint = $('firmware-nic-hint');
+    const currentFw = (nic.fw_version || '').trim();
+    const targetFw = (nic.target_fw || NIC_TARGET_FW || '').trim();
+    const sameVersion = !!(currentFw && targetFw && currentFw === targetFw);
+    const mftMissing = !nic.mft_installed;
+    if (hint) {
+      if (mftMissing) {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，但未安装 MFT 工具：可先点「安装 MFT 工具」（自动从服务器下载安装），或直接开始升级。`;
+        hint.className = 'inline-status';
+      } else if (sameVersion) {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${currentFw} 与在线版本一致不用升级。`;
+        hint.className = 'inline-status';
+      } else {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${currentFw || '未知'}，可开始升级。`;
+        hint.className = 'inline-status';
+      }
+    }
+    if (mftBtn) mftBtn.hidden = !mftMissing;
+    if (flash) { flash.hidden = false; flash.disabled = sameVersion; }
+    if (force) force.hidden = !sameVersion;
+  }
+  renderFirmwareJob(status.job);
+}
+
+async function refreshFirmwareStatus(showError = false) {
+  try {
+    renderFirmwareStatus(await request('api/firmware'));
+  } catch (error) {
+    if (showError) showFirmwareHint(`读取固件状态失败：${error.message}`, true);
+  }
+}
+
+function startFirmwarePoll() {
+  if (firmwarePollTimer) return;
+  firmwarePollTimer = setInterval(() => refreshFirmwareStatus(), FIRMWARE_POLL_MS);
+}
+
+function stopFirmwarePoll() {
+  if (!firmwarePollTimer) return;
+  clearInterval(firmwarePollTimer);
+  firmwarePollTimer = null;
+}
+
+async function uploadFPT() {
+  const file = firmwareFile('firmware-fpt-file');
+  if (!file) {
+    showFirmwareLog('bios', '请先选择 FPT 文件（Linux 版 fpt 可执行文件）。', true);
+    return;
+  }
+  const button = $('firmware-fpt-upload');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '上传中…';
+  }
+  try {
+    const form = new FormData();
+    form.append('fpt', file);
+    renderFirmwareStatus(await postForm('api/firmware/fpt', form));
+    showFirmwareLog('bios', 'FPT 已上传，可以开始刷写 BIOS。');
+  } catch (error) {
+    showFirmwareLog('bios', `FPT 上传失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '上传 FPT';
+    }
+  }
+}
+
+async function flashBIOS() {
+  const file = firmwareFile('firmware-bios-file');
+  if (!file) {
+    showFirmwareLog('bios', '请先选择 BIOS 镜像文件。', true);
+    return;
+  }
+  // 第一对话框：备份确认（替代原 checkbox）
+  const backed = await showAppConfirm({
+    title: '确认备份 BIOS',
+    message: `即将用「${file.name}」刷写 BIOS。请确认已备份当前 BIOS，并接受刷写失败的救砖风险。`,
+    confirmText: '已备份并接受风险',
+    danger: true,
+  });
+  if (!backed) { showFirmwareLog('bios', '已取消刷写。'); return; }
+  // 第二对话框：刷写最终确认
+  const confirmed = await showAppConfirm({
+    title: '再确认：刷写 BIOS',
+    message: `刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认型号匹配且有救砖方案。`,
+    confirmText: '确认刷写',
+    danger: true,
+  });
+  if (!confirmed) { showFirmwareLog('bios', '已取消刷写。'); return; }
+  const button = $('firmware-bios-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'FLASH');
+    form.append('image', file);
+    renderFirmwareStatus(await postForm('api/firmware/bios/flash', form));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('bios', `刷写启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+async function checkNIC() {
+  const button = $('firmware-nic-check');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '检测中…';
+  }
+  showFirmwareHint('正在检测网卡与 MFT 工具…');
+  try {
+    renderFirmwareStatus(await request('api/firmware/nic/check', { method: 'POST' }));
+  } catch (error) {
+    showFirmwareHint(`检测失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '检测网卡';
+    }
+  }
+}
+
+async function flashNIC(force = false) {
+  // 第一对话框：网卡型号与断电确认（替代原 checkbox，不再额外加 secondaryText 避免双取消）
+  const modelOk = await showAppConfirm({
+    title: force ? '强制升级网卡固件' : '确认网卡型号',
+    message: force
+      ? `当前固件已与线上版本 ${NIC_TARGET_FW} 一致。强制刷写通常用于固件损坏或分区修复。刷写后必须完全断电再上电。`
+      : `即将升级网卡固件到 ${NIC_TARGET_FW}。请确认网卡型号为 MCX4421A-ACQ，并接受刷写后必须完全断电再上电。`,
+    confirmText: force ? '强制刷写' : '已确认型号并接受断电要求',
+    danger: true,
+  });
+  if (!modelOk) { showFirmwareLog('nic', '已取消升级。'); return; }
+  // 第二对话框：升级最终确认
+  const confirmed = await showAppConfirm({
+    title: '再确认：升级网卡固件',
+    message: `升级期间不能断电，计划关机与系统关机会被拦截；刷写完成后必须完全断电再上电。`,
+    confirmText: '确认升级',
+    danger: true,
+  });
+  if (!confirmed) { showFirmwareLog('nic', '已取消升级。'); return; }
+  const button = force ? $('firmware-nic-flash-force') : $('firmware-nic-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'UPGRADE');
+    if (force) form.append('force', '1');
+    renderFirmwareStatus(await postForm('api/firmware/nic/flash', form));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('nic', `升级启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+// 手动安装 MFT：检测到网卡但没装 MFT 时显示，自动从服务器下载并安装。
+async function installMFTTool() {
+  const ok = await showAppConfirm({
+    title: '安装 MFT 工具',
+    message: '将自动从服务器下载 MFT 4.37.0 并安装到系统，过程约 1–2 分钟，期间请勿关闭页面。',
+    confirmText: '开始安装',
+  });
+  if (!ok) { showFirmwareLog('nic', '已取消安装。'); return; }
+  const button = $('firmware-nic-mft-install');
+  if (button) button.disabled = true;
+  try {
+    renderFirmwareStatus(await postForm('api/firmware/nic/install-mft', new FormData()));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('nic', `安装启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+// ---- BIOS 在线升级：拉取云端 zip.txt 索引，严格同机型判定 ----
+let biosOnlineUpdateAvailable = false;
+// 本次检查到的候选固件文案：二次确认弹窗里要写清楚刷的是哪个版本
+let biosOnlineCandidateLabel = '';
+
+function showBIOSOnlineHint(message, error = false) {
+  const hint = $('bios-online-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function renderBIOSOnline(status) {
+  if (!status) return;
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value || '—';
+  };
+  setText('bios-online-model', status.model);
+  const current = status.current_version
+    ? `${status.current_version}（${status.current_build_date || '日期未知'}）`
+    : status.current_error || '';
+  setText('bios-online-current', current);
+  const latest = status.candidate_version
+    ? `${status.candidate_version}（${status.candidate_build_date || '日期未知'}）`
+    : '';
+  setText('bios-online-latest', latest);
+  setText('bios-online-zip', status.candidate_zip);
+  biosOnlineCandidateLabel = latest || status.candidate_zip || '';
+  const changelog = $('bios-online-changelog');
+  if (changelog) {
+    if (status.changelog) {
+      changelog.textContent = `更新日志（${status.candidate_zip || ''}）：\n${status.changelog}`;
+      changelog.hidden = false;
+    } else {
+      changelog.textContent = '';
+      changelog.hidden = true;
+    }
+  }
+  const badge = $('bios-online-badge');
+  const flashButton = $('bios-online-flash');
+  biosOnlineUpdateAvailable = Boolean(status.update_available);
+  if (status.error) {
+    showBIOSOnlineHint(status.error, true);
+  } else if (status.update_available) {
+    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），可下载更新。`);
+  } else if (status.candidate_zip) {
+    // 已是最新：不再显示 badge 状态，hint 保持空白让面板更干净
+    showBIOSOnlineHint('');
+  }
+  if (badge) {
+    if (status.update_available) { badge.textContent = '有新版本'; badge.className = 'inline-status success'; }
+    else if (status.error) { badge.textContent = '检查失败'; badge.className = 'inline-status error'; }
+    else if (status.candidate_zip) { badge.textContent = ''; badge.className = 'inline-status'; }
+    else { badge.textContent = '未检查'; badge.className = 'inline-status'; }
+  }
+  updateBIOSOnlineFlashButton();
+}
+
+function updateBIOSOnlineFlashButton() {
+  const flashButton = $('bios-online-flash');
+  if (!flashButton) return;
+  flashButton.disabled = !biosOnlineUpdateAvailable;
+}
+
+async function checkBIOSOnline() {
+  const button = $('bios-online-check');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '检查中…';
+  }
+  showBIOSOnlineHint('正在读取云端索引并用 flashrom 读取当前 BIOS 版本（约 10–30 秒）…');
+  try {
+    renderBIOSOnline(await request('api/firmware/bios-online/check', { method: 'POST' }));
+  } catch (error) {
+    showBIOSOnlineHint(`检查失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '检查更新';
+    }
+  }
+}
+
+async function flashBIOSOnline() {
+  const target = biosOnlineCandidateLabel || '云端候选固件';
+  // 第一对话框：备份确认（替代原 checkbox）
+  const backed = await showAppConfirm({
+    title: '确认备份 BIOS',
+    message: `即将下载并刷写 ${target}。请确认已备份当前 BIOS，并接受刷写失败的救砖风险。`,
+    confirmText: '已备份并接受风险',
+    danger: true,
+  });
+  if (!backed) { showBIOSOnlineHint('已取消刷写。'); return; }
+  // 第二对话框：刷写最终确认
+  const confirmed = await showAppConfirm({
+    title: '再确认：下载并刷写 BIOS',
+    message: `刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认已有救砖方案。`,
+    confirmText: '确认刷写',
+    danger: true,
+  });
+  if (!confirmed) { showBIOSOnlineHint('已取消刷写。'); return; }
+  const button = $('bios-online-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'FLASH');
+    renderFirmwareStatus(await postForm('api/firmware/bios-online/flash', form));
+    startFirmwarePoll();
+    showBIOSOnlineHint('已开始下载并刷写，进度见下方「手动升级 BIOS」卡片里的日志（刷写期间会自动展开）。');
+  } catch (error) {
+    showBIOSOnlineHint(`刷写启动失败：${error.message}`, true);
+    updateBIOSOnlineFlashButton();
+  }
+}
+
+// ---- 开关机计划：定时关机由后端触发，定时开机写主板 RTC wakealarm ----
+let powerScheduleEntries = [];
+let powerScheduleSelected = -1; // 表格选中行；-1 = 无选中
+let powerScheduleEditing = -1;  // 编辑器正在编辑的行；-1 = 新增
+
+const SCHEDULE_DAYS_LABEL = { weekday: '平日', weekend: '假日', daily: '每天' };
+
+function showScheduleHint(message, error = false) {
+  const hint = $('schedule-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function updateScheduleToolbar() {
+  const has = powerScheduleSelected >= 0 && powerScheduleSelected < powerScheduleEntries.length;
+  const entry = has ? powerScheduleEntries[powerScheduleSelected] : null;
+  $('schedule-edit').disabled = !has;
+  $('schedule-delete').disabled = !has;
+  $('schedule-enable').disabled = !has || entry.enabled;
+  $('schedule-disable').disabled = !has || !entry.enabled;
+}
+
+function renderPowerSchedule(status) {
+  if (!status) return;
+  powerScheduleEntries = status.entries || [];
+  if (powerScheduleSelected >= powerScheduleEntries.length) powerScheduleSelected = -1;
+  $('schedule-total').textContent = String(status.total ?? powerScheduleEntries.length);
+  $('schedule-enabled').textContent = String(status.enabled_count ?? 0);
+  $('schedule-next').textContent = status.next_trigger || '—';
+  const trs = powerScheduleEntries.map((entry, index) => {
+    const tr = document.createElement('tr');
+    if (index === powerScheduleSelected) tr.classList.add('selected');
+    const enableTd = document.createElement('td');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = entry.enabled;
+    checkbox.setAttribute('aria-label', `${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time} 启用开关`);
+    checkbox.addEventListener('click', (event) => event.stopPropagation());
+    checkbox.addEventListener('change', () => {
+      powerScheduleEntries[index].enabled = checkbox.checked;
+      savePowerSchedule();
+    });
+    enableTd.appendChild(checkbox);
+    tr.appendChild(enableTd);
+    const timeTd = document.createElement('td');
+    timeTd.textContent = `${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time}`;
+    tr.appendChild(timeTd);
+    const actionTd = document.createElement('td');
+    actionTd.textContent = entry.action === 'poweron' ? '开机' : '关机';
+    tr.appendChild(actionTd);
+    const statusTd = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = `schedule-status ${entry.enabled ? 'on' : 'off'}`;
+    badge.textContent = entry.enabled ? '已启用' : '已停用';
+    statusTd.appendChild(badge);
+    tr.appendChild(statusTd);
+    tr.addEventListener('click', () => {
+      powerScheduleSelected = index;
+      const rows = $('schedule-rows');
+      rows.querySelectorAll('tr').forEach((row, rowIndex) => row.classList.toggle('selected', rowIndex === index));
+      updateScheduleToolbar();
+    });
+    return tr;
+  });
+  $('schedule-rows').replaceChildren(...trs);
+  $('schedule-empty').hidden = powerScheduleEntries.length > 0;
+  // 页脚对齐参考界面：RTC · alarm_IRQ · 服务 · 计划写入
+  $('schedule-footer').textContent = [
+    `RTC: ${status.rtc_time || '读取失败'}`,
+    `alarm_IRQ: ${status.rtc_alarm_irq || '未知'}`,
+    '服务: enabled',
+    `计划写入: ${status.applied ? '是' : '否'}`,
+  ].join(' · ');
+  updateScheduleToolbar();
+  if (status.error) showScheduleHint(status.error, true);
+}
+
+async function loadPowerSchedule() {
+  try {
+    renderPowerSchedule(await request('api/power-schedule'));
+  } catch (error) {
+    showScheduleHint(`读取计划失败：${error.message}`, true);
+  }
+}
+
+async function savePowerSchedule() {
+  try {
+    const status = await request('api/power-schedule/config', {
+      method: 'POST',
+      body: JSON.stringify({ entries: powerScheduleEntries }),
+    });
+    renderPowerSchedule(status);
+    // RTC 缺失时保存仍成功（仅不能写唤醒）：不能把错误提示覆盖成「已同步到 RTC」
+    if (status.error) showScheduleHint(`计划已保存，但${status.error}`, true);
+    else showScheduleHint('计划已保存，开机时刻已同步到 RTC。');
+  } catch (error) {
+    showScheduleHint(`保存失败：${error.message}`, true);
+    loadPowerSchedule(); // 回滚到服务端状态，避免界面与服务端不一致
+  }
+}
+
+function openScheduleEditor(index) {
+  powerScheduleEditing = index;
+  const entry = index >= 0 ? powerScheduleEntries[index] : { days: 'weekday', time: '10:00', action: 'poweron' };
+  $('schedule-editor-title').textContent = index >= 0 ? '编辑计划' : '新增计划';
+  $('schedule-editor-days').value = entry.days;
+  $('schedule-editor-time').value = entry.time;
+  $('schedule-editor-action').value = entry.action;
+  $('schedule-editor').hidden = false;
+}
+
+function closeScheduleEditor() {
+  $('schedule-editor').hidden = true;
+}
+
+function submitScheduleEditor() {
+  const time = $('schedule-editor-time').value;
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) {
+    showScheduleHint('时间格式无效，请选择正确的触发时间。', true);
+    return;
+  }
+  const entry = {
+    enabled: powerScheduleEditing >= 0 ? powerScheduleEntries[powerScheduleEditing].enabled : true,
+    days: $('schedule-editor-days').value,
+    time,
+    action: $('schedule-editor-action').value,
+  };
+  if (powerScheduleEditing >= 0) powerScheduleEntries[powerScheduleEditing] = entry;
+  else powerScheduleEntries.push(entry);
+  closeScheduleEditor();
+  savePowerSchedule();
+}
+
+// 工具栏「启用/停用」：切换选中行的 enabled 并保存
+async function setPowerScheduleEnabled(enabled) {
+  if (powerScheduleSelected < 0 || powerScheduleSelected >= powerScheduleEntries.length) return;
+  powerScheduleEntries[powerScheduleSelected].enabled = enabled;
+  savePowerSchedule();
+}
+
+async function deletePowerSchedule() {
+  if (powerScheduleSelected < 0 || powerScheduleSelected >= powerScheduleEntries.length) return;
+  const entry = powerScheduleEntries[powerScheduleSelected];
+  const ok = await showAppConfirm({
+    title: '删除计划',
+    message: `确定删除「${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time} ${entry.action === 'poweron' ? '开机' : '关机'}」这条计划吗？`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (ok !== true) return;
+  powerScheduleEntries.splice(powerScheduleSelected, 1);
+  powerScheduleSelected = -1;
+  savePowerSchedule();
+}
+
+async function applyPowerSchedule() {
+  try {
+    renderPowerSchedule(await request('api/power-schedule/apply', { method: 'POST' }));
+    showScheduleHint('已把下次开机时刻写入 RTC。');
+  } catch (error) {
+    showScheduleHint(`应用失败：${error.message}`, true);
+  }
+}
+
+async function testPowerSchedule() {
+  const ok = await showAppConfirm({
+    title: '测试开机计划',
+    message: '将写入 3 分钟后的 RTC 唤醒闹钟。请随后手动关机，观察机器是否自动上电。测试闹钟在保护窗口内不会被计划同步覆盖，过期后自动恢复。',
+    confirmText: '写入测试闹钟',
+  });
+  if (ok !== true) return;
+  try {
+    const result = await request('api/power-schedule/test', { method: 'POST', body: JSON.stringify({ minutes: 3 }) });
+    showScheduleHint(`测试闹钟已写入：${result.wake_at}（RTC UTC）。请手动关机验证自动开机。`);
+  } catch (error) {
+    showScheduleHint(`测试闹钟写入失败：${error.message}`, true);
+  }
+}
+
+// ---- 压力测试：CPU / 内存 / GPU 全部由后端施压 ----
+function stressOptionsFromForm() {
+  const cpu = Boolean($('stress-cpu').checked);
+  const gpu = Boolean($('stress-gpu').checked);
+  const memory = Boolean($('stress-memory').checked);
+  if (!cpu && !gpu && !memory) return null;
+  const permanentNode = $('stress-permanent');
+  const permanent = Boolean(permanentNode && permanentNode.checked);
+  const durationValue = Number($('stress-duration').value);
+  const memoryValue = Number($('stress-memory-mb').value);
+  // 0 表示永久测试，由后端一直运行到用户点击停止。
+  const duration = permanent
+    ? 0
+    : Math.min(3600, Math.max(10, Number.isFinite(durationValue) && durationValue > 0 ? Math.round(durationValue) : 300));
+  const memoryMB = Math.max(64, Number.isFinite(memoryValue) && memoryValue > 0 ? Math.round(memoryValue) : 512);
+  const memoryAutoNode = $('stress-memory-auto');
+  const memoryAuto = Boolean(memory && memoryAutoNode && memoryAutoNode.checked);
+  // 自动预留时 MB 由后端按「可用内存 − 256 MB」计算，这里传 0 表示不用手填值
+  return { cpu, gpu, memory, duration_seconds: duration, memory_mb: memoryAuto ? 0 : memoryMB, memory_auto: memoryAuto };
+}
+
+// 勾选「自动预留」后禁用 MB 输入框，值不再参与计算
+function updateStressMemoryAuto() {
+  const auto = $('stress-memory-auto');
+  const input = $('stress-memory-mb');
+  if (!auto || !input) return;
+  input.disabled = Boolean(auto.checked);
+  input.placeholder = auto.checked ? '自动' : '';
+}
+
+// 只在压力测试运行期间检测风扇关停档：避免用户在不知情时一边压测一边停转导致超温
+function updateStressOffWarning(running = false) {
+  const warning = $('stress-off-warning');
+  if (!warning) return;
+  warning.hidden = !(running && fanOffModeActive());
+}
+
+function stressParts(options) {
+  const parts = [];
+  if (!options) return parts;
+  if (options.cpu) parts.push('CPU');
+  if (options.memory) parts.push('内存');
+  if (options.gpu) parts.push('GPU');
+  return parts;
+}
+
+function renderStressStatus(status) {
+  if (!status) return;
+  const options = status.options || {};
+  const running = Boolean(status.running);
+  updateStressOffWarning(running);
+  const parts = stressParts(options);
+  const permanent = (options.duration_seconds || 0) === 0;
+  const text = $('stress-status-text');
+  if (text) {
+    if (status.error) {
+      text.textContent = `压测异常：${status.error}`;
+      text.className = 'message error';
+    } else if (running) {
+      if (permanent) {
+        text.textContent = `压测进行中（${parts.join(' + ')}），永久运行，点击「停止」结束`;
+      } else {
+        const remaining = Math.max(0, (options.duration_seconds || 0) - (status.elapsed_seconds || 0));
+        text.textContent = `压测进行中（${parts.join(' + ')}），剩余 ${remaining} 秒`;
+      }
+      text.className = 'message';
+    } else if (parts.length) {
+      text.textContent = `已结束（用时 ${status.elapsed_seconds || 0} 秒）`;
+      text.className = 'message';
+    } else {
+      text.textContent = '未开始';
+      text.className = 'message';
+    }
+  }
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value;
+  };
+  setText('stress-elapsed', status.elapsed_seconds ? formatDuration(status.elapsed_seconds * 1000) : '—');
+  setText('stress-cpu-percent', running ? `${Number(status.cpu_percent || 0).toFixed(1)}%` : '—');
+  setText('stress-memory-used', status.memory_total_bytes
+    ? `${formatByteSize(status.memory_used_bytes)} / ${formatByteSize(status.memory_total_bytes)}`
+    : '—');
+  const memoryNode = $('stress-memory-used');
+  if (memoryNode) memoryNode.title = status.memory_allocated_bytes ? `压测分配 ${formatByteSize(status.memory_allocated_bytes)}` : '';
+  setText('stress-load', running ? Number(status.load1 || 0).toFixed(2) : '—');
+  setText('stress-cpu-temp', running && status.cpu_temp_c ? `${Number(status.cpu_temp_c).toFixed(1)} °C` : '—');
+  setText('stress-gpu-freq', status.gpu_freq_mhz ? `${status.gpu_freq_mhz} MHz` : '—');
+  setText('stress-gpu-backend', status.gpu_backend === 'vaapi' ? 'VAAPI / ffmpeg' : '—');
+  const gpuHint = $('stress-gpu-hint');
+  if (gpuHint) {
+    if (status.gpu_error) {
+      gpuHint.textContent = `GPU 压测异常：${status.gpu_error}`;
+      gpuHint.className = 'inline-status error';
+    } else if (running && options.gpu) {
+      gpuHint.textContent = 'GPU 压测运行中：后端通过 VAAPI 占用核显。';
+      gpuHint.className = 'inline-status';
+    } else {
+      gpuHint.textContent = 'GPU 压测由后端通过 VAAPI 调用核显（需 root 权限）。';
+      gpuHint.className = 'inline-status';
+    }
+  }
+  const start = $('stress-start');
+  const stop = $('stress-stop');
+  if (start) start.disabled = running;
+  if (stop) stop.disabled = !running;
+  ['stress-cpu', 'stress-gpu', 'stress-memory', 'stress-permanent', 'stress-memory-mb'].forEach((id) => {
+    const node = $(id);
+    if (node) node.disabled = running;
+  });
+  const permanentNode = $('stress-permanent');
+  const durationNode = $('stress-duration');
+  if (durationNode) durationNode.disabled = running || Boolean(permanentNode && permanentNode.checked);
+}
+
+async function refreshStressStatus(showError = false) {
+  try {
+    renderStressStatus(await request('api/stress'));
+  } catch (error) {
+    if (showError) {
+      const text = $('stress-status-text');
+      if (text) {
+        text.textContent = `读取压测状态失败：${error.message}`;
+        text.className = 'message error';
+      }
+    }
+  }
+}
+
+function startStressPoll() {
+  if (stressPollTimer) return;
+  stressPollTimer = setInterval(() => refreshStressStatus(), STRESS_POLL_MS);
+}
+
+function stopStressPoll() {
+  if (!stressPollTimer) return;
+  clearInterval(stressPollTimer);
+  stressPollTimer = null;
+}
+
+async function startStressRun() {
+  const options = stressOptionsFromForm();
+  const text = $('stress-status-text');
+  if (!options) {
+    if (text) {
+      text.textContent = '请至少勾选 CPU、GPU、内存中的一项。';
+      text.className = 'message error';
+    }
+    return;
+  }
+  // 只在压力测试启用时检测关停档：压测持续升温而风扇不会起转，容易在不知情下超温
+  if (fanOffModeActive()) {
+    const result = await showAppConfirm({
+      title: '风扇处于「关停」档',
+      message: '压力测试会让整机持续升温，而关停档下风扇不会自动起转、超温只蜂鸣报警，可能造成硬件损坏。建议先恢复关停前的风扇曲线再开始压测。',
+      confirmText: '仍然开始压测',
+      danger: true,
+      secondaryText: '恢复关停前状态并开始',
+    });
+    if (!result) return;
+    if (result.secondary) {
+      // 「恢复并开始」：恢复后必须回读权威服务端状态，确认确实退出关停档才继续；
+      // 回读失败 / 响应损坏 / 仍是关停档都按不确定处理——保留提示并停止启动。
+      if (!(await restoreFanOffState({ skipConfirm: true }))) return;
+      if (!(await confirmFanOffModeReleased())) return;
+    } else {
+      // 用户明确承担风险直接压测：告知服务端跳过关停档门槛
+      options.ack_off_mode = true;
+    }
+  }
+  const button = $('stress-start');
+  if (button) button.disabled = true;
+  try {
+    renderStressStatus(await request('api/stress/start', { method: 'POST', body: JSON.stringify(options) }));
+    startStressPoll();
+  } catch (error) {
+    if (text) {
+      text.textContent = `启动失败：${error.message}`;
+      text.className = 'message error';
+    }
+    if (button) button.disabled = false;
+  }
+}
+
+async function stopStressRun() {
+  const button = $('stress-stop');
+  if (button) button.disabled = true;
+  try {
+    renderStressStatus(await request('api/stress/stop', { method: 'POST' }));
+  } catch (error) {
+    if (button) button.disabled = false;
+    const text = $('stress-status-text');
+    if (text) {
+      text.textContent = `停止失败：${error.message}`;
+      text.className = 'message error';
+    }
+  }
+}
+
+
 function activateTab(tabID, focus = false) {
   // CRPS 页 iframe 懒加载：首次切到该页才加载，避免常驻轮询耗电 API。
   // 加载后按内容高度自适应 iframe，页面内部不滚动，滚动交给主应用整页（滚动条直达底部）。
@@ -964,8 +3704,17 @@ function activateTab(tabID, focus = false) {
   });
   if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); if (fanDebugVisiblePref()) startFanDebugPoll(); });
   else stopFanDebugPoll(); // 离开风扇控制页即停轮询(调试卡片不在当前页)
+  // 固件/压测状态只在对应页轮询；压测任务本身在后端继续跑，GPU 着色器按剩余时长自动停止
+  if (tabID === 'tab-firmware') requestAnimationFrame(() => { refreshFirmwareStatus(); startFirmwarePoll(); });
+  else stopFirmwarePoll();
+  if (tabID === 'tab-stress') requestAnimationFrame(() => { refreshStressStatus(); startStressPoll(); });
+  else stopStressPoll();
+  // 进按键映射页时刷新一次备份运行状态（备份是异步的，回来能看到结果）
+  if (tabID === 'tab-gpio') requestAnimationFrame(refreshBackupStatus);
   // 调试页的传感器显示名列表靠历史数据发现传感器键，进页时刷新一次再渲染
   if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
+  // 开关机计划页：进页拉一次状态（RTC/计划写入状态随时间变化）
+  if (tabID === 'tab-schedule') requestAnimationFrame(loadPowerSchedule);
 }
 
 function setupTabs() {
@@ -1051,12 +3800,118 @@ function updateGPIOEnabledState() {
   document.querySelectorAll('.gpio-action').forEach((select) => { select.disabled = !enabled; });
 }
 
+// --- 刷新 SD 卡（重新识别 USB 读卡器）--------------------------------------
+// 与「按一下网络键」是同一个动作，这里给一个不用跑到机器跟前的手动入口。
+
+let sdcardRefreshBusy = false;
+
+function describeStorageInsert(event = {}) {
+  const devices = Array.isArray(event.devices) && event.devices.length ? event.devices.join('、') : '';
+  const when = event.detected_at ? new Date(event.detected_at).toLocaleTimeString() : '';
+  return [event.kind_label || '', devices, event.chime ? `（${event.chime}）` : '', when].filter(Boolean).join(' ');
+}
+
+// 存储设备插入提示音：显示开关、正在监视的设备数以及最近几次插入事件。
+function renderStorageNotifyStatus(storageNotify = {}) {
+  const target = $('gpio-storage-notify-status');
+  if (!target) return;
+  const count = (value) => Number(value) || 0;
+  const parts = [
+    storageNotify.enabled ? '提示音已开启' : '提示音已关闭',
+    `正在监视 ${count(storageNotify.devices)} 个存储设备（移动存储 ${count(storageNotify.removable)}、内置存储 ${count(storageNotify.internal)}）`,
+  ];
+  const recent = Array.isArray(storageNotify.recent) ? storageNotify.recent : [];
+  if (recent.length) {
+    parts.push(`最近：${describeStorageInsert(recent[0])}`);
+  } else {
+    parts.push('还没有识别到新插入的存储设备');
+  }
+  if (storageNotify.last_error) parts.push(storageNotify.last_error);
+  target.textContent = parts.join(' · ');
+  target.className = `inline-status${storageNotify.last_error ? ' error' : ''}`;
+  target.title = recent.map(describeStorageInsert).join('\n');
+}
+
+// 刷新 SD 卡：按键映射页与硬盘面板「移动设备」区块共用这一条路径（同一个
+// 后端动作，只是按钮与状态行各自归属自己的卡片）。刷新完再拉一次状态，
+// 新认出来的卡立刻变成图标，不用等下一拍轮询。
+async function refreshSDCardManually(button = $('gpio-refresh-sdcard'), status = $('gpio-sdcard-status')) {
+  if (sdcardRefreshBusy) return;
+  sdcardRefreshBusy = true;
+  button.disabled = true;
+  const originalLabel = button.textContent;
+  const rawIdle = status?.dataset?.idle;
+  const idleText = typeof rawIdle === 'string' ? rawIdle : '';
+  // 记住自己那一行的基类（并剔掉上一次失败留下的 error），刷新结束后按原样恢复。
+  const rawClass = typeof status?.className === 'string' ? status.className : '';
+  const statusClass = rawClass.split(/\s+/).filter((name) => name && name !== 'error').join(' ');
+  button.textContent = '正在刷新…';
+  if (status) {
+    status.textContent = '正在重新识别 USB 读卡器，请稍候（通常几秒）…';
+    status.className = statusClass;
+  }
+  try {
+    const result = await request('api/gpio/refresh-sdcard', { method: 'POST', body: '{}' });
+    if (status) {
+      // 后端只报「真的读到东西」的结果：读卡器重识别了但没介质时 summary 为空，
+      // 这时回到自己那一行的初始说明（硬盘面板没有说明就是空白），不堆提示。
+      status.textContent = result.summary || idleText;
+      status.className = statusClass;
+    }
+    await refresh(true);
+  } catch (error) {
+    if (status) {
+      status.textContent = error.message;
+      status.className = `${statusClass} error`;
+    }
+  } finally {
+    button.disabled = false;
+    button.textContent = originalLabel;
+    sdcardRefreshBusy = false;
+  }
+}
+
 function fillGPIOInputs(gpio = {}) {
   $('gpio-enabled').checked = Boolean(gpio.enabled);
+  // 提示音开关缺省为开：老配置里没有这个字段，不能因此显示成关闭。
+  $('gpio-storage-notify').checked = gpio.storage_notify !== false;
+  // 按键声光反馈开关缺省为开：老配置里没有这个字段，不能因此显示成关闭。
+  $('gpio-feedback').checked = gpio.feedback !== false;
+  // 开机/关机提示音开关缺省为开：老配置里没有这个字段，同样按开启显示。
+  $('gpio-power-chime').checked = gpio.power_chime !== false;
+  gpioMigrations = Array.isArray(gpio.migrations) ? gpio.migrations.map(String) : [];
   gpioScripts = Array.isArray(gpio.scripts)
     ? gpio.scripts.map((script) => ({ id: String(script.id), name: String(script.name), body: String(script.body) }))
     : [];
-  setupGPIOActions(gpioScripts, false);
+  gpioBackups = Array.isArray(gpio.backups)
+    ? gpio.backups.map((job) => ({
+      id: String(job.id),
+      name: String(job.name),
+      source: normalizeBackupLocation(job.source),
+      target: normalizeBackupLocation(job.target),
+      mode: String(job.mode || 'copy'),
+      overwrite: job.overwrite !== false,
+      keep: Number(job.keep) || 0,
+      marker: String(job.marker || ''),
+    }))
+    : [];
+  gpioAutos = Array.isArray(gpio.autos)
+    ? gpio.autos.map((rule) => ({
+      id: String(rule.id),
+      name: String(rule.name),
+      direction: String(rule.direction || 'from_volume'),
+      fixed: normalizeBackupLocation(rule.fixed),
+      volume_sub: String(rule.volume_sub || ''),
+      mode: String(rule.mode || 'archive'),
+      overwrite: rule.overwrite !== false,
+      keep: Number(rule.keep) || 0,
+      // 必须原样带回：丢了它，页面重新加载后再保存按键配置会被后端
+      // validateGPIOAutoBackup 拒掉（「请在规则里勾选确认后再保存」），
+      // 用户此后任何按键改动都存不上；编辑器回显也会变成没勾选。
+      allow_move_to_volume: rule.allow_move_to_volume === true,
+    }))
+    : [];
+  setupGPIOActions(gpioScripts, false, gpioBackups, gpioAutos);
   const buttons = new Map((gpio.buttons || []).map((button) => [button.id, button]));
   document.querySelectorAll('.gpio-table tbody tr').forEach((row) => {
     const actions = buttons.get(row.dataset.button)?.actions || {};
@@ -1066,15 +3921,28 @@ function fillGPIOInputs(gpio = {}) {
   });
   closeGPIOScriptEditor();
   renderGPIOScriptList();
+  closeBackupJobEditor();
+  renderBackupJobList();
+  closeAutoBackupEditor();
+  renderAutoBackupList();
+  refreshAutoBackupDevices();
   showGPIOScriptMessage(gpioScripts.length ? `已加载 ${gpioScripts.length} 个脚本。` : '尚未创建自定义脚本。');
   updateGPIOEnabledState();
+  updateGPIOFeedbackStatus();
+  updatePowerChimeStatus();
 }
 
 function gpioConfigFromInputs() {
   return {
     version: 1,
     enabled: $('gpio-enabled').checked,
+    storage_notify: $('gpio-storage-notify').checked,
+    feedback: $('gpio-feedback').checked,
+    power_chime: $('gpio-power-chime').checked,
+    migrations: [...gpioMigrations],
     scripts: gpioScripts.map((script) => ({ ...script })),
+    backups: gpioBackups.map((job) => ({ ...job })),
+    autos: gpioAutos.map((rule) => ({ ...rule })),
     buttons: [...document.querySelectorAll('.gpio-table tbody tr')].map((row) => {
       const actions = { short: 'none' };
       row.querySelectorAll('.gpio-action').forEach((select) => { actions[select.dataset.stage] = select.value; });
@@ -1092,8 +3960,13 @@ function clamp(value, minimum, maximum) {
 }
 
 function fanMinimumPWM() {
-  const value = Number($('fan-min').value);
-  return Number.isFinite(value) ? clamp(Math.round(value), 30, 100) : 30;
+  // 关停档：0% 也要能填进曲线，最低转速不再是地板
+  if (fanOffMode) return 0;
+  const raw = $('fan-min').value;
+  const value = Number(raw);
+  // 空框（用户正在改）或非法输入按默认最低转速走，30% 是硬性下限而不是默认值
+  if (raw === '' || raw === null || raw === undefined || !Number.isFinite(value)) return DEFAULT_MIN_PWM_PERCENT;
+  return clamp(Math.round(value), 30, 100);
 }
 
 function fanEmergencyTemperature() {
@@ -1199,6 +4072,673 @@ function removeSelectedCurvePoint(kind) {
   editor.curve.splice(editor.selectedIndex, 1);
   editor.selectedIndex = clamp(editor.selectedIndex, 0, editor.curve.length - 1);
   renderFanChart(kind);
+}
+
+// ---- 预设曲线模式：静音 / 平衡 / 性能 --------------------------------------
+// 系统集成的三档参数，数值与后端 internal/powerguard/fan.go 的 builtinFanCurves
+// 一一对应，改一边必须同步另一边。出厂默认就是「平衡」这一档。
+// 点一下替换的是三条曲线的全部节点（界面上的，未保存），保存风扇控制后才下发；
+// 低于「最低转速」的节点会在套用时按最低转速抬起来。
+const CURVE_PRESETS = {
+  quiet: {
+    label: '静音',
+    summary: '低转速优先，晚一点拉高',
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 43], [45, 43], [50, 55], [52, 70], [55, 80], [60, 90]],
+      nvme: [[20, 40], [45, 40], [55, 55], [60, 60]],
+      cpu: [[20, 40], [42, 40], [44, 43], [60, 43], [70, 50], [75, 60], [80, 80], [85, 100]],
+    }),
+  },
+  balanced: {
+    label: '平衡',
+    summary: '常温低速、升温及时提速（出厂默认）',
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 47], [45, 47], [50, 60], [52, 75], [55, 80], [60, 100]],
+      nvme: [[20, 40], [45, 40], [55, 60], [60, 70]],
+      cpu: [[20, 40], [42, 40], [44, 47], [60, 47], [70, 55], [75, 65], [80, 85], [85, 100]],
+    }),
+  },
+  performance: {
+    label: '性能',
+    summary: '高转速优先，温度一上来就压住',
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 47], [40, 50], [50, 65], [52, 80], [55, 90], [60, 100]],
+      nvme: [[20, 40], [45, 40], [55, 65], [60, 75]],
+      cpu: [[20, 47], [45, 47], [50, 60], [55, 70], [60, 85], [85, 100]],
+    }),
+  },
+};
+const CURVE_PRESET_ORDER = ['quiet', 'balanced', 'performance'];
+
+// ---- 曲线模式状态 ----------------------------------------------------------
+// activeCurveMode 只驱动按键选中态与文案：quiet/balanced/performance/temp/
+// full/off/manual/slot-1..3。fanOffMode 决定曲线能不能写 0%（关停档）。
+let activeCurveMode = 'temp';
+let fanOffMode = false;
+// 进入全速／关停之前记下的三条曲线，点「临时」可以原样回来
+const TEMP_CURVE_STORAGE_KEY = 'tad-fan-curve-temp';
+let tempCurveBackup = null;
+// 后端在进入关停档时留的曲线快照：换浏览器/清过本地存储时也能恢复原选定曲线
+let offModeCurveBackup = null;
+
+function loadTempCurveBackup() {
+  try {
+    const raw = window.localStorage.getItem(TEMP_CURVE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return validCurveSet(parsed);
+  } catch (error) {
+    return null;
+  }
+}
+
+function backupTempCurves() {
+  // 只在从「正常曲线」切到极端档时备份，免得把全 0／全 100 当成临时曲线
+  if (activeCurveMode === 'full' || activeCurveMode === 'off') return;
+  tempCurveBackup = currentCurveSet();
+  try {
+    window.localStorage.setItem(TEMP_CURVE_STORAGE_KEY, JSON.stringify(tempCurveBackup));
+  } catch (error) { /* 本地存储不可用时只留内存 */ }
+}
+
+function setCurveMode(mode) {
+  activeCurveMode = mode || 'temp';
+  fanOffMode = activeCurveMode === 'off';
+  renderCurveModeStates();
+}
+
+function renderCurveModeStates() {
+  document.querySelectorAll('[data-curve-mode]').forEach((button) => {
+    const active = button.dataset.curveMode === activeCurveMode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const button = $(`curve-custom-${slot}`);
+    if (!button) continue;
+    const active = activeCurveMode === `slot-${slot}`;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
+const CURVE_MODE_FIELDS = { hdd: 'hdd_curve', nvme: 'nvme_curve', cpu: 'curve' };
+
+// 用后端配置反推当前属于哪一档：关停 → 预设 → 全速 → 手动（三条都同一恒定值）→ 其余按临时算
+function detectCurveMode(fan = {}) {
+  if (fan.off_mode) return 'off';
+  const samePoints = (curve, rows) => Array.isArray(curve) && curve.length === rows.length
+    && curve.every((point, index) => Math.round(Number(point.temp_c)) === rows[index][0]
+      && Math.round(Number(point.pwm_percent)) === rows[index][1]);
+  for (const mode of CURVE_PRESET_ORDER) {
+    const preset = CURVE_PRESETS[mode].points();
+    if (CURVE_KINDS.every((kind) => samePoints(fan[CURVE_MODE_FIELDS[kind]], preset[kind]))) return mode;
+  }
+  const flatValue = (curve) => {
+    if (!Array.isArray(curve) || !curve.length) return null;
+    const first = Math.round(Number(curve[0].pwm_percent));
+    if (!Number.isFinite(first)) return null;
+    return curve.every((point) => Math.round(Number(point.pwm_percent)) === first) ? first : null;
+  };
+  const flat = CURVE_KINDS.map((kind) => flatValue(fan[CURVE_MODE_FIELDS[kind]]));
+  if (flat.every((value) => value === 100)) return 'full';
+  // 三条曲线都是同一个恒定百分比（且不是 0／100）＝手动档
+  if (flat.every((value) => value !== null && value === flat[0]) && flat[0] > 0 && flat[0] < 100) return 'manual';
+  return 'temp';
+}
+
+// 把一套曲线填进三个编辑器：先切模式再收口，关停档的 0% 才不会被最低转速抬起来
+function applyCurveSetToEditors(curves) {
+  if (!curves) return;
+  CURVE_KINDS.forEach((kind) => {
+    if (!curves[kind]) return;
+    const editor = curveEditors[kind];
+    editor.curve = curves[kind].map((point) => ({ ...point }));
+    editor.selectedIndex = 0;
+    normalizeCurveToControls(kind);
+  });
+}
+
+// 平线：保留温度节点，只把所有转速改成同一个百分比
+function flatCurveSet(percent) {
+  const curves = currentCurveSet();
+  CURVE_KINDS.forEach((kind) => {
+    curves[kind] = curves[kind].map((point) => ({ temp_c: point.temp_c, pwm_percent: percent }));
+  });
+  return curves;
+}
+
+function curvePresetPoints(mode, kind) {
+  const preset = CURVE_PRESETS[mode];
+  if (!preset) return null;
+  const rows = preset.points()[kind];
+  return Array.isArray(rows) ? rows.map(([temp_c, pwm_percent]) => ({ temp_c, pwm_percent })) : null;
+}
+
+// 模式弹窗统一出口：主按钮只改界面，副按钮改完顺手下发保存
+async function applyModeCurves(mode, curves, doneMessage) {
+  setCurveMode(mode);
+  applyCurveSetToEditors(curves);
+  if (doneMessage) showMessage(doneMessage, false, 'message-fan');
+}
+
+// 静音 / 平衡 / 性能：三档系统参数，应用并保存一体
+async function applyCurvePreset(mode) {
+  const preset = CURVE_PRESETS[mode];
+  if (!preset) return;
+  const curves = {};
+  for (const kind of CURVE_KINDS) {
+    const points = curvePresetPoints(mode, kind);
+    if (!points) return;
+    curves[kind] = points;
+  }
+  const result = await showAppConfirm({
+    title: `应用「${preset.label}」曲线`,
+    message: `会用「${preset.label}」的节点替换三条曲线的全部节点，界面上还没保存的手动调整也会被覆盖。`,
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  backupTempCurves();
+  await applyModeCurves(mode, curves, `已应用「${preset.label}」曲线（${preset.summary}）。`);
+  if (result.secondary) await saveFanConfig();
+}
+
+// 全速：三条曲线全部 100%
+async function applyFullSpeed() {
+  const result = await showAppConfirm({
+    title: '全部风扇全速运转',
+    message: '三条曲线的全部节点会拉满到 100%，风扇立刻按最高转速运行；噪音与功耗都会明显上升。',
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  backupTempCurves();
+  await applyModeCurves('full', flatCurveSet(100), '已把三条曲线全部拉到 100%；风扇进入全速。');
+  if (result.secondary) await saveFanConfig();
+}
+
+// 恢复关停后回读权威服务端状态：只有服务端明确报告已退出关停档才返回 true。
+// 回读失败、响应损坏（request 已对坏 JSON 抛错）或 fan 段缺失/仍是关停档，
+// 一律按不确定处理——保留未知提示并停止后续压测启动。
+async function confirmFanOffModeReleased() {
+  const text = $('stress-status-text');
+  let status;
+  try {
+    status = await request('api/status');
+  } catch (error) {
+    if (text) {
+      text.textContent = `恢复结果未知：无法回读服务端状态（${error.message}），已取消压测启动。`;
+      text.className = 'message error';
+    }
+    return false;
+  }
+  const fan = status && status.fan_control;
+  // off_mode === true 时服务端明确上报关停；false/缺省即未处于关停档。
+  // 整个 fan_control 段缺失说明状态不可信，同样按不确定处理。
+  if (fan && typeof fan === 'object' && fan.off_mode !== true) return true;
+  if (text) {
+    text.textContent = '恢复结果未知：服务端仍报告风扇处于关停档，已取消压测启动。';
+    text.className = 'message error';
+  }
+  return false;
+}
+
+// 恢复关停前记录的三条曲线并保存：压测拦截与再次点击「关停」共用这一条路。
+// 后端 5 分钟到期自动起转后，本地快照仍可用来恢复。
+async function restoreFanOffState({ skipConfirm = false } = {}) {
+  if (!skipConfirm) {
+    const result = await showAppConfirm({
+      title: '恢复原选定曲线',
+      message: '解除关停档，按关停前记下的三条曲线恢复并保存，风扇会立刻重新起转。',
+      confirmText: '恢复并保存',
+    });
+    if (!result) return false;
+  }
+  const fallback = clamp(Number($('fan-min').value) || DEFAULT_MIN_PWM_PERCENT, 30, 100);
+  const curves = tempCurveBackup || offModeCurveBackup || flatCurveSet(fallback);
+  await applyModeCurves('temp', curves, '已恢复关停前的曲线，正在下发起转…');
+  return saveFanConfig();
+}
+
+// 关停：全部 0%，优先级高于最低转速。第二次确认只留一个红色动作——
+// 关停必须落盘才算数，去掉「只改界面不保存」的主按钮，免得用户以为已经停了。
+// 关停档最长 5 分钟，后端到期自动恢复原曲线并起转；再次点击同一按钮也会
+// 直接退出关停、恢复原选定曲线。
+async function applyShutdown() {
+  if (fanOffMode) {
+    await restoreFanOffState();
+    return;
+  }
+  const first = await showAppConfirm({
+    title: '关停全部风扇',
+    message: '绑定风扇会立刻停转（0%），最低转速保护被绕过。温度会快速上升，只适合短时间检修或换盘；关停最长 5 分钟，到期自动恢复原选定曲线并起转。',
+    confirmText: '继续',
+    danger: true,
+  });
+  if (!first) return;
+  const second = await showAppConfirm({
+    title: '再确认一次：确定要关停风扇？',
+    message: '停转期间硬盘与 NVMe 温度会持续升高。关停最多持续 5 分钟，到期自动恢复原选定曲线并起转；此前的紧急温度兜底也不再生效，只会鸣响蜂鸣器报警——维修时请先断电并做好散热防护。',
+    hideConfirm: true,
+    secondaryText: '关停并保存风扇控制',
+    secondaryDanger: true,
+  });
+  if (!second || !second.secondary) return;
+  backupTempCurves();
+  await applyModeCurves('off', flatCurveSet(0), '已把三条曲线全部设为 0%，正在下发关停…');
+  await saveFanConfig();
+}
+
+// 手动：自己填一个百分比，三条曲线变成同值平线
+async function applyManualSpeed() {
+  const suggested = fanOffMode ? DEFAULT_MIN_PWM_PERCENT : fanMinimumPWM();
+  const result = await showAppConfirm({
+    title: '手动设定转速',
+    message: '填一个百分比，三条曲线的全部节点都会设成这个值。',
+    input: { label: '转速百分比（30–100）', value: String(suggested), placeholder: '例如 55', maxLength: 3 },
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  const raw = result.secondary ? String(result.value || suggested) : String(result);
+  const percent = Number(raw);
+  if (!Number.isFinite(percent) || percent < 30 || percent > 100) {
+    showMessage('转速百分比需在 30–100 之间。', true, 'message-fan');
+    return;
+  }
+  const value = Math.round(percent);
+  backupTempCurves();
+  await applyModeCurves('manual', flatCurveSet(value), `已把三条曲线全部设为 ${value}%。`);
+  if (result.secondary) await saveFanConfig();
+}
+
+// 临时：回到自己调的那版曲线
+async function applyTempMode() {
+  if (tempCurveBackup) {
+    const result = await showAppConfirm({
+      title: '回到临时曲线',
+      message: '会用进入全速／关停前记下的三条曲线覆盖编辑器。',
+      confirmText: '恢复',
+      secondaryText: '应用并保存风扇控制',
+    });
+    if (!result) return;
+    await applyModeCurves('temp', tempCurveBackup, '已恢复临时曲线。');
+    if (result.secondary) await saveFanConfig();
+    return;
+  }
+  const wasOff = fanOffMode;
+  await applyModeCurves('temp', null, '已切到「临时」：按当前曲线下发，点「保存风扇控制」生效。');
+  // 从关停回来又没有临时备份：把 0% 抬回最低转速，免得一保存就被校验拦下
+  if (wasOff) CURVE_KINDS.forEach(normalizeCurveToControls);
+}
+
+// ---- 自定义曲线按键（三个）：每个按键独立一套曲线 -------------------------
+// 数据结构：{ "1": { name, curves: {hdd,nvme,cpu} | null }, ... }
+// 存在本浏览器（localStorage）；导出成 JSON 可备份、换机搬用。
+// 点按键不直接载入，而是打开操作弹窗：应用 / 保存 / 导出 / 导入 / 改名 / 取消。
+const CURVE_SLOT_COUNT = 3;
+const CURVE_SLOT_STORAGE_KEY = 'tad-fan-curve-slots';
+const CURVE_SLOT_DEFAULT_NAMES = { 1: '自定义 1', 2: '自定义 2', 3: '自定义 3' };
+let curveSlots = loadCurveSlots();
+let curveSlotTarget = 0;
+
+function currentCurveSet() {
+  return {
+    hdd: curveFromInputs('hdd'),
+    nvme: curveFromInputs('nvme'),
+    cpu: curveFromInputs('cpu'),
+  };
+}
+
+// 槽位内容按当前三条曲线的形状校验：任一档不是 2–8 个合法节点就整槽作废，
+// 免得坏数据在载入时把曲线编辑器搞崩。
+function validCurveSet(curves) {
+  if (!curves || typeof curves !== 'object') return null;
+  const result = {};
+  for (const kind of CURVE_KINDS) {
+    const points = curves[kind];
+    if (!Array.isArray(points) || points.length < CURVE_MIN_POINTS || points.length > CURVE_MAX_POINTS) return null;
+    const parsed = [];
+    for (const point of points) {
+      const temp = Number(point?.temp_c);
+      const pwm = Number(point?.pwm_percent);
+      if (!Number.isFinite(temp) || !Number.isFinite(pwm)) return null;
+      parsed.push({ temp_c: temp, pwm_percent: pwm });
+    }
+    result[kind] = parsed;
+  }
+  return result;
+}
+
+function curveSlotKey(slot) {
+  return String(slot);
+}
+
+// 只有存了曲线的按键才算「已保存」；只改过名的空按键不算。
+function curveSlotEntry(slot) {
+  const record = curveSlots[curveSlotKey(slot)];
+  return record && record.curves ? record : null;
+}
+
+function curveSlotRecord(slot) {
+  return curveSlots[curveSlotKey(slot)] || null;
+}
+
+function curveSlotName(slot) {
+  const record = curveSlotRecord(slot);
+  return (record && record.name) || CURVE_SLOT_DEFAULT_NAMES[slot];
+}
+
+// 旧版本只存了三条曲线本身（没有 name 字段），读进来时补默认名。
+function normalizeSlotRecord(item, slot) {
+  if (!item || typeof item !== 'object') return null;
+  const defaultName = CURVE_SLOT_DEFAULT_NAMES[slot];
+  const rawName = typeof item.name === 'string' ? item.name.trim() : '';
+  const name = rawName || defaultName;
+  const legacyCurves = (item.hdd || item.nvme || item.cpu) ? item : null;
+  const curves = validCurveSet(item.curves && typeof item.curves === 'object' ? item.curves : legacyCurves);
+  // 名字是默认名、又没有曲线 → 当空按键，不必占位
+  if (!curves && name === defaultName) return null;
+  return { name, curves: curves || null };
+}
+
+function loadCurveSlots() {
+  const slots = {};
+  try {
+    const raw = window.localStorage.getItem(CURVE_SLOT_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && typeof parsed === 'object') {
+      for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+        const record = normalizeSlotRecord(parsed[String(slot)], slot);
+        if (record) slots[String(slot)] = record;
+      }
+    }
+  } catch (error) { /* 解析失败＝当作三个空按键 */ }
+  return slots;
+}
+
+function persistCurveSlots() {
+  try {
+    window.localStorage.setItem(CURVE_SLOT_STORAGE_KEY, JSON.stringify(curveSlots));
+  } catch (error) {
+    showMessage('浏览器本地存储不可用（隐私模式？），自定义曲线只在本次会话有效。', true, 'message-fan');
+  }
+}
+
+function renderCurveSlotStates() {
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const button = $(`curve-custom-${slot}`);
+    if (!button) continue;
+    const filled = Boolean(curveSlotEntry(slot));
+    button.textContent = curveSlotName(slot);
+    // 已保存曲线的按键不加描边/变色：按键只显示名字，有没有内容看弹窗里的说明
+    button.title = filled
+      ? `打开「${curveSlotName(slot)}」的操作弹窗（已保存曲线）`
+      : `「${curveSlotName(slot)}」还是空的：点开后可把当前曲线保存进来，或导入 JSON`;
+  }
+}
+
+const CURVE_KIND_LABELS = { hdd: 'HDD/SATA', nvme: 'NVMe', cpu: 'CPU' };
+
+function curveSlotSummary(curves) {
+  return CURVE_KINDS
+    .map((kind) => `${CURVE_KIND_LABELS[kind]} ${curves[kind].length} 点`)
+    .join(' · ');
+}
+
+function openCurveSlotDialog(slot) {
+  if (!slot) return;
+  curveSlotTarget = slot;
+  const entry = curveSlotEntry(slot);
+  const name = curveSlotName(slot);
+  $('curve-slot-title').textContent = name;
+  $('curve-slot-summary').textContent = entry
+    ? `已保存三条曲线：${curveSlotSummary(entry.curves)}。`
+    : '这个按键还是空的：可以「保存」当前曲线进来，也可以「导入」一个 JSON 文件。';
+  $('curve-slot-apply').disabled = !entry;
+  $('curve-slot-apply-save').disabled = !entry;
+  $('curve-slot-export').disabled = !entry;
+  $('curve-slot-modal').hidden = false;
+  requestAnimationFrame(() => { $('curve-slot-apply').focus(); });
+}
+
+function closeCurveSlotDialog() {
+  curveSlotTarget = 0;
+  const modal = $('curve-slot-modal');
+  if (modal) modal.hidden = true;
+}
+
+// 应用：把按键里的曲线填进编辑器（不动硬件，仍需「保存风扇控制」）
+async function applyCurveSlot(slot) {
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可应用的曲线。`, true, 'message-fan');
+    return;
+  }
+  const name = curveSlotName(slot);
+  const result = await showAppConfirm({
+    title: `应用「${name}」`,
+    message: '会用这个按键保存的三条曲线替换编辑器里的节点，界面上还没保存的手动调整也会被覆盖。',
+    confirmText: '应用到曲线',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  closeCurveSlotDialog();
+  backupTempCurves();
+  await applyModeCurves(`slot-${slot}`, entry.curves, `已把「${name}」的曲线填进编辑器；点「保存风扇控制」后生效。`);
+  if (result.secondary) await saveFanConfig();
+}
+
+// 应用并保存：按键里的曲线填进编辑器后立刻下发，不用再回主界面点保存
+async function applyCurveSlotAndSave(slot) {
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可应用的曲线。`, true, 'message-fan');
+    return;
+  }
+  const name = curveSlotName(slot);
+  closeCurveSlotDialog();
+  backupTempCurves();
+  await applyModeCurves(`slot-${slot}`, entry.curves, `已应用「${name}」的曲线。`);
+  await saveFanConfig();
+}
+
+// 保存：用当前三条曲线覆盖按键
+async function saveCurveSlot(slot) {
+  const name = curveSlotName(slot);
+  const existed = Boolean(curveSlotEntry(slot));
+  const ok = await showAppConfirm({
+    title: existed ? `覆盖「${name}」` : `保存到「${name}」`,
+    message: existed
+      ? '这个按键里已经有曲线了，保存会用当前三条曲线覆盖它（按键名字不变）。'
+      : '会把当前三条曲线（含界面上还没保存的调整）存进这个按键，之后可以随时「应用到曲线」回来。',
+    confirmText: existed ? '覆盖保存' : '保存',
+  });
+  if (!ok) return;
+  curveSlots[curveSlotKey(slot)] = { name, curves: currentCurveSet() };
+  persistCurveSlots();
+  renderCurveSlotStates();
+  closeCurveSlotDialog();
+  showMessage(`当前三条曲线已存入「${name}」；点「保存风扇控制」后这套曲线才真正生效。`, false, 'message-fan');
+}
+
+// ---- 曲线参数导出 / 导入 ---------------------------------------------------
+// 导出文件格式（version 2）：
+// { app, kind:'fan-curve-slots', slots:[{ slot, name, curves:{hdd,nvme,cpu} }], ... }
+// 单键导出只是 slots 里只有一项；旧版单曲线文件（kind:'fan-curves'）也能导入。
+function curvePayloadHeader() {
+  return {
+    app: 'tad-module',
+    kind: 'fan-curve-slots',
+    version: 2,
+    exported_at: new Date().toISOString(),
+    app_version: currentStatus?.version || '',
+    min_pwm_percent: Number($('fan-min').value),
+    emergency_temp_c: Number($('fan-emergency').value),
+    poll_seconds: Number($('fan-poll').value),
+  };
+}
+
+function downloadCurveSlots(slots, filePrefix, doneMessage) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const payload = Object.assign(curvePayloadHeader(), { slots });
+  const text = JSON.stringify(payload, null, 2);
+  const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `${filePrefix}-${stamp}.json`;
+  link.rel = 'noopener';
+  document.body.append(link);
+  link.click();
+  link.remove();
+  // 立刻 revoke 会让部分内置浏览器拿到空文件，留几秒再回收
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+  showMessage(doneMessage, false, 'message-fan');
+}
+
+function exportCurveSlot(slot) {
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可导出的曲线。`, true, 'message-fan');
+    return;
+  }
+  downloadCurveSlots(
+    [{ slot, name: entry.name, curves: entry.curves }],
+    `tad-fan-curve-custom-${slot}`,
+    `「${entry.name}」的曲线参数已导出为 JSON 文件。`,
+  );
+}
+
+// 已保存曲线的按键（导出、批量时用；空按键不算）
+function savedCurveSlots() {
+  const slots = [];
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const entry = curveSlotEntry(slot);
+    if (entry) slots.push({ slot, name: entry.name, curves: entry.curves });
+  }
+  return slots;
+}
+
+function parseCurveSlotFile(text) {
+  let data = null;
+  try { data = JSON.parse(text); } catch (error) { return { error: '不是合法的 JSON 文件。' }; }
+  if (!data || typeof data !== 'object') return { error: '文件里没有曲线参数。' };
+  if (Array.isArray(data.slots) && data.slots.length) {
+    const first = data.slots[0];
+    const curves = validCurveSet(first && first.curves);
+    if (!curves) return { error: '文件里的曲线节点不合法：每条曲线要 2–8 个点，温度递增、转速不递减。' };
+    const name = typeof first.name === 'string' ? first.name.trim() : '';
+    return { curves, name, count: data.slots.length };
+  }
+  // 兼容旧版：{ kind:'fan-curves', curves:{...} } 或直接就是三条曲线
+  const curves = validCurveSet(data.curves && typeof data.curves === 'object' ? data.curves : data);
+  if (!curves) return { error: '文件里没有可识别的曲线：每条曲线要 2–8 个点，温度递增、转速不递减。' };
+  return { curves, name: '', count: 1 };
+}
+
+async function importCurveSlotFile(slot, file) {
+  if (!slot || !file) return;
+  let text = '';
+  try {
+    text = await file.text();
+  } catch (error) {
+    showMessage(`读取文件失败：${error.message}`, true, 'message-fan');
+    return;
+  }
+  const parsed = parseCurveSlotFile(text);
+  if (parsed.error) {
+    showMessage(parsed.error, true, 'message-fan');
+    return;
+  }
+  const name = parsed.name || curveSlotName(slot);
+  const extra = parsed.count > 1 ? `\n文件里有 ${parsed.count} 个按键，只导入第一个。` : '';
+  const ok = await showAppConfirm({
+    title: `导入到「${curveSlotName(slot)}」`,
+    message: `会用文件里的三条曲线覆盖这个按键${parsed.name ? `，并把按键改名为「${parsed.name}」` : '（按键名字不变）'}。${extra}`,
+    confirmText: '导入',
+  });
+  if (!ok) return;
+  curveSlots[curveSlotKey(slot)] = { name, curves: parsed.curves };
+  persistCurveSlots();
+  renderCurveSlotStates();
+  closeCurveSlotDialog();
+  showMessage(`已把文件里的曲线导入「${name}」；点这个按键「应用到曲线」可填进编辑器，再点「保存风扇控制」才会下发。`, false, 'message-fan');
+}
+
+async function renameCurveSlot(slot) {
+  const current = curveSlotName(slot);
+  const value = await showAppConfirm({
+    title: '给自定义按键改名',
+    message: `当前名字：${current}。改名只影响显示和导出文件里的名字，不动曲线内容。`,
+    input: {
+      label: '新名字（最多 16 个字）',
+      value: current === CURVE_SLOT_DEFAULT_NAMES[slot] ? '' : current,
+      placeholder: CURVE_SLOT_DEFAULT_NAMES[slot],
+      maxLength: 16,
+    },
+    confirmText: '改名',
+  });
+  if (value === null || value === undefined) return;
+  // 留空不报错：直接退回这个按键的默认名（自定义 1/2/3），符合「清空即复位」的直觉
+  const fallback = CURVE_SLOT_DEFAULT_NAMES[slot];
+  const name = String(value).trim() || fallback;
+  const key = curveSlotKey(slot);
+  const record = curveSlotRecord(slot);
+  if (record) {
+    record.name = name;
+  } else if (name !== fallback) {
+    curveSlots[key] = { name, curves: null };
+  }
+  persistCurveSlots();
+  renderCurveSlotStates();
+  $('curve-slot-title').textContent = name;
+  showMessage(name === fallback
+    ? `没有填写内容，按键已恢复默认名「${name}」。`
+    : `按键已改名为「${name}」。`, false, 'message-fan');
+}
+
+function setupCurvePresets() {
+  tempCurveBackup = loadTempCurveBackup();
+  document.querySelectorAll('[data-curve-mode]').forEach((button) => {
+    const mode = button.dataset.curveMode;
+    button.addEventListener('click', () => {
+      if (mode === 'quiet' || mode === 'balanced' || mode === 'performance') {
+        applyCurvePreset(mode);
+      } else if (mode === 'full') {
+        applyFullSpeed();
+      } else if (mode === 'off') {
+        applyShutdown();
+      } else if (mode === 'manual') {
+        applyManualSpeed();
+      } else {
+        applyTempMode();
+      }
+    });
+  });
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const loadButton = $(`curve-custom-${slot}`);
+    if (loadButton) loadButton.addEventListener('click', () => openCurveSlotDialog(slot));
+  }
+  $('curve-slot-apply').addEventListener('click', () => applyCurveSlot(curveSlotTarget));
+  $('curve-slot-apply-save').addEventListener('click', () => applyCurveSlotAndSave(curveSlotTarget));
+  $('curve-slot-save').addEventListener('click', () => saveCurveSlot(curveSlotTarget));
+  $('curve-slot-export').addEventListener('click', () => exportCurveSlot(curveSlotTarget));
+  $('curve-slot-rename').addEventListener('click', () => renameCurveSlot(curveSlotTarget));
+  $('curve-slot-import').addEventListener('click', () => $('curve-slot-file').click());
+  $('curve-slot-file').addEventListener('change', (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    importCurveSlotFile(curveSlotTarget, file);
+  });
+  document.querySelectorAll('[data-curve-slot-close]').forEach((element) => {
+    element.addEventListener('click', closeCurveSlotDialog);
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('curve-slot-modal').hidden) closeCurveSlotDialog();
+  });
+  renderCurveSlotStates();
+  renderCurveModeStates();
 }
 
 function svgElement(name, attributes = {}, text = '') {
@@ -1330,9 +4870,9 @@ function renderFanChart(kind = 'cpu') {
 // 父类分组：勾选父类 = 整组曲线显隐；▾ 弹窗勾选组内子类（CPU/SATA/NVMe 弹窗
 // 内含“取最高”聚合项）。
 const HISTORY_GROUPS = [
-  { key: 'cpu', label: 'CPU', color: '#3f6ff5', aggregateLabel: '取最高（核心最高）' },
-  { key: 'sata', label: 'SATA', color: '#18a779', aggregateLabel: 'SATA 取最高' },
-  { key: 'nvme', label: 'NVMe', color: '#a25bd7', aggregateLabel: 'NVMe 取最高' },
+  { key: 'cpu', label: 'CPU', color: '#3f6ff5', aggregateLabel: 'CPU最高' },
+  { key: 'sata', label: 'SATA', color: '#18a779', aggregateLabel: 'SATA最高' },
+  { key: 'nvme', label: 'NVMe', color: '#a25bd7', aggregateLabel: 'NVMe最高' },
   { key: 'gpu', label: 'GPU', color: '#e05252' },
   { key: 'nic', label: '网卡', color: '#e6a53c' },
   { key: 'other', label: '其它', color: '#2aa8a8' },
@@ -1391,11 +4931,11 @@ let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
 
 let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关；未记录的组走默认（见 defaultHistoryGroupEnabled）
-// 历史曲线显隐默认（用户确认）：CPU/SATA/NVMe 只画"取最高"聚合线、风扇组
-// 全画；GPU/网卡/其它默认不画，进图例弹窗按需开——一张图不再默认铺满
-// 全部核心与单盘明细曲线。
+// 历史曲线显隐默认（用户确认）：七个父类默认全开；CPU/SATA/NVMe 只画「最高」
+// 聚合线，GPU 全画，网卡与「其它」默认只画最关心的两个传感器（见下面的
+// defaultHistoryChildSelection）——一张图不被几十条明细曲线铺满。
 function defaultHistoryGroupEnabled(groupKey) {
-  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' || groupKey === 'fan';
+  return HISTORY_GROUPS.some((group) => group.key === groupKey);
 }
 // 只读访问器（渲染与测试用）：直接写 historySeriesEnabled 的路径集中在 setHistoryGroupEnabled。
 function historySeriesEnabledFor(groupKey) {
@@ -1403,6 +4943,42 @@ function historySeriesEnabledFor(groupKey) {
   return value === undefined ? defaultHistoryGroupEnabled(groupKey) : value;
 }
 let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
+
+// 默认勾选改版（v2）：CPU/SATA/NVMe 改名「…最高」、GPU/网卡/其它默认打开。
+// 老浏览器里存着上一版偏好（只开 CPU/SATA/NVMe、其它组不画），不清掉就永远
+// 看不到新默认，所以按版本号一次性清空显隐与组内勾选，并把新默认推回后端。
+const HISTORY_DEFAULTS_VERSION = 2;
+const HISTORY_DEFAULTS_VERSION_KEY = 'tad-history-defaults-version';
+let historyDefaultsMigrated = false;
+
+function migrateHistoryDefaults() {
+  let stored = 0;
+  let hadLocalPrefs = false;
+  try {
+    stored = Number(window.localStorage.getItem(HISTORY_DEFAULTS_VERSION_KEY)) || 0;
+    hadLocalPrefs = Boolean(
+      window.localStorage.getItem('tad-history-series')
+      || window.localStorage.getItem('tad-history-children')
+      || window.localStorage.getItem('tad-history-disks'),
+    );
+  } catch (error) {
+    stored = 0;
+  }
+  if (stored >= HISTORY_DEFAULTS_VERSION) return false;
+  try { window.localStorage.setItem(HISTORY_DEFAULTS_VERSION_KEY, String(HISTORY_DEFAULTS_VERSION)); }
+  catch (error) { /* 隐私模式下写不进去：本会话仍按新默认画 */ }
+  // 全新浏览器没有旧偏好要清，直接记版本号：让服务端 ui_prefs 照常采纳，
+  // 换设备看到的仍是账号里的勾选。
+  if (!hadLocalPrefs) return false;
+  historySeriesEnabled = {};
+  historyChildSelection = {};
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  historyDefaultsMigrated = true;
+  return true;
+}
+
+migrateHistoryDefaults();
 
 // ---- 窗口式回看（30 分钟–24 小时各档，监控录像机式拖动窗口）----
 // 横轴永远只显示所选档位的时间跨度（窗口），背后拉取约 8 倍跨度的数据，
@@ -1587,11 +5163,20 @@ function historyRangeLabel(hours) {
   return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
 }
 
-// 组内默认（用户确认）：CPU/SATA/NVMe 只勾"取最高"聚合项（__agg__），
-// 其余组（风扇/GPU/网卡/其它）null=全部显示。未记录（新设备/清缓存）时生效；
-// 显式记录（含关组清空的空集合）优先于默认。
+// 组内默认（用户确认）：CPU/SATA/NVMe 只勾「最高」聚合项（__agg__）；
+// GPU 全部显示（null）；网卡默认两条业务口/光模块；「其它」默认主板与 PCB 温度。
+// 未记录的组（新设备/清缓存/默认版本升级）走这里，显式记录优先。
+const HISTORY_DEFAULT_CHILDREN = {
+  cpu: ['__agg__'],
+  sata: ['__agg__'],
+  nvme: ['__agg__'],
+  nic: ['mlx5:sensor0', 'mlx5:Module1'],
+  other: ['spd5118:temp1', 'it8613:temp2'],
+};
+
 function defaultHistoryChildSelection(groupKey) {
-  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' ? new Set(['__agg__']) : null;
+  const ids = HISTORY_DEFAULT_CHILDREN[groupKey];
+  return ids ? new Set(ids) : null;
 }
 
 function historyChildSelectionFor(groupKey) {
@@ -1599,6 +5184,18 @@ function historyChildSelectionFor(groupKey) {
   if (stored === undefined) return defaultHistoryChildSelection(groupKey);
   if (stored === null) return null; // 显式"全部显示"
   return stored instanceof Set ? stored : new Set(stored); // 统一为 Set，调用方用 has()
+}
+
+// 生效的勾选：走默认值、而默认键在这台机器上一条都不存在时（换了网卡、
+// 没插光模块），退回「全部显示」——否则整组默认空着，看起来像坏了。
+// 用户自己勾过的组不猜（哪怕勾成空集合也是他的选择）。
+function historyEffectiveSelection(groupKey, childIDs) {
+  const selection = historyChildSelectionFor(groupKey);
+  if (selection === null) return null;
+  if (historyChildSelection[groupKey] === undefined && !childIDs.some((id) => selection.has(id))) {
+    return null;
+  }
+  return selection;
 }
 
 function setHistoryChildSelection(groupKey, selection) {
@@ -1763,10 +5360,11 @@ function historyTickLabel(ts, stepSeconds) {
 }
 
 // 单系列转点集：value 缺失（0/NaN，休眠或空置）的点直接剔除。
-function historySeriesPoints(samples, pick) {
+// 风扇组例外：0% 是关停档的正常读数，当成缺失会让线在停转那一刻断掉（整段 0 干脆没了）。
+function historySeriesPoints(samples, pick, allowZero = false) {
   return samples.filter((sample) => {
     const value = pick(sample);
-    return Number.isFinite(value) && value > 0;
+    return Number.isFinite(value) && (allowZero ? value >= 0 : value > 0);
   }).map((sample) => ({ ts: sample.ts, value: pick(sample) }));
 }
 
@@ -1782,6 +5380,7 @@ function historyDiskIDs(samples) {
 }
 
 // 有过 rpm>0 或 pwm>0 的才算有效风扇（没接风扇的空通道全 0，排除）。
+// 整段都在关停档时所有通道都是 0：这时退回全部通道，否则「风扇」组一条线都画不出来。
 function historyFanIDs(samples) {
   const fanIDs = [];
   const hasSignal = {};
@@ -1790,7 +5389,8 @@ function historyFanIDs(samples) {
     if (!fanIDs.includes(fan.id)) fanIDs.push(fan.id);
     if (fan.rpm > 0 || fan.pwm_percent > 0) hasSignal[fan.id] = true;
   }));
-  return fanIDs.filter((id) => hasSignal[id]);
+  const signaled = fanIDs.filter((id) => hasSignal[id]);
+  return signaled.length ? signaled : fanIDs;
 }
 
 function historySensorsOfGroup(samples, group) {
@@ -1881,12 +5481,16 @@ function historyChildColor(groupKey, childID, allIDs) {
 function historyGroupSeries(groupKey, samples, intervalSeconds) {
   const windowed = historyIsWindowed(historyRangeHours);
   const childIDs = historyGroupChildIDs(groupKey, samples);
-  const selection = historyChildSelectionFor(groupKey);
+  const selection = historyEffectiveSelection(groupKey, childIDs);
   const visible = (childID) => selection === null || selection.has(childID);
   return childIDs
     .filter((childID) => visible(childID))
     .map((childID) => {
-      const points = historySeriesPoints(samples, (sample) => historyChildValue(groupKey, childID, sample));
+      const points = historySeriesPoints(
+        samples,
+        (sample) => historyChildValue(groupKey, childID, sample),
+        groupKey === 'fan',
+      );
       return {
         id: `${groupKey}:${childID}`,
         color: historyChildColor(groupKey, childID, childIDs),
@@ -2012,9 +5616,7 @@ function renderHistoryChart() {
   renderHistoryLegend();
   renderHistoryScrubBar(scrub, win);
 
-  if (status) {
-    status.textContent = `已记录 ${samples.length} 个采样点 · 更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
-  }
+  if (status) status.textContent = '';
   // 自动刷新重绘会清掉十字线；若鼠标仍悬停在图上，按原位置恢复
   if (historyLastCursorEvent && !$('history-tooltip')?.hidden) showHistoryCursor(historyLastCursorEvent);
 }
@@ -2117,7 +5719,7 @@ function closeHistoryPopovers() {
 
 function fillHistoryPopover(groupKey, popover) {
   const childIDs = historyGroupChildIDs(groupKey, historyRangedSamples);
-  const selection = historyChildSelectionFor(groupKey);
+  const selection = historyEffectiveSelection(groupKey, childIDs);
   const visible = (childID) => selection === null || selection.has(childID);
   popover.replaceChildren();
   if (!childIDs.length) {
@@ -2134,9 +5736,10 @@ function fillHistoryPopover(groupKey, popover) {
     box.type = 'checkbox';
     box.checked = visible(childID);
     box.addEventListener('change', () => {
-      const current = historyChildSelectionFor(groupKey) === null
-        ? new Set(historyGroupChildIDs(groupKey, historyRangedSamples))
-        : new Set(historyChildSelectionFor(groupKey));
+      // 起点必须是「当前屏幕上看到的勾选」（可能来自默认值兜底出的全部），
+      // 否则先取消一条时会把默认那两条又当成全集，勾出反直觉的结果。
+      const effective = historyEffectiveSelection(groupKey, childIDs);
+      const current = effective === null ? new Set(childIDs) : new Set(effective);
       if (box.checked) current.add(childID);
       else current.delete(childID);
       setHistoryChildSelection(groupKey, current);
@@ -2179,20 +5782,12 @@ async function fetchHistory(force = false) {
 
 // 把当前 historyRangeHours 同步到滑杆与按钮：固定挡位停在吸附位中心，
 // 动一下滑杆（input/change）就回到滑杆值。
-// 值标签跟随拇指：把滑杆位置百分比写入 CSS 变量（夹在 6%–94%，标签居中
-// 对准拇指且不出容器）。
-function syncRunLogThumbPct(slider) {
-  const max = Number(slider.max) || 1;
-  const pct = clamp((Number(slider.value) / max) * 100, 6, 94);
-  slider.parentElement.style.setProperty('--thumb-pct', `${pct}%`);
-}
-
+// 值标签固定在滑杆正中（CSS 里写死 left:50%），不跟拇指跑。
 function syncHistoryRangeUI() {
   const slider = $('history-range-slider');
   if (slider) {
     slider.value = String(historyHoursToPos(historyRangeHours));
     slider.setAttribute('aria-valuetext', historyRangeLabel(historyRangeHours));
-    syncRunLogThumbPct(slider);
   }
   const label = $('history-range-value');
   if (label) label.textContent = historyRangeLabel(historyRangeHours);
@@ -2220,6 +5815,12 @@ let historySeriesAdopted = false;
 function applyBackendHistorySeries(prefs) {
   if (historySeriesAdopted) return;
   historySeriesAdopted = true;
+  if (historyDefaultsMigrated) {
+    // 本地刚升到新默认：把空显隐推回后端（服务端旧勾选不能覆盖回来）
+    historyLegendIdentity = '';
+    saveUIPrefsQuietly();
+    return;
+  }
   const series = prefs?.history_series;
   const children = prefs?.history_children;
   if (!series && !children) return;
@@ -2282,7 +5883,6 @@ function setupHistoryPanel() {
       const hours = historyPosToHours(parseFloat(slider.value));
       const label = $('history-range-value');
       if (label) label.textContent = historyRangeLabel(hours);
-      syncRunLogThumbPct(slider);
     });
     slider.addEventListener('change', () => setHistoryRange(historyPosToHours(parseFloat(slider.value))));
   }
@@ -2322,8 +5922,8 @@ function historyCursorRows(sample) {
   const rows = [];
   HISTORY_GROUPS.forEach((group) => {
     if (!historySeriesEnabledFor(group.key)) return;
-    const selection = historyChildSelectionFor(group.key);
     const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
+    const selection = historyEffectiveSelection(group.key, childIDs);
     childIDs.forEach((childID) => {
       if (!(selection === null || selection.has(childID))) return;
       const value = historyChildValue(group.key, childID, sample);
@@ -2559,9 +6159,11 @@ function populateFanDevices(status, keepInputs) {
   });
   if (!keepInputs || rebuild) {
     Object.values(FAN_CURVE_GROUPS).forEach((group) => {
-      const configured = Array.isArray(config[group.configField])
+      // 默认绑定所有风扇：配置里没有（新装、或从没动过）时三条曲线都全选，
+      // 用户手动取消过某几个就照配置来。
+      const configured = Array.isArray(config[group.configField]) && config[group.configField].length
         ? config[group.configField]
-        : (config.device_id ? [config.device_id] : (fans.length === 1 ? [fans[0].id] : []));
+        : fans.map((fan) => fan.id);
       const selected = new Set(configured);
       $(group.containerID).querySelectorAll('input').forEach((input) => { input.checked = selected.has(input.value); });
     });
@@ -2576,7 +6178,7 @@ function selectedCurveFanIDs(kind) {
 
 function fillFanInputs(fan = {}) {
   $('fan-enabled').checked = Boolean(fan.enabled);
-  $('fan-min').value = fan.min_pwm_percent ?? 60;
+  $('fan-min').value = fan.min_pwm_percent ?? DEFAULT_MIN_PWM_PERCENT;
   $('fan-emergency').value = fan.emergency_temp_c ?? 85;
   $('fan-poll').value = fan.poll_seconds ?? 2;
   const fillCurve = (kind, curve, fallback) => {
@@ -2591,6 +6193,13 @@ function fillFanInputs(fan = {}) {
   fillCurve('hdd', fan.hdd_curve || fan.disk_curve, DEFAULT_STORAGE_CURVE);
   fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
   fillFanSlotSelections(fan);
+  // 后端留的关停前曲线快照：本地临时曲线缺失时，再次点击「关停」用它恢复
+  const offBackup = fan.off_mode_backup;
+  offModeCurveBackup = offBackup
+    ? validCurveSet({ hdd: offBackup.hdd_curve, nvme: offBackup.nvme_curve, cpu: offBackup.curve })
+    : null;
+  // 打开页面时按配置反推当前选中的曲线模式（关停／预设／全速／临时）
+  setCurveMode(detectCurveMode(fan));
 }
 
 function fillHistoryInputs(history = {}) {
@@ -2674,7 +6283,12 @@ $('history-clear').addEventListener('click', async () => {
     : flushed
       ? '长期记录的缓冲已补归档。清空数据库将删除全部在线历史采样，且无法恢复。确定清空？'
       : '清空数据库将删除全部历史采样，且无法恢复。确定清空？';
-  const confirmed = window.confirm(message);
+  const confirmed = await showAppConfirm({
+    title: '清空历史数据库',
+    message,
+    confirmText: '清空数据库',
+    danger: true,
+  });
   if (!confirmed) {
     setBusy(false);
     return; // 取消：补冲刷已生效（或已尝试），在线数据原样保留
@@ -2729,7 +6343,13 @@ $('runlog-export').addEventListener('click', () => {
 });
 
 $('runlog-clear').addEventListener('click', async () => {
-  if (!window.confirm('清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？')) return;
+  const ok = await showAppConfirm({
+    title: '清空运行日志',
+    message: '清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？',
+    confirmText: '清空日志',
+    danger: true,
+  });
+  if (!ok) return;
   setBusy(true);
   try {
     await request('api/log/clear', { method: 'POST', body: '{}' });
@@ -3258,13 +6878,16 @@ function render(status, keepInputs = false) {
   $('last-error').className = diagnosticError ? 'diagnostic-error' : 'diagnostic-ok';
   renderDiagnostics(status, fanStatus);
   renderStorageVisual(storageStatus);
+  renderStorageMobile(storageStatus);
   renderStorageTable(storageStatus);
   renderFanSlotTemperatures(storageStatus);
   renderFanHardwareWarning(fanStatus);
+  syncFanAlarmMute(fanStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
-    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
+    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '未检测到 GPIO 硬件接口。');
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
+  renderStorageNotifyStatus(status.storage_notify);
   const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
   const healthy = issues.length === 0;
   const healthMessage = healthy
@@ -3815,7 +7438,10 @@ async function refresh(keepInputs = false) {
 }
 
 function reportPanelValidity(panelID) {
-  const invalid = [...$(panelID).querySelectorAll('[required]')]
+  const controls = $(panelID).querySelectorAll('[required]');
+  // NodeList 才有数值 length；测试桩里拿到的是不可迭代的占位对象，按“没有必填项”处理
+  const list = controls && typeof controls.length === 'number' ? Array.from(controls) : [];
+  const invalid = list
     .find((control) => !control.disabled && !control.checkValidity());
   if (!invalid) return true;
   invalid.reportValidity();
@@ -3838,6 +7464,7 @@ function fanConfigFromInputs() {
     min_pwm_percent: Number($('fan-min').value),
     emergency_temp_c: Number($('fan-emergency').value),
     poll_seconds: Number($('fan-poll').value),
+    off_mode: fanOffMode,
     curve: cpuCurve,
     hdd_curve: hddCurve,
     nvme_curve: nvmeCurve,
@@ -3869,46 +7496,78 @@ $('save-global').addEventListener('click', async () => {
   }
 });
 
-$('save-fan').addEventListener('click', async () => {
-  if (!reportPanelValidity('panel-fan')) return;
+// 保存后该亮哪一档：先按落盘的曲线反推（手动拖节点会落回「临时」），但如果是
+// 刚从某个自定义按键「应用并保存」过来的、曲线还跟按键里一致，就保住那个按键的选中态。
+function curveModeAfterSave(config) {
+  const detected = detectCurveMode(config);
+  const match = /^slot-([1-9])$/.exec(activeCurveMode || '');
+  if (detected !== 'temp' || !match) return detected;
+  const entry = curveSlotEntry(Number(match[1]));
+  if (!entry) return detected;
+  const sameCurve = (left, right) => Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length
+    && left.every((point, index) => Math.round(Number(point.temp_c)) === Math.round(Number(right[index].temp_c))
+      && Math.round(Number(point.pwm_percent)) === Math.round(Number(right[index].pwm_percent)));
+  const same = CURVE_KINDS.every((kind) => sameCurve(config[CURVE_MODE_FIELDS[kind]], entry.curves[kind]));
+  return same ? activeCurveMode : detected;
+}
+
+// 保存并下发风扇控制：按钮与「应用并保存风扇控制」共用同一条路
+async function saveFanConfig() {
+  if (!reportPanelValidity('panel-fan')) return false;
   const config = fanConfigFromInputs();
   if (config.enabled && ![...config.cpu_fan_ids, ...config.hdd_fan_ids, ...config.nvme_fan_ids].length) {
     showMessage('启用风扇曲线前，至少需要为一条温度曲线选择风扇。', true, 'message-fan');
-    return;
+    return false;
   }
   const curves = [
-    ['CPU', config.curve],
     ['HDD/SATA', config.hdd_curve],
     ['NVMe', config.nvme_curve],
+    ['CPU', config.curve],
   ];
+  const pwmFloor = config.off_mode ? 0 : config.min_pwm_percent;
   for (const [label, curve] of curves) {
     if (curve.length < CURVE_MIN_POINTS || curve.length > CURVE_MAX_POINTS) {
       showMessage(`${label}曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true, 'message-fan');
-      return;
+      return false;
     }
-    if (curve.some((point, index) => point.pwm_percent < config.min_pwm_percent
+    if (curve.some((point, index) => point.pwm_percent < pwmFloor
         || (index > 0 && (point.temp_c <= curve[index - 1].temp_c || point.pwm_percent < curve[index - 1].pwm_percent)))) {
-      showMessage(`${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true, 'message-fan');
-      return;
+      showMessage(config.off_mode
+        ? `${label}曲线温度必须严格递增，转速不能随温度升高而下降。`
+        : `${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true, 'message-fan');
+      return false;
     }
     if (config.emergency_temp_c < curve[curve.length - 1].temp_c) {
       showMessage(`紧急满速温度不能低于最后一个${label}曲线节点。`, true, 'message-fan');
-      return;
+      return false;
     }
   }
   setBusy(true);
   try {
     render(await request('api/config/fan', { method: 'POST', body: JSON.stringify(config) }), true);
-    showMessage('风扇控制与三条温控曲线已保存并应用；其他配置未修改。', false, 'message-fan');
+    // 按刚落盘的配置反推选中档位：手动拖过节点会落回「临时」，关停／全速／预设各自对上
+    setCurveMode(curveModeAfterSave(config));
+    showMessage(config.off_mode
+      ? '风扇控制已保存：关停档生效，绑定风扇已停转。'
+      : '风扇控制与三条温控曲线已保存并应用；其他配置未修改。', false, 'message-fan');
+    return true;
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-fan');
+    return false;
   } finally {
     setBusy(false);
   }
-});
+}
+
+$('save-fan').addEventListener('click', () => { saveFanConfig(); });
 
 $('save-gpio').addEventListener('click', async () => {
   if (!commitGPIOScriptEditor()) return;
+  if (!commitBackupJobEditor()) return;
+  // 自动备份编辑器开着时，里面的草稿也要先落进 gpioAutos，否则保存后这条
+  // 规则凭空消失，用户还以为是保存成功了。
+  if (!commitAutoBackupEditor()) return;
   const config = gpioConfigFromInputs();
   setBusy(true);
   try {
@@ -3916,6 +7575,113 @@ $('save-gpio').addEventListener('click', async () => {
     showMessage('按钮控制配置已保存；全局和风扇配置未修改。', false, 'message-gpio');
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// 按键触发声光反馈开关：切换后立即落盘，不必再点「保存按钮控制」，
+// 否则用户以为拨了开关就生效，实际配置没存下去、按键照样滴滴滴。
+function updateGPIOFeedbackStatus() {
+  const target = $('gpio-feedback-status');
+  if (!target) return;
+  target.textContent = $('gpio-feedback').checked
+    ? '开启后通过按键触发动作会滴滴滴响 3 声并让复制键 LED 闪 3 次，脚本运行结束时也会重复一次声光提示。'
+    : '已关闭：按键触发动作不再蜂鸣，也不再闪灯。';
+}
+
+// 即时保存单个按键开关：只提交「服务端已确认的配置 + 本次改动的一个字段」，
+// 绝不夹带页面上其他未保存的草稿（否则用户只切了提示音，却把刚改过的 enabled
+// 等状态一并写了进去）。失败分两种：服务端明确拒绝时回填已确认状态；网络结果
+// 不确定时回读服务端确认，读不到就明确标注「状态未知」，不能继续宣称已关闭。
+function gpioFlagConfirmed(field) {
+  const gpio = currentStatus?.config?.gpio || {};
+  return gpio[field] !== false; // 缺省开启，与 fillGPIOInputs 的回显口径一致
+}
+
+function syncGPIOFlagInput(field) {
+  if (field === 'feedback') {
+    $('gpio-feedback').checked = gpioFlagConfirmed('feedback');
+    updateGPIOFeedbackStatus();
+    return;
+  }
+  $('gpio-power-chime').checked = gpioFlagConfirmed('power_chime');
+  updatePowerChimeStatus();
+}
+
+async function saveGPIOFlag(field, enabled, successText) {
+  const confirmed = currentStatus?.config?.gpio;
+  if (!confirmed) {
+    syncGPIOFlagInput(field);
+    showMessage('尚未加载按键配置，请刷新页面后重试。', true, 'message-gpio');
+    return;
+  }
+  // 从已确认配置克隆，页面上其他输入框的未保存草稿不会被顺带提交。
+  const payload = JSON.parse(JSON.stringify(confirmed));
+  payload[field] = enabled;
+  setBusy(true);
+  try {
+    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(payload) }), true);
+    showMessage(successText, false, 'message-gpio');
+  } catch (error) {
+    if (error?.name === 'TypeError') {
+      // 连接中断/超时：服务端可能已经保存，不能自行宣称成功或失败，回读确认。
+      try {
+        render(await request('api/status'), true);
+        syncGPIOFlagInput(field);
+        showMessage('请求结果不确定，已按服务端状态刷新。', true, 'message-gpio');
+      } catch (refreshError) {
+        const target = $(field === 'feedback' ? 'gpio-feedback-status' : 'gpio-power-chime-status');
+        if (target) {
+          target.textContent = '状态未知：保存请求结果不确定，请刷新页面确认实际状态。';
+        }
+        showMessage(`保存结果未知：${error.message}`, true, 'message-gpio');
+      }
+    } else {
+      // 服务端明确拒绝：把开关拨回已确认的状态，别让界面停留在未生效的草稿上。
+      syncGPIOFlagInput(field);
+      showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+    }
+  } finally {
+    setBusy(false);
+  }
+}
+
+$('gpio-feedback').addEventListener('change', async () => {
+  const enabled = $('gpio-feedback').checked;
+  updateGPIOFeedbackStatus();
+  await saveGPIOFlag('feedback', enabled, enabled ? '按键声光反馈已开启。' : '按键声光反馈已关闭。');
+});
+
+// 开机/关机提示音开关：与按键反馈一样切换即落盘，不必再点「保存按钮控制」。
+const POWER_CHIME_HELP = '开启后开机进入系统、网页可访问时滴一声，触发软关机时再滴一声。';
+
+function updatePowerChimeStatus() {
+  const target = $('gpio-power-chime-status');
+  if (!target) return;
+  target.textContent = $('gpio-power-chime').checked
+    ? POWER_CHIME_HELP
+    : '已关闭：开机就绪与软关机时都不再蜂鸣。';
+}
+
+$('gpio-power-chime').addEventListener('change', async () => {
+  const enabled = $('gpio-power-chime').checked;
+  updatePowerChimeStatus();
+  await saveGPIOFlag('power_chime', enabled, enabled ? '开机与关机提示音已开启。' : '开机与关机提示音已关闭。');
+});
+
+// 关停档报警临时静音：切换即调用专用接口（不落盘，退出关停自动解除）。
+$('fan-alarm-mute').addEventListener('change', async () => {
+  const muted = $('fan-alarm-mute').checked;
+  setBusy(true);
+  try {
+    render(await request('api/fan/alarm-mute', { method: 'POST', body: JSON.stringify({ muted }) }), true);
+    showMessage(muted
+      ? '已临时静音关停档的故障/超温蜂鸣报警；界面报警与日志仍保留。'
+      : '已恢复关停档的故障/超温蜂鸣报警。', false, 'message-fan');
+  } catch (error) {
+    showMessage(`静音失败：${error.message}`, true, 'message-fan');
+    syncFanAlarmMute(currentStatus?.fan_control || {}); // 失败时把开关拨回真实状态
   } finally {
     setBusy(false);
   }
@@ -3934,7 +7700,13 @@ $('apply-now').addEventListener('click', async () => {
 });
 
 $('restore').addEventListener('click', async () => {
-  if (!window.confirm('确定关闭自动控制，并恢复首次捕获的功耗限制与 BIOS 风扇模式吗？')) return;
+  const ok = await showAppConfirm({
+    title: '关闭自动控制',
+    message: '确定关闭自动控制，并恢复首次捕获的功耗限制与 BIOS 风扇模式吗？',
+    confirmText: '关闭并恢复',
+    danger: true,
+  });
+  if (!ok) return;
   setBusy(true);
   try {
     render(await request('api/restore', { method: 'POST', body: '{}' }));
@@ -4013,12 +7785,12 @@ let activeCurveKind = loadActiveCurveKind();
 function loadActiveCurveKind() {
   try {
     const saved = window.localStorage.getItem('tad-curve-tab');
-    return CURVE_KINDS.includes(saved) ? saved : 'cpu';
-  } catch (error) { return 'cpu'; }
+    return CURVE_KINDS.includes(saved) ? saved : CURVE_KINDS[0];
+  } catch (error) { return CURVE_KINDS[0]; }
 }
 
 function applyCurveTab(kind) {
-  activeCurveKind = CURVE_KINDS.includes(kind) ? kind : 'cpu';
+  activeCurveKind = CURVE_KINDS.includes(kind) ? kind : CURVE_KINDS[0];
   CURVE_KINDS.forEach((candidate) => {
     const panel = document.querySelector(`.curve-editor[data-curve-kind="${candidate}"]`);
     if (panel) panel.hidden = candidate !== activeCurveKind;
@@ -4040,6 +7812,7 @@ function setupCurveTabs() {
   applyCurveTab(activeCurveKind);
 }
 setupCurveTabs();
+setupCurvePresets();
 function setupCurveChartScaling() {
   const charts = [
     ...CURVE_KINDS.map((kind) => $(curveEditors[kind].chartID)),
@@ -4070,6 +7843,40 @@ $('config-form').addEventListener('invalid', (event) => {
   if (tabID) activateTab(tabID);
 }, true);
 setupTabs();
+// 固件升级 / 压力测试
+$('firmware-fpt-upload').addEventListener('click', uploadFPT);
+$('firmware-bios-flash').addEventListener('click', flashBIOS);
+$('firmware-bios-manual-toggle').addEventListener('change', () => {
+  setManualBIOSVisible($('firmware-bios-manual-toggle').checked);
+});
+$('firmware-nic-check').addEventListener('click', checkNIC);
+$('firmware-nic-flash').addEventListener('click', () => flashNIC(false));
+$('firmware-nic-flash-force').addEventListener('click', () => flashNIC(true));
+$('firmware-nic-mft-install').addEventListener('click', installMFTTool);
+$('bios-online-check').addEventListener('click', checkBIOSOnline);
+$('bios-online-flash').addEventListener('click', flashBIOSOnline);
+// 开关机计划：工具栏 + 编辑器
+$('schedule-add').addEventListener('click', () => openScheduleEditor(-1));
+$('schedule-edit').addEventListener('click', () => openScheduleEditor(powerScheduleSelected));
+$('schedule-delete').addEventListener('click', deletePowerSchedule);
+$('schedule-enable').addEventListener('click', () => setPowerScheduleEnabled(true));
+$('schedule-disable').addEventListener('click', () => setPowerScheduleEnabled(false));
+$('schedule-apply').addEventListener('click', applyPowerSchedule);
+$('schedule-test').addEventListener('click', testPowerSchedule);
+$('schedule-editor-ok').addEventListener('click', submitScheduleEditor);
+$('schedule-editor-cancel').addEventListener('click', closeScheduleEditor);
+document.querySelectorAll('[data-schedule-close]').forEach((node) => {
+  node.addEventListener('click', closeScheduleEditor);
+});
+$('stress-start').addEventListener('click', startStressRun);
+$('stress-stop').addEventListener('click', stopStressRun);
+$('stress-memory-auto').addEventListener('change', updateStressMemoryAuto);
+$('stress-off-restore').addEventListener('click', () => { restoreFanOffState(); });
+$('stress-permanent').addEventListener('change', () => {
+  const duration = $('stress-duration');
+  if (!duration) return;
+  duration.disabled = $('stress-permanent').checked || $('stress-start').disabled;
+});
 setupHistoryPanel();
 setupHealthTooltip();
 setupAppModal();
@@ -4087,6 +7894,8 @@ setupHistoryExport();
 setupSensorNames();
 setupSerialSensor();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
+$('gpio-refresh-sdcard').addEventListener('click', () => refreshSDCardManually());
+$('storage-refresh-sdcard').addEventListener('click', () => refreshSDCardManually($('storage-refresh-sdcard'), $('storage-mobile-status')));
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);
 $('gpio-script-commit').addEventListener('click', commitGPIOScriptEditor);
@@ -4101,7 +7910,81 @@ $('gpio-script-body').addEventListener('keydown', (event) => {
   renderBashHighlight();
 });
 document.querySelectorAll('.gpio-action').forEach((select) => {
-  select.addEventListener('change', renderGPIOScriptList);
+  select.addEventListener('change', () => { renderGPIOScriptList(); renderBackupJobList(); renderAutoBackupList(); });
+});
+
+// 备份任务：新增/编辑/删除、路径与卷选择、立即运行。
+$('backup-job-add').addEventListener('click', () => openBackupJobEditor());
+$('backup-job-cancel').addEventListener('click', closeBackupJobEditor);
+$('backup-job-commit').addEventListener('click', commitBackupJobEditor);
+$('backup-job-test').addEventListener('click', () => {
+  const job = backupJobFromEditor();
+  if (!validateBackupJobDraft(job)) return;
+  runBackupJob(job.id, true, job);
+});
+$('backup-job-marker-write').addEventListener('change', onBackupMarkerToggleChange);
+['source', 'target'].forEach((role) => {
+  $(`backup-job-${role}-pick`).addEventListener('click', () => openPathPicker(role));
+  $(`backup-job-${role}-volume`).addEventListener('click', () => openVolumePicker(role));
+  $(`backup-job-${role}-clear`).addEventListener('click', () => setBackupEditorLocation(role, null));
+});
+document.querySelectorAll('input[name="backup-mode"]').forEach((radio) => {
+  radio.addEventListener('change', updateBackupModeControls);
+});
+// 自动备份：打标管理、规则编辑器、试跑与立即运行。
+$('auto-backup-add').addEventListener('click', () => openAutoBackupEditor());
+$('auto-backup-cancel').addEventListener('click', closeAutoBackupEditor);
+$('auto-backup-commit').addEventListener('click', commitAutoBackupEditor);
+$('auto-backup-test').addEventListener('click', () => {
+  const rule = autoRuleFromEditor();
+  if (!validateAutoRuleDraft(rule)) return;
+  runAutoBackup(rule.id, true, rule);
+});
+$('auto-backup-fixed-pick').addEventListener('click', () => openPathPicker('fixed'));
+$('auto-backup-fixed-clear').addEventListener('click', () => setAutoBackupFixedLocation(null));
+document.querySelectorAll('input[name="auto-backup-direction"]').forEach((radio) => {
+  radio.addEventListener('change', updateAutoBackupModeControls);
+});
+document.querySelectorAll('input[name="auto-backup-mode"]').forEach((radio) => {
+  radio.addEventListener('change', updateAutoBackupModeControls);
+});
+$('auto-backup-sub').addEventListener('input', updateAutoBackupModeControls);
+// 勾上确认项就撤掉告警高亮（抖动只负责把人引过来，勾没勾以勾选框为准）。
+$('auto-backup-allow-move').addEventListener('change', () => {
+  if ($('auto-backup-allow-move').checked) setAutoMoveConfirmAlert(false);
+});
+$('auto-backup-marker-refresh').addEventListener('click', refreshAutoBackupDevices);
+$('auto-backup-marker-pick').addEventListener('click', () => {
+  // 从外接存储的位置进入，避免用户在系统目录里乱选；打标认定这块盘。
+  openPathPicker('marker');
+});
+$('auto-backup-sub-pick').addEventListener('click', () => {
+  // 子目录打标：选中的目录成为这块盘的操作范围（可选多个）。
+  openPathPicker('submark');
+});
+$('path-picker-close').addEventListener('click', closePathPicker);
+$('path-picker-up').addEventListener('click', (event) => {
+  const parent = event.currentTarget.dataset.parent;
+  // parent 为空表示已经到位置根目录，再上一级就是位置总览。
+  if (parent) browsePathTo(parent, pathPicker.scope);
+  else browsePathTo('', 'places');
+});
+$('path-picker-mkdir').addEventListener('click', promptCreateDirectory);
+$('path-picker-advanced').addEventListener('click', togglePathPickerAdvanced);
+$('path-picker-select').addEventListener('click', confirmPathPicker);
+document.querySelectorAll('[data-picker-close]').forEach((node) => {
+  node.addEventListener('click', closePathPicker);
+});
+$('volume-picker-close').addEventListener('click', closeVolumePicker);
+$('volume-picker-refresh').addEventListener('click', loadVolumeList);
+$('volume-picker-confirm').addEventListener('click', confirmVolumePicker);
+document.querySelectorAll('[data-volume-close]').forEach((node) => {
+  node.addEventListener('click', closeVolumePicker);
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape') return;
+  if (!$('path-picker').hidden) closePathPicker();
+  else if (!$('volume-picker').hidden) closeVolumePicker();
 });
 
 const THEME_STORAGE_KEY = 'tad-theme';
@@ -4231,3 +8114,15 @@ if (themeToggle) {
 CURVE_KINDS.forEach(renderFanChart);
 refresh();
 setInterval(() => refresh(true), 5000);
+
+// 动态隐藏滚动条：悬停淡入由 CSS 负责，这里补「正在滚动」这一路——
+// 滚轮/触屏滚动时滑块短暂露出，停下 0.7s 后淡出。滚动事件不冒泡，
+// 挂捕获阶段，弹窗里的存储位置／目录列表也能收到。
+let scrollbarTimer = null;
+window.addEventListener('scroll', () => {
+  const root = document.documentElement;
+  if (!root || !root.classList) return;
+  root.classList.add('scr-on');
+  if (scrollbarTimer) clearTimeout(scrollbarTimer);
+  scrollbarTimer = setTimeout(() => root.classList.remove('scr-on'), 700);
+}, { passive: true, capture: true });

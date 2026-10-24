@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,6 +39,10 @@ func main() {
 		err = apply(os.Args[2:])
 	case "restore":
 		err = restore(os.Args[2:])
+	case "release-fans":
+		err = releaseFans(os.Args[2:])
+	case "bind-all-fans":
+		err = bindAllFans(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
@@ -102,6 +108,32 @@ func restore(args []string) error {
 		return nil
 	}
 	return err
+}
+
+// releaseFans 把风扇控制权交还 BIOS：只处理风扇，不动功耗限制。
+// 卸载时跑它，重装后服务读到 Fan.Enabled=false 就不会一启动又接管风扇。
+func releaseFans(args []string) error {
+	manager, _, err := commonFlags("release-fans", args)
+	if err != nil {
+		return err
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	return manager.ReleaseFans()
+}
+
+// bindAllFans 只在全新安装时跑：三条曲线都绑上所有风扇、打开风扇控制，
+// 曲线用出厂默认的平衡档。卸载重装时配置还在，不会调用它。
+func bindAllFans(args []string) error {
+	manager, _, err := commonFlags("bind-all-fans", args)
+	if err != nil {
+		return err
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	return manager.BindAllFansDefault()
 }
 
 func probe(args []string) error {
@@ -216,7 +248,14 @@ func serve(args []string) error {
 		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler,
+			// 网页可访问时滴一声：只在系统刚启动的窗口内响，升级/手动重启服务
+			// （此时系统已运行很久）不再重复响。
+			OnReady: func() {
+				if recentlyBooted(*root) {
+					go manager.PowerChime()
+				}
+			}}
 		done <- server.ListenAndServe()
 	}()
 	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
@@ -229,7 +268,11 @@ func serve(args []string) error {
 	go fanLoop(ctx, manager, logger)
 	go storageLoop(ctx, manager, logger)
 	go storageActivityLoop(ctx, manager)
+	go storageNotifyLoop(ctx, manager, logger)
+	go autoBackupClearLoop(ctx, manager, logger)
 	go gpioLoop(ctx, manager, logger)
+	// 开关机计划：到点触发关机 + 同步 RTC 唤醒（power_schedule.go）
+	go powerScheduleLoop(ctx, manager, logger)
 	// USB 串口温度传感器读取器：未配置时内部低频空转，常驻无副作用
 	go manager.SerialSensorLoop(ctx, logger)
 	// USB HID 温度计（TEMPer 家族）：锁外后台读取 + 缓存（阻塞 IO 不进
@@ -240,6 +283,9 @@ func serve(args []string) error {
 	select {
 	case <-ctx.Done():
 		logger.Printf("stopping: restoring captured power and fan settings")
+		// 软关机/服务停止前滴一声：此时蜂鸣器仍供电，同步播完再恢复。
+		// 蜂鸣器缺失或开关关闭时 PowerChime 直接返回，不影响退出流程。
+		manager.PowerChime()
 		err := manager.Restore()
 		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
 			logger.Printf("restore skipped because saved state belongs to different hardware: %v", err)
@@ -310,6 +356,45 @@ func storageActivityLoop(ctx context.Context, manager *powerguard.Manager) {
 	}
 }
 
+// storageNotifyLoop 监视「有没有插入新的存储设备」：移动存储长响一次、内置存储
+// 连续响两声（见 internal/powerguard/storage_notify.go）。采样只是 glob /sys/block
+// 加几个小文件读，2 秒一拍也几乎没有开销；首拍只建立基线，开机时已经在的盘不响。
+func storageNotifyLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	manager.MonitorStorageInserts()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			manager.MonitorStorageInserts()
+		}
+	}
+}
+
+// autoBackupClearLoop 执行挂起的「离线取消打标」：设备重新插上后删掉卷内的打标
+// 标记（backup_auto.go 的 ProcessAutoBackupClears）。15 秒一拍，没有挂起项时
+// 只读一次配置就返回，开销可以忽略。
+func autoBackupClearLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleared, err := manager.ProcessAutoBackupClears()
+			if err != nil {
+				logger.Printf("auto backup clear failed: %v", err)
+			}
+			if cleared > 0 {
+				logger.Printf("auto backup: cleared %d pending volume marker(s)", cleared)
+			}
+		}
+	}
+}
+
 func storageLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
 	refresh := func() {
 		status := manager.RefreshStorage(false)
@@ -326,6 +411,22 @@ func storageLoop(ctx context.Context, manager *powerguard.Manager, logger *log.L
 			return
 		case <-ticker.C:
 			refresh()
+		}
+	}
+}
+
+// 开关机计划：启动先对账一次（同步 RTC 唤醒），之后每 30 秒检查——
+// 到点触发计划关机、wakealarm 与开机计划不一致时重写。
+func powerScheduleLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	manager.PowerScheduleTick(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			manager.PowerScheduleTick(ctx)
 		}
 	}
 }
@@ -475,4 +576,26 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
 	return srv.APIHandler(), energy.Save
+}
+
+// bootChimeWindow 开机提示音的判定窗口：只有系统刚启动（uptime 小于该值）才响。
+// 服务随升级/手动重启也会走到就绪回调，但那时 uptime 早已超出窗口，不会重复滴。
+const bootChimeWindow = 10 * time.Minute
+
+// recentlyBooted 读取 sys-root 下的 /proc/uptime 判断系统是否刚启动；读不到时
+// 一律按「不是刚开机」处理，宁可不响也不要在服务重启时误响。
+func recentlyBooted(root string) bool {
+	data, err := os.ReadFile(filepath.Join(root, "proc", "uptime"))
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return false
+	}
+	return seconds < bootChimeWindow.Seconds()
 }

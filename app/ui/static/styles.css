@@ -21,6 +21,8 @@
   --chart-grid: rgba(72, 82, 102, .12);
   --chart-axis: #8a919c;
   --sidebar-hover: rgba(255, 255, 255, .55);
+  --sb-thumb: rgba(11, 11, 12, .12);
+  --sb-thumb-hover: rgba(11, 11, 12, .22);
   --radius: 10px;
   --radius-sm: 6px;
 
@@ -52,6 +54,8 @@
   --chart-grid: rgba(255, 255, 255, .25);
   --chart-axis: #c5cbd4;
   --sidebar-hover: rgba(255, 255, 255, .08);
+  --sb-thumb: rgba(255, 255, 255, .12);
+  --sb-thumb-hover: rgba(255, 255, 255, .22);
 }
 
 * { box-sizing: border-box; }
@@ -282,6 +286,12 @@ input:focus-visible,
   gap: 16px;
   align-items: flex-start;
   margin-bottom: 12px;
+}
+
+/* 卡片右上角的新增按钮：固定尺寸、文字不换行、不被左侧说明挤压 */
+.panel-heading > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 
 .panel-heading p,
@@ -656,15 +666,46 @@ small {
 .storage-visual-slot.is-empty .storage-slot-text span { display: none; }
 
 .storage-visual-front .storage-visual-slot { width: 12.5%; height: 67.8%; top:  47.85%; }
-/* 前置仓固定三行槽位（数字/状态/温度，与 M.2 的状态在上、温度在下一致）：
-   各行锚定固定高度，温度为空或空仓也保留槽位，空仓的"空置"与在位盘的
-   状态词对齐在同一行 */
+/* 前置仓固定四行槽位（数字/HDD/状态/健康/温度），绝对定位锚定：
+   新增健康状态行只改自己的 top，不动其他行位置 */
 .storage-visual-front .storage-slot-text b {
   position: absolute;
   left: 0;
   right: 0;
   top: 12%;
 }
+.storage-visual-front .storage-slot-text .slot-type {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 28%;
+  text-align: center;
+  font-style: normal;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--muted);
+  line-height: 1;
+}
+.storage-visual-front .storage-slot-text small:not(.health-label) {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 36%;
+}
+.storage-visual-front .storage-slot-text .health-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--label);
+}
+.storage-visual-front .storage-slot-text .health-label.is-warning { color: var(--danger); }
+.storage-visual-front .storage-slot-text .health-label.is-unknown { color: var(--muted); }
 .storage-visual-front .storage-slot-text span {
   position: absolute;
   left: 0;
@@ -672,12 +713,6 @@ small {
   top: 66%;
   white-space: pre-line;
   line-height: 1.05;
-}
-.storage-visual-front .storage-slot-text small {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 36%;
 }
 .storage-visual-front .storage-visual-slot[data-slot="front-6"] { left: 15.5%; }
 .storage-visual-front .storage-visual-slot[data-slot="front-5"] { left: 29.3%; }
@@ -805,6 +840,105 @@ button.storage-chip {
 .storage-chip.is-action { cursor: pointer; }
 .storage-chip.is-action:hover { filter: brightness(.97); }
 .storage-visual-slot.is-action { cursor: pointer; }
+
+/* 移动设备（SD 卡 / U 盘）：标题与按钮一行，图标排在下一行、一行两个，
+   第三个起自动换行——比三行卡片矮，又能把设备名写全 */
+.storage-mobile {
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.storage-mobile-head {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+}
+
+.storage-mobile-head h3 {
+  flex: none;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
+
+.storage-mobile-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 12px;
+  margin-top: 3px;
+  min-width: 0;
+}
+/* 没有设备时整行不占高度 */
+.storage-mobile-list:empty { display: none; }
+
+.storage-mobile-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.storage-mobile-item .storage-mobile-icon { flex: none; width: 15px; height: 15px; }
+.storage-mobile-item.kind-sd .storage-mobile-icon { color: #1f8f6b; }
+.storage-mobile-item.kind-usb .storage-mobile-icon { color: #2f6fb5; }
+
+.storage-mobile-item span {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.storage-mobile-item small {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-mobile-count {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.storage-mobile-count:empty { display: none; }
+
+.storage-mobile-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.storage-mobile-status:empty { display: none; }
+.storage-mobile-status.error { color: var(--danger); }
+
+.storage-mobile-head button {
+  flex: none;
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+[data-theme="dark"] .storage-mobile-item.kind-sd .storage-mobile-icon { color: #46c79b; }
+[data-theme="dark"] .storage-mobile-item.kind-usb .storage-mobile-icon { color: #7bb4ee; }
 .storage-col-health .storage-chip {
   max-width: 100%;
   overflow: hidden;
@@ -892,6 +1026,110 @@ body.modal-open { overflow: hidden; }
 }
 
 .inline-status.error { color: var(--danger); }
+
+.inline-status.success { color: var(--success); }
+
+/* 开关机计划 */
+.schedule-panel .schedule-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.schedule-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.schedule-stat {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.schedule-stat-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+.schedule-stat b {
+  display: block;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.schedule-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.schedule-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.schedule-table th,
+.schedule-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.schedule-table th {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-soft);
+}
+
+.schedule-table tbody tr { cursor: pointer; }
+.schedule-table tbody tr:last-child td { border-bottom: 0; }
+.schedule-table tbody tr:hover { background: var(--sidebar-hover); }
+.schedule-table tbody tr.selected { color: var(--primary); background: var(--primary-soft); }
+
+.schedule-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.schedule-status.on { color: var(--success); border-color: #bfe8d6; background: #f3fbf7; }
+.schedule-status.off { color: var(--muted); background: var(--surface); }
+
+.schedule-empty {
+  margin: 0;
+  padding: 18px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.schedule-editor-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+[data-theme="dark"] .schedule-status.on { color: #7fd6a8; border-color: #2b5c45; background: #12271d; }
+
+@media (max-width: 599px) {
+  .schedule-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .schedule-panel .schedule-toolbar button { flex: 1 1 auto; }
+}
 
 .diagnostic-grid {
   display: grid;
@@ -1009,6 +1247,99 @@ body.modal-open { overflow: hidden; }
   color: #fff;
 }
 .curve-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* 曲线模式按键：静音 / 平衡 / 性能 / 临时 / 全速 / 关停 / 手动 / 自定义 1–3。
+   十个按键同一套尺寸与圆角，当前生效的一档反色高亮；窄屏整组换行。 */
+.curve-modes {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.curve-modes-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+
+/* 关停档报警临时静音：开关与说明同一行，仅关停档可用（其余档位置灰并提示）。 */
+.fan-alarm-mute {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.fan-alarm-mute .inline-status { margin: 0; }
+.fan-alarm-mute.is-inactive { opacity: .62; }
+.fan-alarm-mute.is-inactive .toggle { cursor: not-allowed; }
+
+.curve-mode {
+  height: 30px;
+  min-width: 62px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 620;
+  cursor: pointer;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.curve-mode:hover { border-color: var(--primary); color: var(--primary); }
+.curve-mode:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.curve-mode:disabled { opacity: .55; cursor: not-allowed; }
+
+/* 当前生效的那一档 */
+.curve-mode.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.curve-mode.active:hover { color: #fff; }
+
+/* 自定义曲线操作弹窗：六个动作三列排开，应用占主色 */
+.curve-slot-dialog { gap: 10px; }
+.curve-slot-summary { color: var(--text-secondary); font-size: 12.5px; }
+.curve-slot-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.curve-slot-actions button { justify-self: stretch; height: 34px; font-size: 12.5px; }
+
+/* 弹窗底部：说明文字占左边，绿底「应用并保存风扇控制」贴最右边 */
+.curve-slot-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.curve-slot-foot .curve-slot-hint { flex: 1 1 auto; margin: 0; min-width: 0; }
+
+/* 「应用并保存风扇控制」：绿底，和蓝色「应用到曲线」区分开，一眼看出会直接下发硬件 */
+.curve-slot-foot button.confirm-save {
+  flex: 0 0 auto;
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 8px;
+  border: 1px solid var(--success);
+  background: var(--success);
+  color: #fff;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
+.curve-slot-foot button.confirm-save:hover { filter: brightness(.95); }
+.curve-slot-foot button.confirm-save:disabled { opacity: .55; filter: none; }
+.curve-slot-hint { color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+
+@media (max-width: 420px) {
+  .curve-slot-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 窄屏放不下一行：说明文字在上，绿底按钮整行铺满 */
+  .curve-slot-foot { flex-direction: column; align-items: stretch; }
+  .curve-slot-foot button.confirm-save { width: 100%; }
+}
 /* 卡片自身未设 display，hidden 属性默认即生效；显式写出防未来样式回归 */
 .curve-editor[hidden] { display: none; }
 
@@ -1305,13 +1636,10 @@ body.modal-open { overflow: hidden; }
   min-width: 240px;
   max-width: 100%;
 }
-/* 值标签跟随拇指：--thumb-pct 由 JS 写入（CSS 变量，非 style 属性，CSP 安全），
-   translateX(-50%) 以标签自身宽度居中对准拇指；百分比由 JS 夹在 6%–94%，
-   标签不会溢出滑杆容器 */
+/* 值标签固定在滑杆正中上方：不跟随拇指左右移动，读数位置稳定、
+   拖到两端也不会溢出容器（align-self 让它在纵向 flex 里按内容宽度居中） */
 .history-range-value {
-  position: relative;
-  left: var(--thumb-pct, 92%);
-  transform: translateX(-50%);
+  align-self: center;
   white-space: nowrap;
   font-size: 12px;
   line-height: 1.4;
@@ -1465,23 +1793,25 @@ body.modal-open { overflow: hidden; }
   box-shadow: 0 0 0 3px rgba(52, 120, 246, .11);
 }
 
-#curve-help,
-#disk-curve-help,
-#nvme-curve-help {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
-}
-
 .curve-notice { margin-top: 12px; }
 
-.gpio-table { table-layout: fixed; }
-.gpio-table th:first-child,
+.gpio-table { table-layout: fixed; }.gpio-table th:first-child,
 .gpio-table td:first-child,
 .gpio-table tbody th { width: 132px; }
 .gpio-table select { min-width: 0; padding: 8px 10px; border-radius: 8px; font-size: 12px; }
 .gpio-table select:disabled { cursor: not-allowed; opacity: .55; }
+
+/* 刷新 SD 卡：不用跑到机器跟前按网络键的手动入口 */
+.gpio-sdcard-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0 6px;
+}
+
+.gpio-sdcard-row button { min-width: 120px; }
+.gpio-sdcard-row .inline-status { margin: 0; }
 
 .button-name {
   display: inline-flex;
@@ -1791,6 +2121,219 @@ body.modal-open { overflow: hidden; }
 }
 .debug-report:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52, 120, 246, .12); }
 
+/* ---- 固件升级 ---- */
+input[type="file"] {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  outline: 0;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52, 120, 246, .12); }
+
+.firmware-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.firmware-row > button { margin-bottom: 1px; }
+.firmware-confirm { margin: 2px 0 10px; white-space: normal; }
+
+/* 手动升级 BIOS 标题右侧：工具徽标纵向排列（开关已内联到 h2 后面） */
+.firmware-bios-heading-side {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+/* BIOS 在线升级卡底部的"手动升级 BIOS"开关：独立一行，左对齐 */
+.firmware-manual-trigger {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+/* 网卡固件卡按钮区：与上方 hint 拉开距离，强制升级按钮大红色 */
+.firmware-nic-actions {
+  margin-top: 14px;
+  justify-content: flex-end;
+}
+.firmware-nic-actions .danger {
+  background: #c0282b !important;
+  color: #fff !important;
+  border: 1px solid #a02023;
+  font-weight: 600;
+}
+.firmware-nic-actions .danger:hover:not(:disabled) {
+  background: #d63034 !important;
+}
+
+/* 原来标题行内联样式保留，开关在标题里时用 */
+.firmware-bios-toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+  font-size: 14px;
+  font-weight: normal;
+  cursor: pointer;
+}
+
+.firmware-nic-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.firmware-nic-status > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.firmware-nic-status span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.firmware-nic-status b {
+  display: block;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.firmware-log {
+  margin: 10px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-body);
+  background: var(--surface-soft);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.firmware-log.success { color: var(--success); }
+.firmware-log.error { color: var(--danger); }
+
+/* ---- 压力测试 ---- */
+.stress-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 0 0 12px;
+}
+
+.stress-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.stress-memory-auto { margin: 0 0 12px; white-space: normal; }
+
+/* 压测期间检测到风扇关停档时的告警条：只在压力测试启用/运行时出现 */
+.stress-off-warning {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid #f0b8b5;
+  border-radius: var(--radius);
+  color: #a73430;
+  background: #fff1f0;
+}
+
+.stress-off-warning[hidden] { display: none; }
+.stress-off-warning > div { flex: 1 1 auto; min-width: 0; }
+.stress-off-warning strong { display: block; margin: 1px 0 4px; font-size: 13px; }
+.stress-off-warning p { margin: 0; color: #9a4b47; font-size: 12px; line-height: 1.55; }
+.stress-off-warning > button { flex: 0 0 auto; }
+
+.stress-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.stress-metrics > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.stress-metrics span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.stress-metrics b {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.firmware-advanced {
+  margin: 4px 0 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.firmware-advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.firmware-advanced[open] summary { margin-bottom: 10px; }
+
+.firmware-advanced .firmware-row { margin-bottom: 0; }
+
+@media (max-width: 1023px) {
+  .firmware-nic-status,
+  .stress-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 599px) {
+  .firmware-row,
+  .firmware-nic-status,
+  .stress-settings,
+  .stress-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -1799,6 +2342,9 @@ body.modal-open { overflow: hidden; }
 }
 
 .app-actions { margin-top: 0; }
+
+/* 按键表格正下方的「保存按钮控制」：紧跟后置重置按键那一行，改完就能存 */
+.gpio-save-row { margin: 10px 0 2px; }
 
 button {
   height: 32px;
@@ -1893,26 +2439,27 @@ button.danger {
     flex-wrap: nowrap;
     min-width: 0;
     width: 100%;
-    overflow: hidden;
+    /* 选项卡放不下了就横向滑动，不再压缩字号与宽度 */
+    overflow-x: auto;
+    overflow-y: hidden;
     gap: 2px;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
   }
   .app-tabs button {
-    flex: 1 1 0;
-    min-width: 0;
+    flex: 0 0 auto;
+    min-width: 68px;
     width: auto;
-    max-width: 100%;
     height: auto;
     flex-direction: column;
     justify-content: center;
     min-height: 52px;
     gap: 2px;
-    padding: 6px 2px;
-    overflow: hidden;
-    font-size: clamp(9px, 1.5vw, 11px);
+    padding: 6px 8px;
+    font-size: 11px;
     line-height: 1.15;
     text-align: center;
     white-space: nowrap;
-    text-overflow: ellipsis;
   }
   .app-tabs button > img { flex-shrink: 0; }
   .sidebar-meta { display: none; }
@@ -2079,8 +2626,27 @@ button.danger {
 [data-theme="dark"] .storage-chip.tone-idle { color: #aab3c2; border-color: #3d434e; background: var(--surface-muted); }
 [data-theme="dark"] .storage-chip.tone-temp { color: var(--text-body); border-color: var(--line-strong); background: var(--surface-muted); }
 [data-theme="dark"] .storage-chip.tone-muted { color: var(--muted); border-color: var(--line-strong); background: var(--surface-muted); }
+/* 硬盘面板 SVG 面板底图（4M2 / 6SATA）原始色值偏亮，
+   暗色主题下降到 72% 亮度、略微降饱和，避免在深背景上刺眼。 */
+[data-theme="dark"] .storage-visual-base { filter: brightness(0.72) saturate(0.85); }
+/* 各 tone 槽位覆盖图在暗色下分别微调：
+   - red（报警）：保持 1.0 醒目，略提亮保证深底上可见
+   - green（健康）：降到 0.85，不抢红色报警风头
+   - blue（休眠）：降到 0.80，暗底上不会太亮
+   - gray（空置/未使用）：原色本来就淡，只做轻微降噪
+   - empty（空仓托盘）：降到 0.72 跟底图统一 */
+[data-theme="dark"] .storage-visual-slot.tone-red   .storage-slot-overlay { filter: brightness(1.05) saturate(1.0); }
+[data-theme="dark"] .storage-visual-slot.tone-green .storage-slot-overlay { filter: brightness(0.85) saturate(0.9); }
+[data-theme="dark"] .storage-visual-slot.tone-blue  .storage-slot-overlay { filter: brightness(0.80) saturate(0.9); }
+[data-theme="dark"] .storage-visual-slot.tone-gray  .storage-slot-overlay { filter: brightness(0.95); }
+[data-theme="dark"] .storage-visual-slot.tone-empty .storage-slot-overlay { filter: brightness(0.72) saturate(0.85); }
+/* 设备外观图（设备名称卡片 + 关于页）跟硬盘底图同素材级亮度 */
+[data-theme="dark"] .device-identity img,
+[data-theme="dark"] .about-heading img { filter: brightness(0.72) saturate(0.85); }
 [data-theme="dark"] .fan-driver-warning { color: #e2a49f; border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .fan-driver-warning p { color: #e2a49f; }
+[data-theme="dark"] .stress-off-warning { color: #e2a49f; border-color: #6b3532; background: #2c1615; }
+[data-theme="dark"] .stress-off-warning p { color: #e2a49f; }
 [data-theme="dark"] .fan-driver-warning a { color: #f0918a; }
 [data-theme="dark"] .script-risk-notice { color: #e2a49f; background: #2c1615; }
 [data-theme="dark"] .gpio-script-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
@@ -2147,4 +2713,732 @@ button.danger {
   border: none;
   background: transparent;
   display: block;
+}
+
+/* ---------------------------------------------------------------------------
+   备份任务：图形化配置源/目标/复制方式（对应 internal/powerguard/backup.go）
+   --------------------------------------------------------------------------- */
+
+.gpio-backup-panel .panel-heading { align-items: center; }
+
+.backup-job-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.backup-job-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.backup-job-card strong {
+  display: block;
+  overflow: hidden;
+  color: var(--text-body);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backup-job-card .backup-job-flow {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.backup-job-card small {
+  display: block;
+  margin: 6px 0 10px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backup-job-card .actions { gap: 6px; }
+.backup-job-card button { height: 28px; padding: 0 10px; font-size: 12px; }
+.backup-job-card .delete-script { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.backup-job-editor {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.backup-job-editor[hidden] { display: none; }
+
+.backup-location { display: grid; gap: 6px; }
+
+.backup-location-label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.backup-location-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.backup-path-input {
+  flex: 1 1 220px;
+  min-width: 0;
+  background: var(--surface-muted);
+}
+
+.backup-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+.backup-hint:empty { display: none; }
+
+.backup-hint code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--surface-muted);
+  font-size: 11px;
+}
+
+.backup-mode {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 8px 12px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.backup-mode legend {
+  padding: 0 6px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.backup-mode-option {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.backup-mode-option:hover { background: var(--surface-muted); }
+.backup-mode-option input { margin: 3px 0 0; flex: 0 0 auto; }
+.backup-mode-option span { display: grid; gap: 2px; }
+
+.backup-mode-option strong { color: var(--text-body); font-size: 13px; }
+
+.backup-mode-option small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.backup-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: flex-end;
+}
+
+.backup-keep-field { flex: 0 1 200px; }
+.backup-keep-field .text-input { width: 100%; }
+
+/* 归档保留份数：只在选中「归档」档位时出现，紧贴在该档位正下方（位置由 app.js 的
+   syncBackupKeepRow 决定）。文字与文本框排在同一行、尽量短；.backup-mode 是 grid，
+   所以左边留出缩进，对齐档位文字。 */
+.backup-mode-keep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px 30px;
+}
+
+.backup-mode-keep > span { margin-bottom: 0; white-space: nowrap; }
+.backup-mode-keep .text-input { flex: 0 0 auto; width: 80px; padding: 4px 8px; }
+
+/* 「在源中创建标识文件」开关：与「覆盖目标中已存在的同名文件」同一种 toggle 风格，
+   排在同组的「源介质标识」输入框上方。 */
+.backup-marker-toggle { margin: 0 0 8px; }
+.backup-overwrite:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+.backup-keep-field:has(input:disabled) { opacity: .45; }
+
+/* --- 自动备份（打标卷）--- */
+
+.auto-marker-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.auto-marker-bar button { height: 30px; padding: 0 12px; font-size: 12px; }
+
+/* 打标列表：在线设备与离线记录都列出来，每台一张小卡片 */
+.auto-device-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.auto-device-item {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+}
+
+.auto-device-item.offline { border-style: dashed; opacity: .8; }
+
+/* 内置存储：只是一行「不支持打标」的说明，样式比真实设备条目更淡 */
+.auto-device-item.builtin {
+  border-style: dashed;
+  background: transparent;
+  padding: 8px 12px;
+}
+
+.auto-device-item.builtin strong {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.auto-device-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.auto-device-head strong { font-size: 13px; }
+
+.auto-device-head small { color: var(--muted); font-size: 11px; }
+
+.auto-device-badge {
+  padding: 1px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--surface);
+}
+
+.auto-device-badge.on { color: #1a7f37; border-color: #bfe3c8; background: #f2fbf4; }
+
+.auto-device-badge.pending { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.auto-device-subs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  font-size: 12px;
+}
+
+.auto-device-subs .empty { color: var(--muted); }
+
+.auto-device-sub {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.auto-device-sub button {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  line-height: 1;
+  border-color: transparent;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--danger);
+  font-size: 11px;
+}
+
+.auto-device-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.auto-device-actions button { height: 26px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+
+.auto-device-actions button.danger { color: var(--danger); border-color: #f0c9c6; background: #fff7f6; }
+
+.auto-device-empty { color: var(--muted); font-size: 12px; }
+
+.gpio-backup-panel .backup-mode-option input[type="radio"]:disabled + span { opacity: .45; }
+
+/* --- 目录浏览 / 卷选择对话框 --- */
+
+/* 卷选择对话框仍是 头/提示/列表/子目录/脚 五行；浏览弹窗把面包屑挪进了
+   body，只有 头/双栏/警告/脚 四行，单独用 #path-picker 圈定。 */
+.path-picker-modal .path-picker-dialog {
+  width: min(800px, 100%);
+  max-height: min(84vh, 700px);
+  gap: 10px;
+  overflow: hidden;
+  grid-template-rows: auto auto minmax(220px, 1fr) auto auto;
+}
+
+#path-picker .path-picker-dialog {
+  grid-template-rows: auto minmax(240px, 1fr) auto auto;
+}
+
+.path-picker-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.path-picker-head h3 { margin: 0; }
+
+.path-picker-head button { height: 28px; }
+
+/* 目录浏览弹窗：整体照搬硬盘测试工具「选择测试目录」的窗体——
+   左右两个带边框的列盒子、栏头一条灰底标题/路径条、列表在盒子内滚动。
+   底部仍是原来的四个按键（右下角）。 */
+.path-picker-body {
+  display: flex;
+  gap: 12px;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.picker-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.picker-col.places-col { flex: 0 0 220px; }
+.picker-col.entries-col { flex: 1 1 auto; min-width: 0; }
+
+.col-title {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+/* 位置列表 */
+.places,
+.dirs {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  overflow: auto;
+  /* 字号与硬盘测试工具一致（其正文字号 14px）；本页基准是 16px，必须显式压回 */
+  font-size: 14px;
+}
+
+.places li,
+.dirs li {
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.places li:hover,
+.dirs li:hover { background: var(--surface-muted); }
+
+.places li:focus-visible,
+.dirs li:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
+.places li.active { background: var(--primary); color: #fff; }
+.places li.active .pl-free,
+.places li.active .pl-sub,
+.places li.active .pl-name { color: rgba(255, 255, 255, .88); }
+.places li.active .rename { color: #fff; }
+
+.pl-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pl-row.sub { margin-top: 2px; }
+
+.pl-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pl-free {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* 容量未知：虚线下划线 + 问号光标，悬停看原因（与硬盘测试工具一致） */
+.pl-free.unknown {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+.pl-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 远程挂载的改名入口：小字、不抢宽度 */
+.places .rename {
+  flex: 0 0 auto;
+  height: auto;
+  margin-left: auto;
+  padding: 1px 7px;
+  border: 0;
+  border-radius: 5px;
+  color: var(--primary);
+  background: transparent;
+  font-size: 11px;
+}
+
+.places .rename:hover { background: rgba(0, 0, 0, .06); text-decoration: underline; }
+[data-theme="dark"] .places .rename:hover { background: rgba(255, 255, 255, .1); }
+
+.places .empty,
+.dirs .empty {
+  color: var(--muted);
+  font-size: 12px;
+  cursor: default;
+}
+
+/* 路径栏：当前完整路径（单行省略）+ 只读提示 */
+.path-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-muted);
+}
+
+.path-bar code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-body);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-hint {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* 「↑ 上级」照硬盘测试工具放在路径栏最左边（底部只剩三个操作按键） */
+.path-bar button {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+/* 目录内容：纯名称行（目录带结尾斜杠），只读项变淡 */
+.path-entry {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--text-body);
+}
+
+.path-entry.locked { opacity: .55; }
+
+.path-entry-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.path-entry-meta {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.path-entry-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid var(--primary);
+  border-radius: 999px;
+  color: var(--primary);
+  font-size: 10px;
+}
+
+.path-entry.selected { color: var(--primary); background: var(--primary-soft); }
+
+/* 卷选择对话框：自己的带框列表（与浏览弹窗分开，互不影响） */
+#volume-picker-list {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  min-height: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: auto;
+}
+
+#volume-picker-list .path-entry {
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  justify-self: stretch;
+}
+
+#volume-picker-list .path-entry:hover { background: var(--surface-muted); }
+#volume-picker-list .path-entry.selected { color: var(--primary); background: var(--primary-soft); }
+
+#volume-picker-list .path-entry-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--primary);
+}
+
+/* 高级（原生目录）模式：隐藏左侧位置栏，目录列表占满 */
+.path-picker-body.advanced .places-col { display: none; }
+
+.path-picker-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #d9a441;
+  border-radius: 8px;
+  color: #8a5b00;
+  background: #fff6e0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+[data-theme="dark"] .path-picker-warning {
+  border-color: #6b5526;
+  color: #f0cf8a;
+  background: #2c2415;
+}
+
+#path-picker-advanced.active {
+  border-color: #d9a441;
+  color: #8a5b00;
+  background: #fff6e0;
+}
+
+[data-theme="dark"] #path-picker-advanced.active {
+  border-color: #6b5526;
+  color: #f0cf8a;
+  background: #2c2415;
+}
+
+/* 内置确认 / 输入对话框：替代 window.confirm 的应用内弹窗 */
+.confirm-modal .confirm-dialog {
+  width: min(440px, 100%);
+  padding: 22px;
+  gap: 12px;
+}
+
+.confirm-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.confirm-icon {
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: var(--danger);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.confirm-head h3 { margin: 0; font-size: 15px; }
+
+.confirm-message {
+  margin: 0;
+  color: var(--text-body);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
+/* hidden 必须压得住 display：下面这些元素平时靠 display 排版，若不给 [hidden]
+   兜底，「进入原生目录模式」这类不带输入框的确认框会残留一个空输入框。 */
+.confirm-input-row { display: grid; gap: 6px; }
+.confirm-input-row[hidden] { display: none !important; }
+.backup-keep-field[hidden] { display: none !important; }
+/* 「NAS → 打标卷 + 移动模式」的确认开关：同样要压住 .toggle 的 display:flex */
+.backup-danger-toggle[hidden] { display: none !important; }
+.backup-danger-toggle { margin-top: 8px; color: var(--danger); }
+/* 没勾确认就去保存/试跑：那一行抖一下并保持描边高亮，直到用户勾上或换到别的档位。
+   高亮只用 outline（不占位、不改变布局），免得抖动时整段文字跟着位移。 */
+@keyframes backup-confirm-shake {
+  0%, 100% { transform: translateX(0); }
+  15% { transform: translateX(-6px); }
+  30% { transform: translateX(5px); }
+  45% { transform: translateX(-4px); }
+  60% { transform: translateX(3px); }
+  75% { transform: translateX(-2px); }
+}
+.backup-danger-toggle.needs-confirm {
+  border-radius: 6px;
+  outline: 1px solid var(--danger);
+  outline-offset: 4px;
+  background: rgba(226, 76, 76, .07);
+}
+.backup-danger-toggle.needs-confirm.shake { animation: backup-confirm-shake .5s ease-in-out; }
+[data-theme="dark"] .backup-danger-toggle.needs-confirm { background: rgba(241, 106, 106, .14); }
+@media (prefers-reduced-motion: reduce) {
+  .backup-danger-toggle.needs-confirm.shake { animation: none; }
+}
+.backup-hint.danger { color: var(--danger); }
+.confirm-input-row span { color: var(--muted); font-size: 12px; }
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.confirm-actions button { min-width: 88px; height: 32px; }
+.confirm-actions button[hidden] { display: none; }
+
+/* 弹出确认里的第三个动作：风扇模式弹窗用它表示「应用并保存风扇控制」。
+   绿底＝真的会写进硬件并落盘，跟蓝色的「只改界面」区别开。 */
+.confirm-actions button.confirm-secondary {
+  border-color: var(--success);
+  background: var(--success);
+  color: #fff;
+}
+
+.confirm-actions button.confirm-secondary:hover { border-color: var(--success); filter: brightness(.95); }
+
+/* 关停弹窗只剩这一个动作：红色，明确是破坏性操作 */
+.confirm-actions button.confirm-secondary.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.confirm-actions button.confirm-secondary.danger:hover { border-color: var(--danger); filter: brightness(.94); }
+
+/* 暗色主题的 --success 是亮绿，白字压不住，换成深色字 */
+[data-theme="dark"] .confirm-actions button.confirm-secondary:not(.danger),
+[data-theme="dark"] .curve-slot-foot button.confirm-save { color: #0d1f17; }
+
+.confirm-actions button.danger {
+  margin-left: 0;
+  color: #fff;
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.confirm-actions button.danger:hover { border-color: var(--danger-hover, var(--danger)); filter: brightness(.94); }
+
+[data-theme="dark"] .confirm-message { color: var(--text-body); }
+
+[data-theme="dark"] .backup-job-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
+[data-theme="dark"] .path-entry:hover { background: var(--surface-muted); }
+
+
+/* ── 滚动条：与硬盘测试工具/飞牛同款动态隐藏式 ─────────────
+   轨道常驻透明，滑块默认全透明；鼠标移入内容区淡入、移开淡出，
+   正在滚动时（html.scr-on，见 app.js）短暂露出。8px 细条圆角。 */
+html::-webkit-scrollbar,
+html *::-webkit-scrollbar { width: 8px; height: 8px; }
+
+html::-webkit-scrollbar-track,
+html *::-webkit-scrollbar-track { background: transparent; }
+
+html::-webkit-scrollbar-corner,
+html *::-webkit-scrollbar-corner { background: transparent; }
+
+html::-webkit-scrollbar-thumb,
+html *::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 6px;
+  transition: background-color .4s ease;
+}
+
+html:hover::-webkit-scrollbar-thumb,
+html *:hover::-webkit-scrollbar-thumb,
+html.scr-on::-webkit-scrollbar-thumb,
+html.scr-on *::-webkit-scrollbar-thumb { background: var(--sb-thumb); }
+
+html::-webkit-scrollbar-thumb:hover,
+html *::-webkit-scrollbar-thumb:hover,
+html.scr-on::-webkit-scrollbar-thumb:hover,
+html.scr-on *::-webkit-scrollbar-thumb:hover { background: var(--sb-thumb-hover); }
+
+/* Firefox：用标准属性退化（没有淡出动画） */
+@supports not selector(::-webkit-scrollbar) {
+  html, body { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  html:hover, body:hover,
+  html.scr-on, body.scr-on { scrollbar-color: var(--sb-thumb) transparent; }
 }

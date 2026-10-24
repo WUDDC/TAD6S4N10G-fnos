@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,9 @@ type Server struct {
 	History     *HistoryStore
 	LogPath     string       // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
 	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 直接挂在 /api/crps/, handler 自行改写为 /api/<ep>
+	// OnReady 在 socket 监听成功、网页已可访问后调用一次；用于开机提示音等
+	// 「服务就绪」动作。回调在 Serve 之前同步执行，实现方需自行避免阻塞。
+	OnReady func()
 }
 
 const configRequestMaxBytes = 3 << 20
@@ -82,6 +86,9 @@ func (s *Server) ListenAndServe() error {
 	if err := os.Chmod(s.Socket, 0o660); err != nil {
 		return err
 	}
+	if s.OnReady != nil {
+		s.OnReady()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
@@ -94,6 +101,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/api/config/fan", s.handleFanConfig)
+	mux.HandleFunc("/api/fan/alarm-mute", s.handleFanAlarmMute)
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
 	mux.HandleFunc("/api/config/history", s.handleHistoryConfig)
 	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
@@ -102,6 +110,17 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config/log", s.handleLogConfig)
 	mux.HandleFunc("/api/log/clear", s.handleLogClear)
 	mux.HandleFunc("/api/log/export", s.handleLogExport)
+	mux.HandleFunc("/api/backup/status", s.handleBackupStatus)
+	mux.HandleFunc("/api/backup/volumes", s.handleBackupVolumes)
+	mux.HandleFunc("/api/backup/browse", s.handleBackupBrowse)
+	mux.HandleFunc("/api/backup/mkdir", s.handleBackupMkdir)
+	mux.HandleFunc("/api/backup/marker", s.handleBackupMarker)
+	mux.HandleFunc("/api/backup/alias", s.handleBackupAlias)
+	mux.HandleFunc("/api/backup/run", s.handleBackupRun)
+	mux.HandleFunc("/api/backup/auto", s.handleBackupAuto)
+	mux.HandleFunc("/api/backup/auto/marker", s.handleBackupAutoMarker)
+	mux.HandleFunc("/api/backup/auto/run", s.handleBackupAutoRun)
+	mux.HandleFunc("/api/gpio/refresh-sdcard", s.handleRefreshSDCard)
 	mux.HandleFunc("/api/fans/debug", s.handleFansDebug)
 	mux.HandleFunc("/api/fans/debug/takeover", s.handleFansDebugTakeover)
 	mux.HandleFunc("/api/fans/debug/pwm", s.handleFansDebugPWM)
@@ -110,6 +129,22 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/fans/debug/calibrate", s.handleFansDebugCalibrate)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
+	mux.HandleFunc("/api/firmware", s.handleFirmwareStatus)
+	mux.HandleFunc("/api/firmware/fpt", s.handleFirmwareFPTUpload)
+	mux.HandleFunc("/api/firmware/bios/flash", s.handleFirmwareBIOSFlash)
+	mux.HandleFunc("/api/firmware/bios-online", s.handleBIOSOnlineStatus)
+	mux.HandleFunc("/api/firmware/bios-online/check", s.handleBIOSOnlineCheck)
+	mux.HandleFunc("/api/firmware/bios-online/flash", s.handleBIOSOnlineFlash)
+	mux.HandleFunc("/api/firmware/nic/check", s.handleFirmwareNICCheck)
+	mux.HandleFunc("/api/firmware/nic/flash", s.handleFirmwareNICFlash)
+	mux.HandleFunc("/api/firmware/nic/install-mft", s.handleFirmwareNICInstallMFT)
+	mux.HandleFunc("/api/stress", s.handleStressStatus)
+	mux.HandleFunc("/api/stress/start", s.handleStressStart)
+	mux.HandleFunc("/api/stress/stop", s.handleStressStop)
+	mux.HandleFunc("/api/power-schedule", s.handlePowerScheduleStatus)
+	mux.HandleFunc("/api/power-schedule/config", s.handlePowerScheduleConfig)
+	mux.HandleFunc("/api/power-schedule/apply", s.handlePowerScheduleApply)
+	mux.HandleFunc("/api/power-schedule/test", s.handlePowerScheduleTest)
 	if s.Crps != nil {
 		// CRPS 板块: handler 内部把 /api/crps/<ep> 改写为板块原路由 /api/<ep>
 		mux.Handle("/api/crps/", s.Crps)
@@ -283,6 +318,26 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Manager.SaveFanConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+// handleFanAlarmMute 临时静音/恢复关停档的故障与超温蜂鸣报警。只影响蜂鸣器，
+// 界面错误状态与风扇控制不变；状态不落盘，退出关停档自动解除。
+func (s *Server) handleFanAlarmMute(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Muted bool `json:"muted"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanAlarmMute(payload.Muted); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -658,6 +713,325 @@ func (s *Server) handleGPIOConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.Manager.Status())
 }
 
+func (s *Server) handleBackupStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "只有管理员可以查看备份状态")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.BackupStatus())
+}
+
+// handleBackupVolumes 列出可选的卷（含可移动介质），供界面快捷选择。
+func (s *Server) handleBackupVolumes(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以浏览存储设备")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"volumes": s.Manager.ListBackupVolumes()})
+}
+
+// handleBackupBrowse 目录浏览：返回子目录/文件以及卷快捷入口，供「浏览…」用。
+func (s *Server) handleBackupBrowse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以浏览文件系统")
+		return
+	}
+	result, err := s.Manager.BrowseBackupPath(r.URL.Query().Get("path"), r.URL.Query().Get("scope"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleBackupMkdir 在浏览对话框里新建一个子目录（「新建文件夹」按钮）。
+// 与浏览一样受 scope 约束：默认只能在「位置」范围内创建，防止手写路径摸到系统目录。
+func (s *Server) handleBackupMkdir(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Path  string `json:"path"`
+		Name  string `json:"name"`
+		Scope string `json:"scope"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	result, err := s.Manager.CreateBackupDirectory(request.Path, request.Name, request.Scope)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// handleBackupMarker 把「源标识文件」写进源位置（.tad-backup/source）。
+// 内容留空时自动生成并回传，用户不需要自己编。刻意只由用户点击触发：
+// 若在备份时自动补写，插错介质也会被写成「对的介质」，校验就失去意义了。
+func (s *Server) handleBackupMarker(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Job *GPIOBackupJob `json:"job"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	if request.Job == nil {
+		writeError(w, http.StatusBadRequest, "缺少备份任务配置")
+		return
+	}
+	marker, written, err := s.Manager.WriteBackupMarker(*request.Job)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"marker": marker, "path": written})
+}
+
+// handleBackupAlias 设置远程挂载的显示名（界面上「✎ 改显示名」用）。name 为空
+// 表示恢复系统命名。
+func (s *Server) handleBackupAlias(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		MountPoint string `json:"mount_point"`
+		Name       string `json:"name"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	if request.MountPoint == "" {
+		writeError(w, http.StatusBadRequest, "缺少远程挂载路径")
+		return
+	}
+	if err := s.Manager.SetRemoteAlias(request.MountPoint, request.Name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleBackupRun 立刻执行一次备份。请求可以给已保存任务的 job_id，也可以
+// 直接给完整的 job 定义（界面「试跑」用它验证尚未保存的草稿）。dry_run 走同步
+// 执行并把结果直接回给界面；正式运行转后台，前端轮询 /api/backup/status。
+func (s *Server) handleBackupRun(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		JobID  string         `json:"job_id"`
+		Job    *GPIOBackupJob `json:"job"`
+		DryRun bool           `json:"dry_run"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	var job GPIOBackupJob
+	if request.Job != nil {
+		job = *request.Job
+		if err := validateGPIOBackupJob(job); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		saved, ok := s.Manager.BackupJobByID(strings.TrimSpace(request.JobID))
+		if !ok {
+			writeError(w, http.StatusNotFound, "备份任务不存在，请先保存任务配置")
+			return
+		}
+		job = saved
+	}
+	if request.DryRun {
+		result, err := s.Manager.RunBackupJobNow(r.Context(), job, true)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err := s.Manager.StartBackupJob(job, false); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.Manager.BackupStatus())
+}
+
+// handleBackupAuto 打标列表：当前插着的存储设备（含尚未打标的）+ 已打标但当前
+// 离线的设备记录（离线项可以在界面上取消打标，设备下次上线时自动清除标记）。
+func (s *Server) handleBackupAuto(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以查看自动备份状态")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"devices":    s.Manager.AutoBackupDevices(),
+		"marker_dir": BackupAutoMarkerDirName + "/" + BackupAutoMarkerFileName,
+		"status":     s.Manager.BackupStatus(),
+	})
+}
+
+// handleBackupAutoMarker 打标操作。action 取值：
+//
+//	mark            整卷打标（可带 alias 设置别名）
+//	sub_add         给卷内子目录打标（可累积多个）
+//	sub_remove      取消某个子目录的打标
+//	unmark          取消打标（删掉卷内打标目录）
+//	offline_unmark  离线取消打标（记下「下次上线自动清除」）
+//	rename          修改别名
+func (s *Server) handleBackupAutoMarker(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		Action   string `json:"action"`
+		Path     string `json:"path"`
+		Identity string `json:"identity"`
+		Alias    string `json:"alias"`
+		Marked   *bool  `json:"marked"` // 兼容更早的前端：只有 marked 没有 action
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	action := strings.TrimSpace(request.Action)
+	if action == "" {
+		action = "mark"
+		if request.Marked != nil && !*request.Marked {
+			action = "unmark"
+		}
+	}
+	message := ""
+	switch action {
+	case "mark":
+		volume, err := s.Manager.MarkAutoBackupVolume(request.Path, request.Alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已给 %s 整块卷打标", volume.displayName())
+	case "sub_add":
+		volume, sub, err := s.Manager.AddAutoBackupSub(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已给 %s 的 %s 目录打标", volume.displayName(), sub)
+	case "sub_remove":
+		volume, sub, err := s.Manager.RemoveAutoBackupSub(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已取消 %s 的 %s 目录打标", volume.displayName(), sub)
+	case "unmark":
+		volume, err := s.Manager.ClearAutoBackupMark(request.Path)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("已取消 %s 的打标", volume.displayName())
+	case "offline_unmark":
+		if err := s.Manager.ForgetAutoBackupVolume(request.Identity); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = "已取消打标：该设备下次插上时会自动清除标记"
+	case "offline_keep":
+		if err := s.Manager.CancelPendingAutoBackupClear(request.Identity); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = "已撤销：这块盘下次插上时不再清除打标"
+	case "rename":
+		volume, err := s.Manager.SetAutoBackupAlias(request.Path, request.Alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		message = fmt.Sprintf("%s 的别名已更新", volume.displayName())
+	default:
+		writeError(w, http.StatusBadRequest, "未知的打标操作: "+action)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"action":  action,
+		"message": message,
+		"devices": s.Manager.AutoBackupDevices(),
+		"status":  s.Manager.BackupStatus(),
+	})
+}
+
+// handleBackupAutoRun 立刻执行一次自动备份：给已保存规则的 rule_id，正式运行
+// 转后台（前端轮询 /api/backup/status），试跑同步返回每块打标卷的结果。
+func (s *Server) handleBackupAutoRun(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var request struct {
+		RuleID string          `json:"rule_id"`
+		Rule   *GPIOAutoBackup `json:"rule"`
+		DryRun bool            `json:"dry_run"`
+	}
+	if err := decodeConfigRequest(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	var rule GPIOAutoBackup
+	if request.Rule != nil {
+		rule = *request.Rule
+		if err := validateGPIOAutoBackup(rule); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	} else {
+		saved, ok := s.Manager.AutoBackupRuleByID(strings.TrimSpace(request.RuleID))
+		if !ok {
+			writeError(w, http.StatusNotFound, "自动备份规则不存在，请先保存规则配置")
+			return
+		}
+		rule = saved
+	}
+	if request.DryRun {
+		result, err := s.Manager.RunAutoBackupJobNow(r.Context(), rule, true)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "result": result})
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+		return
+	}
+	if err := s.Manager.StartAutoBackupJob(rule, false); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, s.Manager.BackupStatus())
+}
+
 func (s *Server) authorizeConfigRequest(w http.ResponseWriter, r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		methodNotAllowed(w)
@@ -675,6 +1049,25 @@ func decodeConfigRequest(r *http.Request, target any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, configRequestMaxBytes))
 	dec.DisallowUnknownFields()
 	return dec.Decode(target)
+}
+
+// handleRefreshSDCard 手动刷新一次 SD 卡（重新识别 USB 读卡器）。刷新要让内核
+// 重新枚举，通常几秒，所以同步执行完再把结果回给界面。
+func (s *Server) handleRefreshSDCard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷新 SD 卡")
+		return
+	}
+	result, err := s.Manager.RunRefreshSDCard(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": result})
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) handleApply(w http.ResponseWriter, r *http.Request) {
@@ -741,4 +1134,357 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// handleFirmwareStatus 返回缓存的固件状态（含任务日志）；轮询不会触发外部命令。
+func (s *Server) handleFirmwareStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareFPTUpload 保存 Linux 版 FPT 可执行文件（multipart 字段 fpt）。
+func (s *Server) handleFirmwareFPTUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以上传固件工具")
+		return
+	}
+	data, err := readMultipartFile(w, r, "fpt", firmwareToolMaxBytes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Manager.SaveFPTBinary(data); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareBIOSFlash 执行 BIOS 刷写；必须提交 confirm=FLASH 与 image 文件。
+func (s *Server) handleFirmwareBIOSFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写 BIOS")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, firmwareImageMaxBytes+(2<<20))
+	if err := r.ParseMultipartForm(firmwareImageMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "FLASH" {
+		writeError(w, http.StatusBadRequest, "缺少刷写确认")
+		return
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请选择 BIOS 镜像文件")
+		return
+	}
+	defer func() { _ = file.Close() }()
+	image, err := io.ReadAll(io.LimitReader(file, firmwareImageMaxBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "读取 BIOS 镜像失败: "+err.Error())
+		return
+	}
+	if int64(len(image)) > firmwareImageMaxBytes {
+		writeError(w, http.StatusBadRequest, "BIOS 镜像超过 64 MB 上限")
+		return
+	}
+	if err := s.Manager.StartBIOSFlash(image); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareNICCheck 主动探测网卡与 MFT 状态（可能执行 lspci/flint）。
+func (s *Server) handleFirmwareNICCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以检测网卡")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.Manager.RefreshFirmwareStatus(ctx))
+}
+
+// handleFirmwareNICFlash 刷写网卡固件；confirm=UPGRADE，可选 firmware 文件覆盖内置版本。
+func (s *Server) handleFirmwareNICFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写网卡固件")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, firmwareImageMaxBytes+(2<<20))
+	if err := r.ParseMultipartForm(firmwareImageMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "UPGRADE" {
+		writeError(w, http.StatusBadRequest, "缺少升级确认")
+		return
+	}
+	var firmware []byte
+	file, _, err := r.FormFile("firmware")
+	switch {
+	case err == nil:
+		defer func() { _ = file.Close() }()
+		firmware, err = io.ReadAll(io.LimitReader(file, firmwareImageMaxBytes+1))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "读取网卡固件失败: "+err.Error())
+			return
+		}
+		if int64(len(firmware)) > firmwareImageMaxBytes {
+			writeError(w, http.StatusBadRequest, "网卡固件超过 64 MB 上限")
+			return
+		}
+	case errors.Is(err, http.ErrMissingFile):
+		firmware = nil // 未上传则使用内置下载地址
+	default:
+		writeError(w, http.StatusBadRequest, "读取上传文件失败: "+err.Error())
+		return
+	}
+	if err := s.Manager.StartNICFlash(firmware); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareNICInstallMFT 手动安装 MFT：下载、解压、安装并启动 mst。
+func (s *Server) handleFirmwareNICInstallMFT(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以安装 MFT 工具")
+		return
+	}
+	if err := s.Manager.StartNICMFTInstall(); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleBIOSOnlineStatus 返回缓存的 BIOS 在线检查结果（不触发网络请求）。
+func (s *Server) handleBIOSOnlineStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.BIOSOnline())
+}
+
+// handleBIOSOnlineCheck 拉取 zip.txt 索引并读取当前 flash $FID，判定是否有新版 BIOS。
+func (s *Server) handleBIOSOnlineCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以检查 BIOS 更新")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.Manager.CheckBIOSOnline(ctx))
+}
+
+// handleBIOSOnlineFlash 按检查结果在线下载并刷写 BIOS；confirm=FLASH。
+func (s *Server) handleBIOSOnlineFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写 BIOS")
+		return
+	}
+	// 前端用 FormData（multipart）提交 confirm：绝不能在这里显式 ParseForm——
+	// 它不解析 multipart 请求体，还会把 r.Form 置成非 nil，导致 FormValue 跳过
+	// 惰性 ParseMultipartForm，confirm 永远取不到。FormValue 自身兼容两种编码。
+	if strings.TrimSpace(r.FormValue("confirm")) != "FLASH" {
+		writeError(w, http.StatusBadRequest, "缺少刷写确认")
+		return
+	}
+	if err := s.Manager.StartBIOSOnlineFlash(); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleStressStatus 返回压力测试实时指标。
+func (s *Server) handleStressStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handleStressStart 启动压力测试；CPU、内存与 GPU 均由后端施压。
+func (s *Server) handleStressStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以启动压力测试")
+		return
+	}
+	var options StressOptions
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&options); err != nil {
+		writeError(w, http.StatusBadRequest, "解析参数失败: "+err.Error())
+		return
+	}
+	if err := s.Manager.StartStress(options); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handleStressStop 停止压力测试。
+func (s *Server) handleStressStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以停止压力测试")
+		return
+	}
+	if err := s.Manager.StopStress(); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handlePowerScheduleStatus 返回开关机计划状态（计划列表、统计、RTC 信息）。
+func (s *Server) handlePowerScheduleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.PowerScheduleStatus())
+}
+
+// handlePowerScheduleConfig 保存开关机计划列表，并立即同步 RTC 唤醒。
+func (s *Server) handlePowerScheduleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg PowerScheduleConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SavePowerScheduleConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.PowerScheduleStatus())
+}
+
+// handlePowerScheduleApply 立即把下次开机计划写进 RTC（界面「应用计划」按钮）。
+func (s *Server) handlePowerScheduleApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以应用开关机计划")
+		return
+	}
+	status, err := s.Manager.ApplyPowerSchedule()
+	if err != nil {
+		writeJSON(w, http.StatusConflict, status)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// handlePowerScheduleTest 写入一个 N 分钟后的测试唤醒，用于验证主板定时开机。
+func (s *Server) handlePowerScheduleTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以测试开机计划")
+		return
+	}
+	var body struct {
+		Minutes int `json:"minutes"`
+	}
+	if err := decodeConfigRequest(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	at, err := s.Manager.TestPowerSchedule(body.Minutes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"wake_at": at.Format("2006-01-02 15:04:05")})
+}
+
+func readMultipartFile(w http.ResponseWriter, r *http.Request, field string, limit int64) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, limit+(1<<20))
+	if err := r.ParseMultipartForm(limit); err != nil {
+		return nil, fmt.Errorf("解析上传内容失败: %w", err)
+	}
+	file, _, err := r.FormFile(field)
+	if err != nil {
+		return nil, errors.New("缺少上传文件")
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取上传文件失败: %w", err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("文件超过 %d MB 上限", limit>>20)
+	}
+	return data, nil
 }

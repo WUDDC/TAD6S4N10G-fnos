@@ -59,21 +59,33 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool                   `json:"enabled"`
-	PL1W           int64                  `json:"pl1_w"`
-	PL2W           int64                  `json:"pl2_w"`
-	ReapplySeconds int                    `json:"reapply_seconds"`
-	Fan            FanConfig              `json:"fan"`
-	GPIO           GPIOConfig             `json:"gpio"`
-	History        HistoryConfig          `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
-	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
-	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
-	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
-	Serial         *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
-	Serials        []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
-	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
-	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
-	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+	Enabled        bool              `json:"enabled"`
+	PL1W           int64             `json:"pl1_w"`
+	PL2W           int64             `json:"pl2_w"`
+	ReapplySeconds int               `json:"reapply_seconds"`
+	Fan            FanConfig         `json:"fan"`
+	GPIO           GPIOConfig        `json:"gpio"`
+	History        HistoryConfig     `json:"history"`                // 历史温度：采样开关、数据库大小上限与保留天数
+	Log            LogConfig         `json:"log"`                    // 运行日志：大小上限（与历史数据库上限解耦）
+	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
+	// SensorNameDefaultsApplied 记录内置默认显示名（主板PCB / 光模块1 …）是否
+	// 已补进 SensorNames：只补一次，用户之后清空或改名不再被覆盖。
+	SensorNameDefaultsApplied bool `json:"sensor_name_defaults_applied,omitempty"`
+	// SensorNamePCBRenamed 记录 0.10.46 的默认名调整（PCB温度/PCB → 主板PCB）是否做过：
+	// 只改仍停在旧默认名上的那一项，用户自己改过的名字不动。
+	SensorNamePCBRenamed bool                   `json:"sensor_name_pcb_renamed,omitempty"`
+	SensorGroups         map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	Serial               *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
+	Serials              []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
+	FanRPMBase           map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
+	FanRPMMap            map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
+	UIPrefs              UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+	// RemoteAliases 远程挂载的显示名（键为挂载点，如 /vol02/1000-1-xxx）。云盘友好名
+	// 尽力从挂载进程推断，拿不到就靠用户手动改名；见 backup.go 的 SetRemoteAlias。
+	RemoteAliases map[string]string `json:"remote_aliases,omitempty"`
+	// PowerSchedule 开关机计划（power_schedule.go）：定时关机由守护进程触发，
+	// 定时开机写进主板 RTC wakealarm。
+	PowerSchedule PowerScheduleConfig `json:"power_schedule"`
 }
 
 // UIPrefsConfig 纯界面偏好，与功能配置分开存放：历史/风扇等保存接口整段
@@ -208,6 +220,7 @@ type Status struct {
 	Storage           StorageStatus        `json:"storage"`
 	GPIO              GPIOStatus           `json:"gpio"`
 	Serial            SerialSensorInfo     `json:"serial"`
+	StorageNotify     StorageNotifyStatus  `json:"storage_notify"`
 	LastApply         time.Time            `json:"last_apply,omitempty"`
 	LastError         string               `json:"last_error,omitempty"`
 }
@@ -225,6 +238,39 @@ type Manager struct {
 	fanLastError  string
 	fanLastTarget int
 	fanLastTemp   float64
+	// 关停档退出后的起转宽限窗口：风扇从 0 转自然起转需要几秒到几十秒，期间的
+	// 0 转速不能当「通道接不到风扇」拒绝下发，否则切出关停后永远起不来。
+	// fanOffExitedAt 记录关停档 → 普通档的切换时刻，宽限期见 fanSpinUpGraceWindow；
+	// 过期后恢复严格检查，不再像旧的「见过转速就永久豁免」那样放过真故障。
+	fanOffWasActive bool
+	fanOffExitedAt  time.Time
+	// nowFn 测试注入的时钟（默认 time.Now）：起转宽限期与关停 5 分钟上限的
+	// 边界断言直接拨时间，不依赖真实等待。仅测试使用，运行时保持 nil。
+	nowFn func() time.Time
+	// fanOffModeSince 关停档的进入时刻，用于 5 分钟上限后自动恢复原曲线并起转。
+	fanOffModeSince time.Time
+	// fanOffGen 关停档的进入代次：每次从普通档切到关停档（且生效）就 +1。
+	// 标定采样开始时记下代次，入特性表时核对——期间进入过关停档（风扇被写成
+	// 0 转）的读数不是可靠的全速基准，即使采样结束时已经退出关停也要作废。
+	fanOffGen uint64
+
+	// fanOffAlarmChimeAt 关停档维修安全报警（errOffModeAlarm）的上次蜂鸣时刻，
+	// 按 fanOffAlarmChimeInterval 节流，避免报警期间蜂鸣器连响不停。
+	fanOffAlarmChimeAt time.Time
+	// fanAlarmMuted 关停档故障/超温蜂鸣报警的临时静音（不落盘）：只停蜂鸣器，
+	// 界面错误状态与日志照旧；退出关停档时自动解除，避免长期静音漏掉真故障。
+	fanAlarmMuted bool
+	// fanOffAlarmActive 最近一次控制周期是否处于关停档报警状态：解除静音时用它
+	// 判断要不要立刻补响，避免没有报警时凭空响一声。
+	fanOffAlarmActive bool
+	// fanOffAlarmLogKey 关停档报警日志去重键（报警内容+蜂鸣状态）：既避免每个
+	// 控制周期重复刷同一行，也避免静音时仍写成「已蜂鸣报警」。
+	fanOffAlarmLogKey string
+
+	// 0 转风扇屏蔽/跳过日志的去重键：控制周期每 2 秒跑一轮，同一组风扇问题
+	// 只在集合变化（或恢复后再次出现）时写一次日志，避免刷满运行日志。
+	fanFilteredLogKey string
+	fanSkippedLogKey  string
 
 	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
 	fanDebugTakenOver       map[string]int
@@ -272,7 +318,15 @@ type Manager struct {
 	storageStatus StorageStatus
 	gpioMu        sync.Mutex
 	gpioRuntime   gpioRuntime
-	usbLastError  string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
+	backupMu      sync.Mutex // 备份运行状态（backup_runner.go）
+	backupRun     backupRunState
+	sdcardMu      sync.Mutex // 刷新SD卡运行状态（sdcard.go）
+	sdcardRun     sdcardRunState
+	// 存储设备插入提示音（storage_notify.go）：前后两拍块设备快照的差分状态。
+	// 锁序固定在 m.mu 之后（MonitorStorageInserts 先放掉 m.mu 再拿它）。
+	storageNotifyMu sync.Mutex
+	storageNotify   storageNotifyState
+	usbLastError    string // USB 温度计最近一次读取错误（变化才记日志），随 m.mu 保护
 	// USB HID 温度计读数缓存（usb_temper.go）：读取是秒级阻塞 IO，只能在
 	// USBTemperatureLoop 里锁外做；extraTemperatures 只采信新鲜缓存。随 m.mu 保护。
 	usbTempReadings []usbTempReading
@@ -286,6 +340,55 @@ type Manager struct {
 	// 读取器的运行状态，全部随 m.mu 保护。
 	serialKick    chan struct{}                 // 配置保存后通知监督者重新对账（容量 1，非阻塞）
 	serialReaders map[string]*serialReaderState // 在跑的读取器（键为设备路径，读取器退出时自行摘除）
+
+	// 固件升级（firmware.go）：任务状态与网卡探测缓存都在内存里，不落盘；
+	// 刷写任务同一时刻只允许一个，状态接口只读缓存、不执行外部命令。
+	firmwareMu       sync.Mutex
+	firmwareJob      firmwareJobState
+	firmwareNIC      firmwareNICInfo
+	firmwareExec     firmwareCommandRunner // 测试注入，nil 时执行真实命令
+	firmwareFlint    string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
+	firmwareMST      string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
+	firmwareFPT      string                // 测试注入的 FPT 路径，空则按数据目录/内置路径查找
+	firmwareFlashrom string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
+	flashromMu       sync.Mutex            // flashrom 自动下载串行化：并发获取只下载一次，且半成品不对外可见
+	biosOnline       biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
+	// shutdownPending 计划关机已提交占位（随 firmwareMu 保护）：与刷写启动共用
+	// 同一把锁做原子互斥，占位期间 beginFirmwareJob 一律拒绝，见
+	// tryAcquireShutdownSlot / power_schedule.go。
+	shutdownPending bool
+
+	// 压力测试（stress.go）：CPU/内存工作协程与采样状态，全部在内存中。
+	stressMu sync.Mutex
+	stress   stressState
+	// stressCPUWorker / stressMemoryWorker / stressSampleFn 为测试注入的工作协程
+	// 实现（nil 走真实负载）：状态机单测不得真的打满宿主 CPU 或占用内存。
+	stressCPUWorker    func(stop <-chan struct{}, workers *sync.WaitGroup)
+	stressMemoryWorker func(stop <-chan struct{}, workers *sync.WaitGroup, total int64)
+	stressSampleFn     func(stop <-chan struct{}, duration time.Duration)
+
+	// 开关机计划（power_schedule.go）：关机触发去重键（日期+时间，同一分钟
+	// 只触发一次），随 m.mu 保护。
+	powerScheduleFiredKey string
+	// powerScheduleTestUntil 测试唤醒的保护窗口：TestPowerSchedule 写入的
+	// 临时闹钟在窗口内不被 tick 的计划同步覆盖，给用户留出手动关机的时间。
+	powerScheduleTestUntil time.Time
+	// powerScheduleOwnedWake 本模块最后一次写入 wakealarm 的时刻（所有权凭证）：
+	// 只有当前 wakealarm 仍等于该值时才允许清空。别的软件（BIOS 工具、其他守护
+	// 进程）后来写入的唤醒闹钟不得被「无开机计划」的同步逻辑抹掉。进程重启后
+	// 视为无主，宁可留下一个旧闹钟也不误清外部设置。
+	powerScheduleOwnedWake time.Time
+
+	// firmwareInhibitor 固件刷写期间持有的系统关机 inhibitor（systemd-inhibit
+	// 子进程，见 firmware_inhibit.go / firmware_inhibit_linux.go），随 inhibitMu
+	// 保护。inhibitorAcquire 为测试注入的获取实现，nil 时走平台默认（Linux 用
+	// systemd-inhibit，其他平台为 no-op 句柄）。
+	inhibitMu         sync.Mutex
+	firmwareInhibitor inhibitorHandle
+	inhibitorAcquire  func(reason string) (inhibitorHandle, error)
+	// firmwareJobInhibitor 本任务启动时获取的 inhibitor 句柄（随 firmwareMu
+	// 保护）：破坏性写入前用它确认保护仍属于本任务，提前退出后不得继续写入。
+	firmwareJobInhibitor inhibitorHandle
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -300,6 +403,13 @@ func (m *Manager) logf(format string, args ...any) {
 	if m.logger != nil {
 		m.logger.Printf(format, args...)
 	}
+}
+
+// logfSafe 给未持有 m.mu 的调用方用（logf 要求调用方持锁）。
+func (m *Manager) logfSafe(format string, args ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logf(format, args...)
 }
 
 // saveConfigLocked 用户主动保存的统一写盘出口：成功即记一条运行日志。
@@ -691,7 +801,9 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 	previous := cfg.Fan
 	cfg.Fan = fan
 	normalizeConfig(&cfg)
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	// 进入关停档时留一份关停前曲线，供 5 分钟上限到期自动恢复；退出时清掉。
+	captureOffModeBackup(&cfg.Fan, previous)
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -699,14 +811,26 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
+	// 关停档真正生效（此前未生效、本次已启用）就作废进行中的标定采样：
+	// 标定开始时记下这个代次，入表前核对。必须在落盘成功后递增——保存失败
+	// 没有真的停转，不该白白丢掉一次有效标定。
+	if cfg.Fan.Enabled && cfg.Fan.OffMode && !(previous.Enabled && previous.OffMode) {
+		m.fanOffGen++
+	}
 	if previous.Enabled && !cfg.Fan.Enabled {
 		err = m.restoreFansLocked()
 	} else if cfg.Fan.Enabled {
 		err = m.applyFanLocked(cfg.Fan)
 	}
 	if err != nil {
-		m.lastError = err.Error()
-		return err
+		if errors.Is(err, errOffModeAlarm) {
+			// 关停档超温正是维修场景：配置有效且已落盘，风扇保持停转，报警经
+			// fanLastError 呈现——不算保存失败，否则用户在高温设备上根本开不了关停档。
+			m.fanLastError = err.Error()
+		} else {
+			m.lastError = err.Error()
+			return err
+		}
 	}
 	m.lastError = ""
 	m.lastApply = time.Now()
@@ -721,6 +845,10 @@ func (m *Manager) SaveGPIOConfig(gpio GPIOConfig) error {
 		m.lastError = err.Error()
 		return err
 	}
+	// 打标卷记录由打标接口（backup_auto.go）独占维护：前端保存按键配置时整段覆盖
+	// GPIO 配置，若不在这里保住，用户每点一次「保存按钮控制」都会把打标记录抹掉，
+	// 列表里的离线设备随之消失。
+	gpio.AutoVolumes = append([]AutoBackupVolumeRecord(nil), cfg.GPIO.AutoVolumes...)
 	cfg.GPIO = gpio
 	normalizeConfig(&cfg)
 	if err := validateGPIOConfig(cfg.GPIO); err != nil {
@@ -766,6 +894,75 @@ func (m *Manager) Restore() error {
 	return nil
 }
 
+// ReleaseFans 把风扇交还 BIOS 控制，功耗限制一概不动（卸载 / 重装专用）：
+// 先把配置里的风扇控制关掉并落盘（否则重装后服务一启动就重新接管），
+// 再按接管前存档的 PWM 与 pwm*_enable 模式写回硬件。配置读不出来时也照样
+// 尝试还硬件——交还控制权比保留配置重要。
+func (m *Manager) ReleaseFans() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var configErr error
+	cfg, err := m.loadConfigLocked()
+	switch {
+	case err == nil:
+		if cfg.Fan.Enabled {
+			cfg.Fan.Enabled = false
+			if saveErr := m.saveConfigLocked(cfg); saveErr != nil {
+				configErr = saveErr
+			}
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		configErr = err
+	}
+	restoreErr := m.restoreFansLocked()
+	err = errors.Join(configErr, restoreErr)
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
+// BindAllFansDefault 只在「全新安装」时调用：把三条曲线都绑到所有有转速反馈的
+// 风扇上并打开风扇控制，曲线参数用出厂默认（平衡档）。
+// 卸载重装时配置还在（Fan.Enabled=false），不会走到这里，所以不会抢回 BIOS 的控制权。
+func (m *Manager) BindAllFansDefault() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return err
+	}
+	fans, err := m.DiscoverFans()
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(fans))
+	for _, fan := range fans {
+		// 校验要求绑定的风扇必须有转速反馈，0 RPM 的通道绑上会直接报错
+		if fan.RPM > 0 {
+			ids = append(ids, fan.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return errors.New("没有检测到有转速反馈的风扇，风扇控制保持关闭")
+	}
+	cfg.Fan.CPUFanIDs = append([]string(nil), ids...)
+	cfg.Fan.HDDFanIDs = append([]string(nil), ids...)
+	cfg.Fan.NVMeFanIDs = append([]string(nil), ids...)
+	cfg.Fan.DeviceID = ids[0]
+	cfg.Fan.Enabled = true
+	// 只校验风扇段：这个命令不下发功耗限制，不该因为 RAPL 暂时读不到就整条失败
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
+		return err
+	}
+	if err := m.saveConfigLocked(cfg); err != nil {
+		return err
+	}
+	return m.applyFanLocked(cfg.Fan)
+}
+
 func (m *Manager) DisableAndRestore() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -800,7 +997,7 @@ func (m *Manager) validateLocked(cfg Config) error {
 	if err := m.validateGlobalLocked(cfg); err != nil {
 		return err
 	}
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		return err
 	}
 	return validateGPIOConfig(cfg.GPIO)
@@ -1155,6 +1352,7 @@ func (m *Manager) Status() Status {
 	status.FanControl = m.fanStatusLocked(status.Config.Fan)
 	status.Storage = m.StorageStatus()
 	status.GPIO = m.GPIOStatus(status.Config.GPIO)
+	status.StorageNotify = m.StorageInsertNotifyStatus(status.Config.GPIO.StorageNotifyEnabled())
 	return status
 }
 
