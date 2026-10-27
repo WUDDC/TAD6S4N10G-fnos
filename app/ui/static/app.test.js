@@ -3139,6 +3139,10 @@ test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，刷写
   const baseline = requests.length;
 
   await app.resolve('checkBIOSOnline')();
+  // 渐进式改造后终态渲染发生在 POST .then(微任务链)里,冲刷几拍再断言
+  await nextTick();
+  await nextTick();
+  await nextTick();
   const checkReq = requests.slice(baseline).find((item) => /bios-online\/check$/.test(item.url));
   assert.ok(checkReq, '检查要 POST bios-online/check');
   assert.equal(checkReq.init.method, 'POST');

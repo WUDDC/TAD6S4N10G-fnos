@@ -1,0 +1,5 @@
+#!/bin/sh
+# 群晖 DSM 升级前：DSM 会先 stop（守护进程自行恢复硬件状态）再替换载荷，
+# etc/、var/ 由 DSM 原样保留，无需备份迁移。
+set -eu
+exit 0

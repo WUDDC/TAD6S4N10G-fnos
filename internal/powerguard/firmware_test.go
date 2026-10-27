@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -787,4 +788,142 @@ func waitFirmwareJob(t *testing.T, manager *Manager) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("固件任务超时未结束")
+}
+
+func TestDetectNICFallsBackToDmesgWithoutMFT(t *testing.T) {
+	// 真机形态(群晖 DSM):无 flint/MFT,dmesg 里有 mlx5 探测行
+	manager := &Manager{}
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		switch name {
+		case "lspci":
+			return "0000:01:00.0 Ethernet controller [0200]: Mellanox ConnectX-4 LX [15b3:1015]\n", nil
+		case "dmesg":
+			return "[   32.401935] mlx5_core 0000:01:00.0: firmware version: 14.21.2320\n", nil
+		}
+		return "", errors.New("unexpected " + name)
+	}
+	info := manager.detectNIC(context.Background())
+	// parseMellanoxLspci 会剥掉 0000: 域前缀(flint -d 接受短格式)
+	if !info.present || info.pciAddress != "01:00.0" {
+		t.Fatalf("网卡识别失败: %+v", info)
+	}
+	if info.err != "" {
+		t.Fatalf("无 MFT 时应兜底成功而非报错: %q", info.err)
+	}
+	if info.fwVersion != "14.21.2320" {
+		t.Fatalf("固件版本应取自 dmesg: %q", info.fwVersion)
+	}
+}
+
+func TestFirmwareEthtoolFWRe(t *testing.T) {
+	// 真机 ethtool -i 输出:版本与 PSID 同行
+	out := "driver: mlx5_core\nversion: 5.0-0\nfirmware-version: 14.21.2320 (MT_2470112034)\n"
+	match := firmwareEthtoolFWRe.FindStringSubmatch(out)
+	if match == nil || match[1] != "14.21.2320" || match[2] != "MT_2470112034" {
+		t.Fatalf("ethtool 解析不符: %+v", match)
+	}
+	// 无 PSID 括注的形态
+	match = firmwareEthtoolFWRe.FindStringSubmatch("firmware-version: 16.35.2000\n")
+	if match == nil || match[1] != "16.35.2000" || match[2] != "" {
+		t.Fatalf("无 PSID 形态解析不符: %+v", match)
+	}
+}
+
+func TestEnsureFlashromNegativeCacheSkipsRedownload(t *testing.T) {
+	// 真机回归:DSM 上下载的 flashrom 跑不起来,曾导致每次 BIOS 检查都
+	// 重新下载几 MB——标记存在时必须直接失败且完全不触网
+	dir := t.TempDir()
+	manager := &Manager{StatePath: filepath.Join(dir, "state.json")}
+	fwDir := filepath.Join(dir, "firmware")
+	if err := os.MkdirAll(fwDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fwDir, "flashrom-incompatible"),
+		[]byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		t.Fatal("负缓存生效时不应触发下载")
+		return nil, nil
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	_, err := manager.ensureFlashrom(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "跳过重复下载") {
+		t.Fatalf("应命中负缓存快速失败: %v", err)
+	}
+}
+
+func TestEnsureFlashromNegativeCacheExpires(t *testing.T) {
+	// 标记 7 天后过期:环境变化(系统升级)后允许重新尝试下载
+	dir := t.TempDir()
+	manager := &Manager{StatePath: filepath.Join(dir, "state.json")}
+	fwDir := filepath.Join(dir, "firmware")
+	if err := os.MkdirAll(fwDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-8 * 24 * time.Hour).Unix()
+	if err := os.WriteFile(filepath.Join(fwDir, "flashrom-incompatible"),
+		[]byte(strconv.FormatInt(stale, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		return nil, errors.New("网络不可达(证明已过期并重新尝试下载)")
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	_, err := manager.ensureFlashrom(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "重新尝试下载") {
+		t.Fatalf("过期标记应放行下载: %v", err)
+	}
+}
+
+func TestFirmwareDeadDNSCache(t *testing.T) {
+	// 真机回归:resolv.conf 前两个 nameserver 不可达,每次 DNS 查询烧 10s+
+	firmwareDeadDNS.Lock()
+	firmwareDeadDNS.until = map[string]time.Time{}
+	firmwareDeadDNS.Unlock()
+	t.Cleanup(func() {
+		firmwareDeadDNS.Lock()
+		firmwareDeadDNS.until = nil
+		firmwareDeadDNS.Unlock()
+	})
+
+	if firmwareDNSServerDead("192.168.254.254") {
+		t.Fatal("未标记前不应视为死服务器")
+	}
+	firmwareMarkDNSDead("192.168.254.254", 5*time.Minute)
+	if !firmwareDNSServerDead("192.168.254.254") {
+		t.Fatal("标记后应视为死服务器")
+	}
+	if firmwareDNSServerDead("10.0.0.1") {
+		t.Fatal("其他服务器不受影响")
+	}
+	// TTL 过期自动恢复
+	firmwareMarkDNSDead("10.0.0.1", -time.Minute)
+	if firmwareDNSServerDead("10.0.0.1") {
+		t.Fatal("过期后应恢复")
+	}
+}
+
+func TestFirmwareDNSDialSkipsDeadServerInstantly(t *testing.T) {
+	firmwareDeadDNS.Lock()
+	firmwareDeadDNS.until = map[string]time.Time{"192.168.254.254": time.Now().Add(5 * time.Minute)}
+	firmwareDeadDNS.Unlock()
+	t.Cleanup(func() {
+		firmwareDeadDNS.Lock()
+		firmwareDeadDNS.until = nil
+		firmwareDeadDNS.Unlock()
+	})
+
+	start := time.Now()
+	_, err := firmwareDNSDial(context.Background(), "udp", "192.168.254.254:53")
+	if err == nil {
+		t.Fatal("死服务器应返回错误")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("死服务器应立即跳过,耗时 %v", elapsed)
+	}
 }

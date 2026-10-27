@@ -1,0 +1,295 @@
+#!/bin/sh
+# 套件服务真正实现：假定以 root 运行（正常路径 = 经 start-stop-status 薄壳由
+# SPM 的 spm-exec 提权；DSM 6/调试场景直接 root 调用）。
+#
+# 桌面嵌入模式（唯一模式）：
+#   - 守护进程只监听 127.0.0.1:8123（回环；Basic 认证整段不启用，鉴权由
+#     DSM 登录态承担——页面经 nginx 反代 /webman/3rdparty/tad-module/ 提供）
+#   - 启动时自愈 nginx 反代配置（/usr/local/etc/nginx/conf.d/tad-module.conf）
+#     并 reload nginx；写不进/校验失败只降级并留日志，不影响 DSM 自身
+#   - 若用户把 HTTP_ADDR 改成非回环地址，自动生成 Basic 凭据文件再启动
+#     （fail-closed，绝不裸暴露管理面）
+set -eu
+
+PKG="tad-module"
+# 目录解析:DSM 调用时带 SYNOPKG_* 环境变量(指向 <卷>/@appstore 与
+# <卷>/@appdata);手动/SSH 调用时没有——按脚本自身位置推导,并跟随
+# /var/packages/<pkg>/target 符号链接(DSM 卷安装的标准布局),var 目录
+# 按 @appdata 惯例回退。
+PKGDEST="${SYNOPKG_PKGDEST:-}"
+if [ -z "${PKGDEST}" ]; then
+  HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+  PKGDEST="$(dirname "${HERE}")"
+  if [ ! -x "${PKGDEST}/bin/tad-module" ] && [ -e "${PKGDEST}/target" ]; then
+    PKGDEST="$(readlink -f "${PKGDEST}/target")"
+  fi
+fi
+PKG_ETC="${SYNOPKG_PKGETC:-${PKGDEST}/etc}"
+PKG_VAR="${SYNOPKG_PKGVAR:-${PKGDEST}/var}"
+if [ -z "${SYNOPKG_PKGVAR:-}" ]; then
+  APPSTORE_PARENT="$(dirname "${PKGDEST}")"
+  case "${APPSTORE_PARENT}" in
+    */@appstore)
+      if [ -d "${APPSTORE_PARENT%/@appstore}/@appdata/${PKG}" ]; then
+        PKG_VAR="${APPSTORE_PARENT%/@appstore}/@appdata/${PKG}"
+      fi
+      ;;
+  esac
+fi
+BIN="${PKGDEST}/bin/tad-module"
+WEBROOT="${PKGDEST}/ui/static"
+PIDFILE="${PKG_VAR}/tad-module.pid"
+LOGFILE="${PKG_VAR}/tad-module.log"
+CFG="${PKG_ETC}/config.json"
+AUTH="${PKG_ETC}/web-auth.json"
+PROXY_TOKEN="${PKG_ETC}/proxy-token"
+BASE_PATH="/webman/3rdparty/${PKG}"
+NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"
+# 真机教训（SA6400/RR）：DSM 的 nginx 按模式 conf.d/dsm.*.conf 收纳 server 块内
+# 规则，文件名不带 dsm. 前缀不会被加载；location 必须带 ^~（正则优先级更高，
+# DSM 有 ~ /api/ 与 ~* \.css|.js 的全局规则会截胡页面资源与 API 路径）
+NGINX_CONF="${NGINX_CONF_DIR}/dsm.${PKG}.conf"
+
+HTTP_ADDR="127.0.0.1:8123"
+IT87_FORCE_ID=""
+CFG_FILE="${PKG_ETC}/tad-module.cfg"
+if [ -f "${CFG_FILE}" ]; then
+  # shellcheck disable=SC1090
+  . "${CFG_FILE}" || true
+fi
+
+daemon_pid() {
+  if [ -f "${PIDFILE}" ]; then
+    cat "${PIDFILE}" 2>/dev/null || true
+  fi
+}
+
+is_loopback_addr() {
+  case "${1:-}" in
+    127.*|localhost:*|localhost|\[::1\]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_power() {
+  # RR/DSM 内核不一定自动加载 RAPL（功耗限制的 sysfs 通路），尽力补载；
+  # 失败无害——功耗功能在守护进程内降级，其余功能不受影响。
+  [ -d /sys/class/powercap ] || modprobe intel_rapl 2>/dev/null || true
+  modprobe intel_rapl_msr 2>/dev/null || true
+}
+
+ensure_it87() {
+  # 已加载或已有 it87 hwmon 节点则不动；都没有再按配置的 force_id 试一次。
+  # DSM 没有 DKMS 工具链，系统没带模块时这一步必然失败，属预期：风扇页有提示。
+  grep -qw it87 /proc/modules 2>/dev/null && return 0
+  for name_file in /sys/class/hwmon/*/name; do
+    [ -r "${name_file}" ] || continue
+    if grep -q '^it87$' "${name_file}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  IT87_ARGS=""
+  [ -n "${IT87_FORCE_ID}" ] && IT87_ARGS="force_id=${IT87_FORCE_ID}"
+  modprobe it87 ${IT87_ARGS} 2>/dev/null || true
+}
+
+ensure_web_auth() {
+  # 仅非回环监听需要：没有凭据文件就生成一份（守护进程 fail-closed，
+  # 非回环无凭据会拒绝启动）。密码同时打印在启动日志里可见的文件中。
+  [ -f "${AUTH}" ] && return 0
+  PASSWORD="$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 24)"
+  printf '{"username":"admin","password":"%s"}\n' "${PASSWORD}" > "${AUTH}"
+  printf '%s\n' "${PASSWORD}" > "${PKG_ETC}/initial-password.txt"
+  chmod 600 "${AUTH}" "${PKG_ETC}/initial-password.txt"
+}
+
+ensure_proxy_token() {
+  # 反代↔守护进程共享密钥:root-only,反代携带、后端校验;无密钥的直连
+  # (含本机进程)一律拒绝
+  if [ -s "${PROXY_TOKEN}" ]; then
+    return 0
+  fi
+  tr -dc A-Za-z0-9 < /dev/urandom | head -c 40 > "${PROXY_TOKEN}"
+  chmod 600 "${PROXY_TOKEN}"
+}
+
+ensure_cfg() {
+  # 默认运行参数自愈:postinst 以套件用户跑,etc 被 root 属主时写不进
+  # (安装不阻断),这里在 root 语境补齐;已有配置(用户改过)不动
+  if [ -f "${CFG_FILE}" ]; then
+    return 0
+  fi
+  {
+    echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
+    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+    echo 'HTTP_ADDR="127.0.0.1:8123"'
+    echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
+    echo 'IT87_FORCE_ID=""'
+  } > "${CFG_FILE}" 2>/dev/null || true
+  chmod 600 "${CFG_FILE}" 2>/dev/null || true
+}
+
+ensure_nginx() {
+  # 自愈反代配置：/webman/3rdparty/tad-module/ → 127.0.0.1:8123（URI 原样
+  # 透传，守护进程 --base-path 负责剥前缀）。DSM 的 nginx 在 server 块里
+  # include conf.d/dsm.*.conf。
+  # 上游 review(PR#39)：/webman/3rdparty 路径并无 DSM 登录校验——反代不得
+  # 注入管理员身份，只带共享密钥标识来源；会话与管理员组校验由后端
+  # (authenticate.cgi + administrators)完成。写不进或 nginx -t 不过：
+  # 降级退出并留痕，绝不 reload 一个校验失败的配置。
+  mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null || {
+    echo "tad-module: 无法创建 ${NGINX_CONF_DIR}（/usr/local 不可写?），桌面嵌入入口不可用；可改用 ${HTTP_ADDR} 直连。" >&2
+    return 1
+  }
+  # 旧文件名（不带 dsm. 前缀，DSM 不加载）清理
+  rm -f "${NGINX_CONF_DIR}/${PKG}.conf" 2>/dev/null || true
+  ensure_proxy_token
+  TOKEN="$(cat "${PROXY_TOKEN}")"
+  if [ -f "${NGINX_CONF}" ] && grep -q "tad-module-managed v5" "${NGINX_CONF}" \
+      && grep -q "X-Tad-Proxy-Token \"${TOKEN}\"" "${NGINX_CONF}" 2>/dev/null; then
+    return 0
+  fi
+  # upstream 跟随 HTTP_ADDR(剥可能的 scheme 前缀),不能写死 127.0.0.1:8123
+  UPSTREAM="${HTTP_ADDR#http://}"
+  UPSTREAM="${UPSTREAM#https://}"
+  [ -n "${UPSTREAM}" ] || UPSTREAM="127.0.0.1:8123"
+  cat > "${NGINX_CONF}" <<'EOF'
+# tad-module-managed v5 —— 由 tad-module 套件启动脚本维护，勿手改
+# ^~ 必需：DSM 全局正则（~ /api/、~* .css/.js）优先级高于普通前缀，会截胡
+location ^~ /webman/3rdparty/tad-module/ {
+    proxy_pass http://@UPSTREAM@;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    # 仅共享密钥标识"来自可信反代";管理员身份由后端校验 DSM 会话
+    # (authenticate.cgi + administrators 组)后自行注入
+    proxy_set_header X-Tad-Proxy-Token "@TOKEN@";
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 300s;
+}
+EOF
+  sed -i -e "s|@TOKEN@|${TOKEN}|" -e "s|@UPSTREAM@|${UPSTREAM}|" "${NGINX_CONF}"
+  chmod 600 "${NGINX_CONF}"
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "tad-module: nginx -t 校验失败，已撤回反代配置（不影响 DSM 现有配置）。" >&2
+    rm -f "${NGINX_CONF}"
+    return 1
+  fi
+  if ! systemctl reload nginx >/dev/null 2>&1; then
+    echo "tad-module: nginx reload 失败，反代配置已写入但未生效（可稍后手动 systemctl reload nginx）。" >&2
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  start)
+    if [ -n "$(daemon_pid)" ] && kill -0 "$(daemon_pid)" 2>/dev/null; then
+      exit 0
+    fi
+    [ -x "${BIN}" ] || exit 1
+    mkdir -p "${PKG_VAR}"
+    rm -f "${PIDFILE}"
+    ensure_power
+    ensure_cfg
+    ensure_it87
+    # 旧版默认值迁移：独立端口时代遗留的 ":8123" 改为回环绑定
+    if [ "${HTTP_ADDR}" = ":8123" ]; then
+      HTTP_ADDR="127.0.0.1:8123"
+      if [ -f "${CFG_FILE}" ]; then
+        sed -i "s|^HTTP_ADDR=.*|HTTP_ADDR=\"${HTTP_ADDR}\"|" "${CFG_FILE}" 2>/dev/null || true
+      fi
+    fi
+    AUTH_ARGS=""
+    if is_loopback_addr "${HTTP_ADDR}"; then
+      ensure_nginx || true
+      AUTH_ARGS="--dsm-auth --proxy-token-file ${PROXY_TOKEN}"
+    else
+      ensure_web_auth
+      AUTH_ARGS="--auth-file ${AUTH}"
+      echo "tad-module: 非回环直连监听未启用 TLS，Basic 凭据将以明文传输；建议改为经 HTTPS 的 DSM 反代访问。" >&2
+    fi
+    setsid "${BIN}" serve \
+      --config "${CFG}" \
+      --state "${PKG_VAR}/original-state.json" \
+      --web-root "${WEBROOT}" \
+      --log "${LOGFILE}" \
+      --socket-group none \
+      --base-path "${BASE_PATH}" \
+      --http "${HTTP_ADDR}" \
+      ${AUTH_ARGS} \
+      >> "${LOGFILE}" 2>&1 &
+    echo $! > "${PIDFILE}"
+    # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
+    # 否则 DSM 会把套件标成已启动。
+    i=0
+    while [ "${i}" -lt 8 ]; do
+      sleep 1
+      if ! kill -0 "$(daemon_pid)" 2>/dev/null; then
+        rm -f "${PIDFILE}"
+        echo "tad-module 在启动阶段退出，最近日志："
+        tail -n 5 "${LOGFILE}" 2>/dev/null || true
+        exit 1
+      fi
+      i=$((i + 1))
+    done
+    exit 0
+    ;;
+  stop)
+    pid="$(daemon_pid)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      # 宽限 30 秒：守护进程要在退出前恢复功耗/风扇原始状态（含蜂鸣提示音）
+      i=0
+      while [ "${i}" -lt 30 ] && kill -0 "${pid}" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    fi
+    rm -f "${PIDFILE}"
+    exit 0
+    ;;
+  release-fans)
+    # 卸载兜底(经薄壳以 root 执行):直接跑 release-fans 会因套件用户的
+    # requireRoot 失败且被吞掉——必须走本脚本(同 stop 一样具备 root 语境)
+    if [ -x "${BIN}" ] && [ -f "${CFG}" ]; then
+      "${BIN}" release-fans \
+        --config "${CFG}" \
+        --state "${PKG_VAR}/original-state.json" || true
+    fi
+    exit 0
+    ;;
+  cleanup-nginx)
+    # 卸载清理(经 start-stop-status 薄壳提权执行):只删确认属于本套件的
+    # 反代配置(须含 managed 标记,误碰他家文件),nginx -t 校验通过才
+    # reload;顺带清共享密钥。全部 best-effort,不阻断卸载。
+    for conf in "${NGINX_CONF}" "${NGINX_CONF_DIR}/${PKG}.conf"; do
+      [ -f "${conf}" ] || continue
+      grep -q "tad-module-managed" "${conf}" 2>/dev/null || continue
+      rm -f "${conf}"
+    done
+    if nginx -t >/dev/null 2>&1; then
+      systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    rm -f "${PROXY_TOKEN}" 2>/dev/null || true
+    exit 0
+    ;;
+  status)
+    pid="$(daemon_pid)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      exit 0
+    fi
+    exit 1
+    ;;
+  log)
+    echo "${LOGFILE}"
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status|log}"
+    exit 1
+    ;;
+esac

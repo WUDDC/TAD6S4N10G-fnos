@@ -202,6 +202,7 @@ type PackageStatus struct {
 
 type Status struct {
 	Version           string               `json:"version"`
+	Platform          string               `json:"platform,omitempty"`
 	DeviceName        string               `json:"device_name,omitempty"`
 	OSName            string               `json:"os_name,omitempty"`
 	OSVersion         string               `json:"os_version,omitempty"`
@@ -343,16 +344,17 @@ type Manager struct {
 
 	// 固件升级（firmware.go）：任务状态与网卡探测缓存都在内存里，不落盘；
 	// 刷写任务同一时刻只允许一个，状态接口只读缓存、不执行外部命令。
-	firmwareMu       sync.Mutex
-	firmwareJob      firmwareJobState
-	firmwareNIC      firmwareNICInfo
-	firmwareExec     firmwareCommandRunner // 测试注入，nil 时执行真实命令
-	firmwareFlint    string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
-	firmwareMST      string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
-	firmwareFPT      string                // 测试注入的 FPT 路径，空则按数据目录/内置路径查找
-	firmwareFlashrom string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
-	flashromMu       sync.Mutex            // flashrom 自动下载串行化：并发获取只下载一次，且半成品不对外可见
-	biosOnline       biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
+	firmwareMu        sync.Mutex
+	firmwareJob       firmwareJobState
+	firmwareNIC       firmwareNICInfo
+	firmwareExec      firmwareCommandRunner // 测试注入，nil 时执行真实命令
+	firmwareFlint     string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
+	firmwareMST       string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
+	firmwareFPT       string                // 测试注入的 FPT 路径，空则按数据目录/内置路径查找
+	firmwareFlashrom  string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
+	flashromMu        sync.Mutex            // flashrom 自动下载串行化：并发获取只下载一次，且半成品不对外可见
+	biosOnline        biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
+	biosOnlineRunning bool                  // 在线检查后台执行中（随 firmwareMu 保护），挡并发重复触发
 	// shutdownPending 计划关机已提交占位（随 firmwareMu 保护）：与刷写启动共用
 	// 同一把锁做原子互斥，占位期间 beginFirmwareJob 一律拒绝，见
 	// tryAcquireShutdownSlot / power_schedule.go。
@@ -1294,6 +1296,7 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	status := Status{Version: m.Version, LastApply: m.lastApply, LastError: m.lastError}
+	status.Platform = DetectPlatform(m.Root)
 	status.DeviceName, status.OSName, status.OSVersion = m.deviceSystemInfo()
 	if m.fanLastError != "" {
 		status.LastError = combineError(status.LastError, errors.New(m.fanLastError))

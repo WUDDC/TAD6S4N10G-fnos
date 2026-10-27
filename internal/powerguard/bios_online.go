@@ -42,6 +42,9 @@ type biosFID struct {
 	Version   string
 	BuildDate time.Time
 	BuildText string
+	// degraded: 版本来自 dmidecode 兜底(AMI 主版本),不是 flashrom 的精确
+	// $FID——群晖 DSM 自带 libpci 过旧,厂商 flashrom 跑不起来
+	degraded bool
 }
 
 type biosIndexRecord struct {
@@ -62,19 +65,24 @@ type biosChangelog struct {
 
 // BIOSOnlineStatus 是在线检查的结果，全部可 JSON 序列化给前端。
 type BIOSOnlineStatus struct {
-	CheckedAt          time.Time `json:"checked_at"`
-	Model              string    `json:"model"`
-	CurrentBoardID     string    `json:"current_board_id"`
-	CurrentVersion     string    `json:"current_version"`
-	CurrentBuildDate   string    `json:"current_build_date"`
-	CurrentError       string    `json:"current_error,omitempty"`
-	CandidateZip       string    `json:"candidate_zip"`
-	CandidateVersion   string    `json:"candidate_version"`
-	CandidateBuildDate string    `json:"candidate_build_date"`
-	DownloadURL        string    `json:"download_url"`
-	UpdateAvailable    bool      `json:"update_available"`
-	Changelog          string    `json:"changelog"`
-	Error              string    `json:"error,omitempty"`
+	CheckedAt        time.Time `json:"checked_at"`
+	Model            string    `json:"model"`
+	CurrentBoardID   string    `json:"current_board_id"`
+	CurrentVersion   string    `json:"current_version"`
+	CurrentBuildDate string    `json:"current_build_date"`
+	CurrentError     string    `json:"current_error,omitempty"`
+	// CurrentVersionNote 非空表示当前版本来自降级读取(如 DSM 上的 dmidecode),
+	// 只到 AMI 主版本精度,前端随版本号一并展示
+	CurrentVersionNote string `json:"current_version_note,omitempty"`
+	// Checking: 检查进行中。各阶段完成即发布快照进缓存,前端轮询渐进渲染。
+	Checking           bool   `json:"checking,omitempty"`
+	CandidateZip       string `json:"candidate_zip"`
+	CandidateVersion   string `json:"candidate_version"`
+	CandidateBuildDate string `json:"candidate_build_date"`
+	DownloadURL        string `json:"download_url"`
+	UpdateAvailable    bool   `json:"update_available"`
+	Changelog          string `json:"changelog"`
+	Error              string `json:"error,omitempty"`
 }
 
 // biosOnlineCache 缓存最近一次检查选中的候选记录，刷写时凭它下载。
@@ -250,6 +258,45 @@ func biosZipModel(zipName string) string {
 
 // readCurrentBIOSFID 用 flashrom 读出当前 BIOS 区域并解析 $FID。
 func (m *Manager) readCurrentBIOSFID(ctx context.Context) (biosFID, error) {
+	fid, flashErr := m.readCurrentBIOSFIDViaFlashrom(ctx)
+	if flashErr == nil {
+		return fid, nil
+	}
+	// flashrom 不可用(群晖 DSM 自带 libpci 过旧,厂商 flashrom 报 LIBPCI_3.8
+	// not found)时退而求其次:dmidecode 读 AMI 主版本+发布日期,精度降级
+	if dmi, ok := m.readBIOSVersionViaDMI(ctx); ok {
+		dmi.degraded = true
+		return dmi, nil
+	}
+	return biosFID{}, flashErr
+}
+
+var dmiBiosDateRe = regexp.MustCompile(`(?m)^\s*Release Date:\s*(\d{2})/(\d{2})/(\d{4})`)
+
+// readBIOSVersionViaDMI 经 dmidecode 读 BIOS 主版本(真机输出 "5.27",对应
+// TAD 四段版本的前两组 05.27)与发布日期(MM/DD/YYYY)。读不到日期只给版本。
+func (m *Manager) readBIOSVersionViaDMI(ctx context.Context) (biosFID, bool) {
+	version, err := m.runFirmwareCommand(ctx, "", "dmidecode", []string{"-s", "bios-version"})
+	version = strings.TrimSpace(version)
+	if err != nil || version == "" || strings.Contains(version, "#") {
+		return biosFID{}, false
+	}
+	fid := biosFID{Version: version}
+	if out, dateErr := m.runFirmwareCommand(ctx, "", "dmidecode", []string{"-t", "bios"}); dateErr == nil {
+		if match := dmiBiosDateRe.FindStringSubmatch(out); match != nil {
+			month, _ := strconv.Atoi(match[1])
+			day, _ := strconv.Atoi(match[2])
+			year, _ := strconv.Atoi(match[3])
+			if year > 2000 && month >= 1 && month <= 12 && day >= 1 && day <= 31 {
+				fid.BuildDate = time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.UTC)
+				fid.BuildText = fmt.Sprintf("%04d-%02d-%02d", year, month, day)
+			}
+		}
+	}
+	return fid, true
+}
+
+func (m *Manager) readCurrentBIOSFIDViaFlashrom(ctx context.Context) (biosFID, error) {
 	var data []byte
 	if biosFIDReadHook != nil {
 		var err error
@@ -296,6 +343,54 @@ func (m *Manager) cpuModel() string {
 	return detectCPUModel(string(data))
 }
 
+// fetchBIOSIndex 拉取索引并对瞬时抖动重试一次:索引文件只有几 KB,厂商 CDN
+// 冷路径握手慢 + NAS 本地 DNS 忽好忽坏(真机实测),单次失败立即重试比让用户
+// 手动再点一次体验好得多;重试间隔 1 秒,上下文取消即时返回。
+func fetchBIOSIndex(ctx context.Context) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		data, err := downloadFirmwareFile(ctx, biosIndexURL(), biosIndexMaxBytes)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	return nil, lastErr
+}
+
+// StartBIOSOnlineCheck 后台启动一次在线检查并立即返回:POST 端点不再同步
+// 等整个检查跑完(连接断开/页面刷新也不会取消检查),进度经缓存快照由
+// GET 轮询渐进可见。已在跑时返回 false,不叠加并发检查。
+func (m *Manager) StartBIOSOnlineCheck() bool {
+	m.firmwareMu.Lock()
+	if m.biosOnlineRunning {
+		m.firmwareMu.Unlock()
+		return false
+	}
+	m.biosOnlineRunning = true
+	// 同步发布"检查中"快照:POST 的响应体本身就是 checking 状态,
+	// 前端拿到即可进入轮询节奏,不依赖与后台 goroutine 的时序
+	status := BIOSOnlineStatus{CheckedAt: time.Now(), Model: m.cpuModel(), Checking: true}
+	m.biosOnline = biosOnlineCache{status: status}
+	m.firmwareMu.Unlock()
+	go func() {
+		defer func() {
+			m.firmwareMu.Lock()
+			m.biosOnlineRunning = false
+			m.firmwareMu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+		defer cancel()
+		m.CheckBIOSOnline(ctx)
+	}()
+	return true
+}
+
 // BIOSOnline 返回缓存的在线检查结果（不触发网络/刷写工具）。
 func (m *Manager) BIOSOnline() BIOSOnlineStatus {
 	m.firmwareMu.Lock()
@@ -305,76 +400,146 @@ func (m *Manager) BIOSOnline() BIOSOnlineStatus {
 
 // CheckBIOSOnline 拉取 zip.txt 索引、读取当前 flash 的 $FID，判定是否有可升级版本。
 func (m *Manager) CheckBIOSOnline(ctx context.Context) BIOSOnlineStatus {
-	status := BIOSOnlineStatus{CheckedAt: time.Now(), Model: m.cpuModel()}
+	status := BIOSOnlineStatus{CheckedAt: time.Now(), Model: m.cpuModel(), Checking: true}
 	cache := biosOnlineCache{status: status}
-	defer func() {
+	// 每个阶段完成即发布快照:GET /api/firmware/bios-online 立即可见,
+	// 前端轮询渐进渲染,不必等整个检查跑完。
+	// 注意必须在这里同步 cache.status = status:cache 捕获的是创建时的
+	// 结构体副本,调用方改完 status 直接 publish 才不会把旧快照发出去
+	publish := func() {
+		cache.status = status
 		m.firmwareMu.Lock()
 		m.biosOnline = cache
 		m.firmwareMu.Unlock()
+	}
+	publish()
+
+	// 当前版本(本地:flashrom/dmidecode)与在线索引(CDN)两路并行取,主循环
+	// select 谁先回来就先应用并发布谁——DSM 上 CDN 慢(先见本机型号/当前版本),
+	// fnOS 上 flashrom dump 可能更慢(先见候选版本),两种环境页面都不空等。
+	type biosFIDResult struct {
+		fid biosFID
+		err error
+	}
+	type biosIndexResult struct {
+		data []byte
+		err  error
+	}
+	fidCh := make(chan biosFIDResult, 1)
+	idxCh := make(chan biosIndexResult, 1)
+	go func() {
+		fid, err := m.readCurrentBIOSFID(ctx)
+		fidCh <- biosFIDResult{fid: fid, err: err}
+	}()
+	go func() {
+		data, err := fetchBIOSIndex(ctx)
+		idxCh <- biosIndexResult{data: data, err: err}
 	}()
 
-	data, err := downloadFirmwareFile(ctx, biosIndexURL(), biosIndexMaxBytes)
-	if err != nil {
-		status.Error = fmt.Sprintf("获取 BIOS 索引失败: %v", err)
-		cache.status = status
-		return status
-	}
-	records, changelogs := parseBIOSIndex(string(data))
-	if len(records) == 0 {
-		status.Error = "BIOS 索引中没有可用的固件记录"
-		cache.status = status
-		return status
-	}
-
-	fid, fidErr := m.readCurrentBIOSFID(ctx)
-	if fidErr != nil {
-		status.CurrentError = fidErr.Error()
-	} else {
-		status.CurrentBoardID = fid.BoardID
-		status.CurrentVersion = fid.Version
-		status.CurrentBuildDate = fid.BuildText
-	}
-
-	// 严格同机型匹配：N150 与 N100/N305 互刷会砖，N100 与 N305 互刷也有问题。
-	var candidate biosIndexRecord
-	found := false
-	for _, record := range records {
-		if status.Model == "" || biosZipModel(record.ZipName) != status.Model {
-			continue
-		}
-		if !found || record.BuildDate.After(candidate.BuildDate) {
-			candidate, found = record, true
-		}
-	}
-	if !found {
-		if status.Model == "" {
-			status.Error = "无法识别本机 CPU 型号（需要 N100/N150/N305），已停止在线判定"
+	var fid biosFID
+	var fidErr error
+	haveFID := false
+	applyFID := func(res biosFIDResult) {
+		fid, fidErr, haveFID = res.fid, res.err, true
+		if fidErr != nil {
+			status.CurrentError = fidErr.Error()
 		} else {
-			status.Error = fmt.Sprintf("索引中没有匹配本机 %s 的固件包", status.Model)
+			status.CurrentBoardID = fid.BoardID
+			status.CurrentVersion = fid.Version
+			status.CurrentBuildDate = fid.BuildText
+			if fid.degraded {
+				status.CurrentVersionNote = "当前环境无法运行 flashrom，仅能读取 AMI 主版本，精确小版本不可用"
+			}
 		}
-		cache.status = status
-		return status
+		publish()
 	}
 
-	status.CandidateZip = candidate.ZipName
-	status.CandidateVersion = candidate.Version
-	status.CandidateBuildDate = candidate.BuildText
-	status.DownloadURL = biosZipURL(candidate.ZipName)
+	// 索引结果一到就匹配候选并发布(机型匹配只依赖 Model,不必等 FID)
+	var candidate biosIndexRecord
+	haveCandidate := false
+	var indexErr error
+	applyIndex := func(res biosIndexResult) {
+		if res.err != nil {
+			indexErr = res.err
+			return
+		}
+		records, changelogs := parseBIOSIndex(string(res.data))
+		if len(records) == 0 {
+			indexErr = errors.New("BIOS 索引中没有可用的固件记录")
+			return
+		}
+		// 严格同机型匹配：N150 与 N100/N305 互刷会砖，N100 与 N305 互刷也有问题。
+		found := false
+		for _, record := range records {
+			if status.Model == "" || biosZipModel(record.ZipName) != status.Model {
+				continue
+			}
+			if !found || record.BuildDate.After(candidate.BuildDate) {
+				candidate, found = record, true
+			}
+		}
+		if !found {
+			if status.Model == "" {
+				indexErr = errors.New("无法识别本机 CPU 型号（需要 N100/N150/N305），已停止在线判定")
+			} else {
+				indexErr = fmt.Errorf("索引中没有匹配本机 %s 的固件包", status.Model)
+			}
+			return
+		}
+		status.CandidateZip = candidate.ZipName
+		status.CandidateVersion = candidate.Version
+		status.CandidateBuildDate = candidate.BuildText
+		status.DownloadURL = biosZipURL(candidate.ZipName)
+		// 更新日志只保留日期与压缩包文件名日期一致的段落。
+		if dateMatch := biosZipDateRe.FindStringSubmatch(candidate.ZipName); len(dateMatch) >= 2 {
+			for _, changelog := range changelogs {
+				if changelog.Date == dateMatch[1] {
+					status.Changelog = changelog.Text
+					break
+				}
+			}
+		}
+		haveCandidate = true
+		cache.candidate = candidate
+		cache.hasCandi = true
+		publish()
+	}
+
+	haveIndex := false
+	for !haveFID || !haveIndex {
+		select {
+		case res := <-fidCh:
+			applyFID(res)
+		case res := <-idxCh:
+			applyIndex(res)
+			haveIndex = true
+			if indexErr == nil && !haveCandidate {
+				// applyIndex 内部已 publish 候选;走到这里说明无候选,
+				// 把索引侧的错误状态也亮出来
+				publish()
+			}
+		case <-ctx.Done():
+			// 取消时不再等待两路收尾,直接以当前已发布内容收束
+			if !haveFID {
+				applyFID(biosFIDResult{err: ctx.Err()})
+			}
+			if !haveIndex {
+				indexErr = ctx.Err()
+			}
+			haveFID, haveIndex = true, true
+		}
+	}
+
+	status.Checking = false
+	if indexErr != nil {
+		status.Error = fmt.Sprintf("获取 BIOS 在线信息失败: %v", indexErr)
+		publish()
+		return status
+	}
 	if !fid.BuildDate.IsZero() && candidate.BuildDate.After(fid.BuildDate) {
 		status.UpdateAvailable = true
 	}
-	// 更新日志只保留日期与压缩包文件名日期一致的段落。
-	if dateMatch := biosZipDateRe.FindStringSubmatch(candidate.ZipName); len(dateMatch) >= 2 {
-		for _, changelog := range changelogs {
-			if changelog.Date == dateMatch[1] {
-				status.Changelog = changelog.Text
-				break
-			}
-		}
-	}
-	cache.candidate = candidate
-	cache.hasCandi = true
-	cache.status = status
+	publish()
 	return status
 }
 
