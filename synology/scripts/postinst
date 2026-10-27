@@ -1,0 +1,107 @@
+#!/bin/sh
+# 群晖 DSM 安装/升级后：初始化目录、配置、Web 认证凭据，并做与 fnOS
+# install_callback 等价的首次绑定。升级时 etc/、var/ 由 DSM 保留，已有配置与
+# 凭据一律不覆盖。
+#
+# 本脚本任何一步失败都会让 DSM 报「无法正确安装此套件」，所以：所有写入都
+# 限定在套件目录内；所有硬件相关步骤（init/RAPL、it87、绑风扇）一律降级不
+# 阻断；并留调试日志（var/postinst-debug.log，分步留痕）供真机排障。
+set -eu
+
+PKG="tad-module"
+PKGDEST="${SYNOPKG_PKGDEST:-/var/packages/${PKG}}"
+PKG_ETC="${SYNOPKG_PKGETC:-${PKGDEST}/etc}"
+PKG_VAR="${SYNOPKG_PKGVAR:-${PKGDEST}/var}"
+BIN="${PKGDEST}/bin/tad-module"
+DEBUG_LOG="${PKG_VAR}/postinst-debug.log"
+
+mkdir -p "${PKG_ETC}" "${PKG_VAR}"
+: > "${DEBUG_LOG}"
+
+# dash/busybox 无 ERR trap（bash 专属），调试靠下方 log() 分步留痕：
+# postinst 若失败，看本日志最后一个 completed 步骤，失败点即其后一步。
+log() {
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') $*" >> "${DEBUG_LOG}" 2>/dev/null || true
+}
+
+chmod 700 "${PKG_ETC}" "${PKG_VAR}"
+
+# 全新安装（没有旧配置）才把三条曲线的默认绑定和开关补上；
+# 卸载后重装时配置还在（风扇控制已被释放为关闭），不能又把它打开。
+FRESH_INSTALL=0
+if [ ! -f "${PKG_ETC}/config.json" ]; then
+  FRESH_INSTALL=1
+fi
+log "start fresh=${FRESH_INSTALL}"
+
+# CPU 识别 + RAPL 写入初始化。fnOS 版这里一票否决；DSM（RR）上 intel_rapl
+# 可能未加载/未就绪，硬拒装会把整套件挡在门外，改降级安装：失败仅提示，
+# 安装照常。功耗功能在服务端自行降级（serve 对不支持的 CPU 会拒绝启动并留
+# 日志；RAPL 缺失只影响功耗页，监控/风扇/硬盘面板不受影响）。
+if ! "${BIN}" init \
+  --config "${PKG_ETC}/config.json" \
+  --state "${PKG_VAR}/original-state.json" 2>> "${DEBUG_LOG}"; then
+  log "init failed (CPU/RAPL), degraded"
+  echo "警告：硬件初始化未通过（CPU 不受支持或 RAPL 功耗接口不可用）。功耗限制功能将不可用；监控、风扇、硬盘面板等功能不受影响。"
+fi
+log "init done"
+
+# it87 风扇驱动：群晖 DSM 没有 DKMS/gcc/内核头工具链，不做编译安装；
+# 仅当系统已经自带（引导加载器 extra 驱动等）时尝试加载。失败不阻断安装，
+# 风扇页会给出平台对应的提示。
+if ! grep -qw it87 /proc/modules 2>/dev/null; then
+  IT87_ARGS=""
+  CFG_FILE="${PKG_ETC}/tad-module.cfg"
+  IT87_FORCE_ID=""
+  if [ -f "${CFG_FILE}" ]; then
+    # shellcheck disable=SC1090
+    . "${CFG_FILE}" || true
+    IT87_ARGS="${IT87_FORCE_ID}"
+  fi
+  modprobe it87 ${IT87_ARGS} 2>/dev/null || \
+    log "it87 not available (expected on stock DSM without extra drivers)" || true
+fi
+log "it87 step done"
+
+# 全新安装默认全启：三条曲线都绑到所有风扇上，曲线用平衡档。
+# 驱动刚起来时转速可能还没读到，失败只提示——用户可在风扇页手动开启。
+if [ "${FRESH_INSTALL}" = "1" ]; then
+  if ! "${BIN}" bind-all-fans \
+    --config "${PKG_ETC}/config.json" \
+    --state "${PKG_VAR}/original-state.json" 2>> "${DEBUG_LOG}"; then
+    log "bind-all-fans failed (driver not ready?), skip"
+    echo "未能自动绑定风扇（多为驱动刚加载、转速还没读上来）。请在风扇页勾选风扇并开启风扇曲线。"
+  fi
+fi
+log "fans step done"
+
+# Web 认证凭据：首次安装生成随机密码（Basic 认证）。
+# 没有它，TCP 监听只允许绑回环地址，等于不可用；凭据文件 root-only。
+# 密码用 tr 方案（busybox 的 od 不支持 -An/-N/-t 组合，曾致 postinst exit 1）
+if [ ! -f "${PKG_ETC}/web-auth.json" ]; then
+  PASSWORD="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
+  printf '{"username":"admin","password":"%s"}\n' "${PASSWORD}" > "${PKG_ETC}/web-auth.json"
+  printf '%s\n' "${PASSWORD}" > "${PKG_ETC}/initial-password.txt"
+  chmod 600 "${PKG_ETC}/web-auth.json" "${PKG_ETC}/initial-password.txt"
+fi
+log "auth step done"
+
+# 运行参数默认值：写进套件自己的 etc/（DSM 升级同样保留）。
+# 真机教训：/usr/local 在部分 DSM/RR 系统上不可写（postinst 曾死在这里），
+# 一律不碰 /usr/local；改端口/force_id 请直接编辑本文件后重启套件。
+log "cfg step: begin"
+CFG_FILE="${PKG_ETC}/tad-module.cfg"
+if [ ! -f "${CFG_FILE}" ]; then
+  {
+    echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
+    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+    echo 'HTTP_ADDR="127.0.0.1:8123"'
+    echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
+    echo 'IT87_FORCE_ID=""'
+  } > "${CFG_FILE}"
+  chmod 600 "${CFG_FILE}"
+fi
+log "cfg step done, postinst ok"
+
+exit 0

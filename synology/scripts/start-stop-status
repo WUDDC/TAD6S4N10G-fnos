@@ -1,0 +1,32 @@
+#!/bin/sh
+# 群晖 DSM 7 起第三方套件服务不允许直接以 root 运行（run-as root 会被拒，
+# 而功耗/风扇/GPIO/SMART 都需要 root）。本脚本因此只是提权入口：
+#   - 已是 root（DSM 6、开发调试）→ 直接执行 real-start-stop-status
+#   - 否则经 SimplePermissionManager（SPM）的 setuid 入口 spm-exec 提权转发。
+#     spm-exec 按调用方 UID 查 SPM 的授权表（Package 标签勾选启用本套件即可，
+#     无需逐脚本 GPG 签名；签名链只是免手动勾选的自动批准通道）。
+#
+# 用户前置流程：安装并「激活」SPM → 安装本套件 → SPM 的 Package 标签勾选
+# 启用 tad-module → 启动本套件。
+set -eu
+
+PKG="tad-module"
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+REAL="${HERE}/real-start-stop-status"
+
+if [ "$(id -u)" = "0" ]; then
+  exec sh "${REAL}" "$@"
+fi
+
+SPM_EXEC="/usr/local/bin/spm-exec"
+if [ ! -x "${SPM_EXEC}" ]; then
+  echo "本套件需要 root 权限（功耗/风扇/GPIO/SMART 硬件通路），而 DSM 7 禁止第三方套件直接以 root 运行。" >&2
+  echo "请按顺序操作：" >&2
+  echo "  1. 套件中心安装 SimplePermissionManager 并打开其界面点 Active 激活" >&2
+  echo "     （https://github.com/XPEnology-Community/SimplePermissionManager）" >&2
+  echo "  2. 在 SPM 界面的 Package 标签勾选启用 ${PKG}" >&2
+  echo "  3. 回到套件中心启动本套件" >&2
+  exit 1
+fi
+
+exec "${SPM_EXEC}" sh "${REAL}" "$@"

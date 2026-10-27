@@ -1,0 +1,13 @@
+#!/bin/sh
+# 群晖 DSM 安装前检查：仅支持 x86_64。
+set -eu
+
+case "$(uname -m)" in
+  x86_64|amd64) ;;
+  *)
+    echo "TAD6S4N模块仅支持 x86_64 平台。"
+    exit 1
+    ;;
+esac
+
+exit 0

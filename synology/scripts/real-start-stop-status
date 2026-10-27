@@ -1,0 +1,206 @@
+#!/bin/sh
+# 套件服务真正实现：假定以 root 运行（正常路径 = 经 start-stop-status 薄壳由
+# SPM 的 spm-exec 提权；DSM 6/调试场景直接 root 调用）。
+#
+# 桌面嵌入模式（唯一模式）：
+#   - 守护进程只监听 127.0.0.1:8123（回环；Basic 认证整段不启用，鉴权由
+#     DSM 登录态承担——页面经 nginx 反代 /webman/3rdparty/tad-module/ 提供）
+#   - 启动时自愈 nginx 反代配置（/usr/local/etc/nginx/conf.d/tad-module.conf）
+#     并 reload nginx；写不进/校验失败只降级并留日志，不影响 DSM 自身
+#   - 若用户把 HTTP_ADDR 改成非回环地址，自动生成 Basic 凭据文件再启动
+#     （fail-closed，绝不裸暴露管理面）
+set -eu
+
+PKG="tad-module"
+PKGDEST="${SYNOPKG_PKGDEST:-/var/packages/${PKG}}"
+PKG_ETC="${SYNOPKG_PKGETC:-${PKGDEST}/etc}"
+PKG_VAR="${SYNOPKG_PKGVAR:-${PKGDEST}/var}"
+BIN="${PKGDEST}/bin/tad-module"
+WEBROOT="${PKGDEST}/ui/static"
+PIDFILE="${PKG_VAR}/tad-module.pid"
+LOGFILE="${PKG_VAR}/tad-module.log"
+CFG="${PKG_ETC}/config.json"
+AUTH="${PKG_ETC}/web-auth.json"
+BASE_PATH="/webman/3rdparty/${PKG}"
+NGINX_CONF_DIR="/usr/local/etc/nginx/conf.d"
+# 真机教训（SA6400/RR）：DSM 的 nginx 按模式 conf.d/dsm.*.conf 收纳 server 块内
+# 规则，文件名不带 dsm. 前缀不会被加载；location 必须带 ^~（正则优先级更高，
+# DSM 有 ~ /api/ 与 ~* \.css|.js 的全局规则会截胡页面资源与 API 路径）
+NGINX_CONF="${NGINX_CONF_DIR}/dsm.${PKG}.conf"
+
+HTTP_ADDR="127.0.0.1:8123"
+IT87_FORCE_ID=""
+CFG_FILE="${PKG_ETC}/tad-module.cfg"
+if [ -f "${CFG_FILE}" ]; then
+  # shellcheck disable=SC1090
+  . "${CFG_FILE}" || true
+fi
+
+daemon_pid() {
+  if [ -f "${PIDFILE}" ]; then
+    cat "${PIDFILE}" 2>/dev/null || true
+  fi
+}
+
+is_loopback_addr() {
+  case "${1:-}" in
+    127.*|localhost:*|localhost|\[::1\]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_power() {
+  # RR/DSM 内核不一定自动加载 RAPL（功耗限制的 sysfs 通路），尽力补载；
+  # 失败无害——功耗功能在守护进程内降级，其余功能不受影响。
+  [ -d /sys/class/powercap ] || modprobe intel_rapl 2>/dev/null || true
+  modprobe intel_rapl_msr 2>/dev/null || true
+}
+
+ensure_it87() {
+  # 已加载或已有 it87 hwmon 节点则不动；都没有再按配置的 force_id 试一次。
+  # DSM 没有 DKMS 工具链，系统没带模块时这一步必然失败，属预期：风扇页有提示。
+  grep -qw it87 /proc/modules 2>/dev/null && return 0
+  for name_file in /sys/class/hwmon/*/name; do
+    [ -r "${name_file}" ] || continue
+    if grep -q '^it87$' "${name_file}" 2>/dev/null; then
+      return 0
+    fi
+  done
+  IT87_ARGS=""
+  [ -n "${IT87_FORCE_ID}" ] && IT87_ARGS="force_id=${IT87_FORCE_ID}"
+  modprobe it87 ${IT87_ARGS} 2>/dev/null || true
+}
+
+ensure_web_auth() {
+  # 仅非回环监听需要：没有凭据文件就生成一份（守护进程 fail-closed，
+  # 非回环无凭据会拒绝启动）。密码同时打印在启动日志里可见的文件中。
+  [ -f "${AUTH}" ] && return 0
+  PASSWORD="$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 24)"
+  printf '{"username":"admin","password":"%s"}\n' "${PASSWORD}" > "${AUTH}"
+  printf '%s\n' "${PASSWORD}" > "${PKG_ETC}/initial-password.txt"
+  chmod 600 "${AUTH}" "${PKG_ETC}/initial-password.txt"
+}
+
+ensure_nginx() {
+  # 自愈反代配置：/webman/3rdparty/tad-module/ → 127.0.0.1:8123（URI 原样
+  # 透传，守护进程 --base-path 负责剥前缀）。DSM 的 nginx 在 server 块里
+  # include conf.d/*.conf，login 门槛由 /webman 前缀天然携带。
+  # 写不进（/usr/local 不可写）或 nginx -t 不过：降级退出并留痕，绝不
+  # reload 一个校验失败的配置。
+  mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null || {
+    echo "tad-module: 无法创建 ${NGINX_CONF_DIR}（/usr/local 不可写?），桌面嵌入入口不可用；可改用 ${HTTP_ADDR} 直连。" >&2
+    return 1
+  }
+  # 旧文件名（不带 dsm. 前缀，DSM 不加载）清理
+  rm -f "${NGINX_CONF_DIR}/${PKG}.conf" 2>/dev/null || true
+  if [ -f "${NGINX_CONF}" ] && grep -q "tad-module-managed v3" "${NGINX_CONF}"; then
+    return 0
+  fi
+  cat > "${NGINX_CONF}" <<'EOF'
+# tad-module-managed v3 —— 由 tad-module 套件启动脚本维护，勿手改
+# ^~ 必需：DSM 全局正则（~ /api/、~* .css/.js）优先级高于普通前缀，会截胡
+location ^~ /webman/3rdparty/tad-module/ {
+    proxy_pass http://127.0.0.1:8123;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    # /webman 前缀已被 DSM 登录保护；页面所在后端把通过反代进来的请求
+    # 视为已鉴权管理员（与 fnOS 宿主网关注入同一身份头）
+    proxy_set_header X-Trim-Isadmin "true";
+    proxy_read_timeout 300s;
+}
+EOF
+  if ! nginx -t >/dev/null 2>&1; then
+    echo "tad-module: nginx -t 校验失败，已撤回反代配置（不影响 DSM 现有配置）。" >&2
+    rm -f "${NGINX_CONF}"
+    return 1
+  fi
+  if ! systemctl reload nginx >/dev/null 2>&1; then
+    echo "tad-module: nginx reload 失败，反代配置已写入但未生效（可稍后手动 systemctl reload nginx）。" >&2
+    return 1
+  fi
+}
+
+case "${1:-}" in
+  start)
+    if [ -n "$(daemon_pid)" ] && kill -0 "$(daemon_pid)" 2>/dev/null; then
+      exit 0
+    fi
+    [ -x "${BIN}" ] || exit 1
+    mkdir -p "${PKG_VAR}"
+    rm -f "${PIDFILE}"
+    ensure_power
+    ensure_it87
+    # 旧版默认值迁移：独立端口时代遗留的 ":8123" 改为回环绑定
+    if [ "${HTTP_ADDR}" = ":8123" ]; then
+      HTTP_ADDR="127.0.0.1:8123"
+      if [ -f "${CFG_FILE}" ]; then
+        sed -i "s|^HTTP_ADDR=.*|HTTP_ADDR=\"${HTTP_ADDR}\"|" "${CFG_FILE}" 2>/dev/null || true
+      fi
+    fi
+    AUTH_ARGS=""
+    if is_loopback_addr "${HTTP_ADDR}"; then
+      ensure_nginx || true
+    else
+      ensure_web_auth
+      AUTH_ARGS="--auth-file ${AUTH}"
+    fi
+    setsid "${BIN}" serve \
+      --config "${CFG}" \
+      --state "${PKG_VAR}/original-state.json" \
+      --web-root "${WEBROOT}" \
+      --log "${LOGFILE}" \
+      --socket-group none \
+      --base-path "${BASE_PATH}" \
+      --http "${HTTP_ADDR}" \
+      ${AUTH_ARGS} \
+      >> "${LOGFILE}" 2>&1 &
+    echo $! > "${PIDFILE}"
+    # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
+    # 否则 DSM 会把套件标成已启动。
+    i=0
+    while [ "${i}" -lt 8 ]; do
+      sleep 1
+      if ! kill -0 "$(daemon_pid)" 2>/dev/null; then
+        rm -f "${PIDFILE}"
+        echo "tad-module 在启动阶段退出，最近日志："
+        tail -n 5 "${LOGFILE}" 2>/dev/null || true
+        exit 1
+      fi
+      i=$((i + 1))
+    done
+    exit 0
+    ;;
+  stop)
+    pid="$(daemon_pid)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      # 宽限 30 秒：守护进程要在退出前恢复功耗/风扇原始状态（含蜂鸣提示音）
+      i=0
+      while [ "${i}" -lt 30 ] && kill -0 "${pid}" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+      done
+      if kill -0 "${pid}" 2>/dev/null; then
+        kill -9 "${pid}" 2>/dev/null || true
+      fi
+    fi
+    rm -f "${PIDFILE}"
+    exit 0
+    ;;
+  status)
+    pid="$(daemon_pid)"
+    if [ -n "${pid}" ] && kill -0 "${pid}" 2>/dev/null; then
+      exit 0
+    fi
+    exit 1
+    ;;
+  log)
+    echo "${LOGFILE}"
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 {start|stop|status|log}"
+    exit 1
+    ;;
+esac

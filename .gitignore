@@ -1,6 +1,8 @@
 /.cache/
 /dist/
 /*.fpk
+/*.spk
+/*.spk.sha256
 /app/bin/tad-module
 /ICON.PNG
 /ICON_256.PNG

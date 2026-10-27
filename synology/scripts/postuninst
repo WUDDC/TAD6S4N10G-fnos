@@ -1,0 +1,9 @@
+#!/bin/sh
+# 群晖 DSM 卸载后：清理运行参数文件。/var/packages/<pkg>（含 etc/config.json、
+# web-auth.json、日志）由 DSM 随套件目录整体删除，这里只管仓库树之外的部分。
+set -eu
+
+PKG="tad-module"
+rm -f "/usr/local/etc/${PKG}.cfg"
+
+exit 0

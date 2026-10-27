@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 与 BIOS-FID-Tool 生成的 $FID 布局完全一致的合成镜像：
@@ -306,5 +308,274 @@ func writeTestFile(t *testing.T, path, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFirmwareTransportRaisesTLSHandshakeTimeout(t *testing.T) {
+	// 真机回归:ky.mi-d.cn 冷路径握手 ~9s,默认 10s 贴线,必须放宽
+	if got := firmwareHTTPTransport().TLSHandshakeTimeout; got < 25*time.Second {
+		t.Fatalf("TLS 握手超时应 >=25s, got %v", got)
+	}
+}
+
+func TestFetchBIOSIndexRetriesOnce(t *testing.T) {
+	calls := 0
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("TLS handshake timeout")
+		}
+		return []byte("zip.txt"), nil
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	data, err := fetchBIOSIndex(context.Background())
+	if err != nil || string(data) != "zip.txt" {
+		t.Fatalf("首次失败应重试成功: %v %q", err, data)
+	}
+	if calls != 2 {
+		t.Fatalf("应恰好调用两次, got %d", calls)
+	}
+}
+
+func TestFetchBIOSIndexGivesUpAfterRetry(t *testing.T) {
+	calls := 0
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		calls++
+		return nil, errors.New("DNS 解析超时")
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	_, err := fetchBIOSIndex(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "DNS") {
+		t.Fatalf("重试后仍失败应返回最后错误: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("不应超过两次, got %d", calls)
+	}
+}
+
+func TestReadBIOSVersionViaDMI(t *testing.T) {
+	manager := &Manager{}
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		switch {
+		case name == "dmidecode" && len(args) == 2 && args[0] == "-s":
+			return "5.27\n", nil
+		case name == "dmidecode":
+			return "# dmidecode 3.3\nRelease Date: 07/07/2025\n", nil
+		}
+		return "", errors.New("unexpected " + name)
+	}
+	fid, ok := manager.readBIOSVersionViaDMI(context.Background())
+	if !ok || fid.Version != "5.27" || fid.BuildText != "2025-07-07" {
+		t.Fatalf("DMI 解析不符: %+v ok=%v", fid, ok)
+	}
+	if fid.BuildDate.Format("2006-01-02") != "2025-07-07" {
+		t.Fatalf("构建日期不符: %v", fid.BuildDate)
+	}
+}
+
+func TestReadCurrentBIOSFIDFallsBackToDMIWhenFlashromFails(t *testing.T) {
+	// 真机形态:flashrom 缺依赖跑不起来(LIBPCI_3.8 not found),dmidecode 兜底
+	restoreDL := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		return nil, errors.New("自动下载失败")
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restoreDL })
+
+	manager := &Manager{}
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if name == "dmidecode" && len(args) == 2 && args[0] == "-s" {
+			return "5.27\n", nil
+		}
+		if name == "dmidecode" {
+			return "Release Date: 07/07/2025\n", nil
+		}
+		return "", errors.New("unexpected " + name)
+	}
+	fid, err := manager.readCurrentBIOSFID(context.Background())
+	if err != nil {
+		t.Fatalf("应回落 DMI 成功, got %v", err)
+	}
+	if fid.Version != "5.27" || !fid.degraded {
+		t.Fatalf("应标记降级版本: %+v", fid)
+	}
+}
+
+func TestCheckBIOSOnlinePublishesProgressively(t *testing.T) {
+	// 用户要求:不要憋到最后一次性显示——候选(最新版本)必须在"当前版本
+	// 读取"这一慢段完成之前就发布进缓存
+	cpuRoot := t.TempDir()
+	procDir := filepath.Join(cpuRoot, "proc")
+	if err := os.MkdirAll(procDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cpuinfo := "model name\t: Intel(R) Processor N100\n"
+	if err := os.WriteFile(filepath.Join(procDir, "cpuinfo"), []byte(cpuinfo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: cpuRoot}
+	dmiRelease := make(chan struct{})
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if name == "dmidecode" {
+			<-dmiRelease
+			if len(args) == 2 && args[0] == "-s" {
+				return "5.27\n", nil
+			}
+			return "Release Date: 07/07/2025\n", nil
+		}
+		return "", errors.New("unexpected " + name)
+	}
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		if strings.Contains(address, "zip.txt") {
+			return []byte(biosIndexFixture), nil
+		}
+		return nil, errors.New("unexpected download " + address)
+	}
+	t.Cleanup(func() {
+		firmwareDownloadHook = restore
+		// 测试主体正常走完会先关一次;未关(异常路径)时兜底关,幂等
+		select {
+		case <-dmiRelease:
+		default:
+			close(dmiRelease)
+		}
+	})
+
+	done := make(chan BIOSOnlineStatus, 1)
+	go func() { done <- manager.CheckBIOSOnline(context.Background()) }()
+
+	// 轮询等待候选发布(此刻 dmidecode 仍阻塞)
+	deadline := time.Now().Add(3 * time.Second)
+	var mid BIOSOnlineStatus
+	for time.Now().Before(deadline) {
+		mid = manager.BIOSOnline()
+		if mid.CandidateVersion != "" {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !mid.Checking {
+		t.Fatalf("候选发布时仍应处于 checking 状态: %+v", mid)
+	}
+	if mid.CandidateVersion == "" {
+		t.Fatalf("慢段完成前候选应已发布: %+v", mid)
+	}
+
+	close(dmiRelease)
+	var final BIOSOnlineStatus
+	select {
+	case final = <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("检查未在时限内完成")
+	}
+	if final.Checking {
+		t.Fatal("终态不应 checking")
+	}
+	if final.CurrentVersion != "5.27" {
+		t.Fatalf("当前版本应来自 dmidecode 兜底: %+v", final)
+	}
+	if !final.UpdateAvailable {
+		t.Fatalf("候选构建日期晚于 DMI 日期,应判定可更新: %+v", final)
+	}
+}
+
+func TestBIOSOnlinePublishesCurrentBeforeIndexFetch(t *testing.T) {
+	// 真机反馈:页面要等在线索引拉完才见本机信息——当前版本(本地,快)
+	// 必须先于索引(CDN,慢)读取并发布
+	manager := &Manager{}
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if name == "dmidecode" && len(args) == 2 && args[0] == "-s" {
+			return "5.27\n", nil
+		}
+		if name == "dmidecode" {
+			return "Release Date: 07/07/2025\n", nil
+		}
+		return "", errors.New("unexpected " + name)
+	}
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		// flashrom 工具下载(无数据目录时本就到不了)与索引下载共用注入点:
+		// 只对索引断言"本机版本已发布"——并行启动有微秒级竞态,本地段(注入的
+		// dmidecode 即时返回)必须在索引仍在进行的窗口内可见
+		if !strings.Contains(address, "zip.txt") {
+			return nil, errors.New("flashrom 下载失败(测试注入)")
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			snapshot := manager.BIOSOnline()
+			if snapshot.Checking && snapshot.CurrentVersion == "5.27" {
+				break
+			}
+			if !time.Now().Before(deadline) {
+				t.Fatalf("索引拉取进行中本机版本应已发布: %+v", snapshot)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return nil, errors.New("索引下载失败(测试注入)")
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	status := manager.CheckBIOSOnline(context.Background())
+	if status.CurrentVersion != "5.27" || status.Error == "" {
+		t.Fatalf("当前版本应先于索引可用,索引失败单独报错: %+v", status)
+	}
+	if status.Checking {
+		t.Fatal("失败收尾应清除 checking")
+	}
+}
+
+func TestStartBIOSOnlineCheckRunsInBackground(t *testing.T) {
+	// POST 端点立即返回的关键:检查在后台跑,进行中挡并发,完成后可再来
+	manager := &Manager{}
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if name == "dmidecode" && len(args) == 2 && args[0] == "-s" {
+			return "5.27\n", nil
+		}
+		return "Release Date: 07/07/2025\n", nil
+	}
+	release := make(chan struct{})
+	restore := firmwareDownloadHook
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		if !strings.Contains(address, "zip.txt") {
+			return nil, errors.New("flashrom 下载失败(测试注入)")
+		}
+		<-release
+		return nil, errors.New("索引下载失败(测试注入)")
+	}
+	t.Cleanup(func() { firmwareDownloadHook = restore })
+
+	if !manager.StartBIOSOnlineCheck() {
+		t.Fatal("首次启动应成功")
+	}
+	if snapshot := manager.BIOSOnline(); !snapshot.Checking {
+		t.Fatalf("启动后快照应立即是检查中: %+v", snapshot)
+	}
+	if manager.StartBIOSOnlineCheck() {
+		t.Fatal("进行中应拒绝并发启动")
+	}
+	close(release)
+	deadline := time.After(5 * time.Second)
+	for manager.BIOSOnline().Checking {
+		select {
+		case <-deadline:
+			t.Fatal("后台检查未在期限内结束")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	if !manager.StartBIOSOnlineCheck() {
+		t.Fatal("结束后应允许再次启动")
+	}
+	// 等第二次收尾,避免测试泄漏 goroutine 写缓存
+	deadline = time.After(5 * time.Second)
+	for manager.BIOSOnline().Checking {
+		select {
+		case <-deadline:
+			t.Fatal("第二次检查未收尾")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

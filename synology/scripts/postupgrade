@@ -1,0 +1,5 @@
+#!/bin/sh
+# 群晖 DSM 升级后：postinst 会对新载荷重新执行 init（幂等：读已有配置并应用），
+# 无需额外动作。
+set -eu
+exit 0

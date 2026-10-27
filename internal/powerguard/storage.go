@@ -133,6 +133,33 @@ type lsblkNode struct {
 	Children    []lsblkNode `json:"children"`
 }
 
+// smartAttrLabels 把 SMART 故障属性翻译成客户能读懂的白话:弹窗的"完整信息"
+// 直接展示这些文案,技术属性名只作括注供排查用。
+var smartAttrLabels = map[string]struct{ label, meaning string }{
+	"Reallocated_Sector_Ct":   {"重分配扇区", "硬盘已用备用扇区替换过损坏扇区"},
+	"Reported_Uncorrect":      {"不可修复错误", "读写过程中出现过无法恢复的错误"},
+	"Reallocated_Event_Count": {"重分配事件", "发生过损坏扇区被替换的动作"},
+	"Current_Pending_Sector":  {"待定坏扇区", "发现了不稳定扇区,等待后续处理"},
+	"Offline_Uncorrectable":   {"离线不可修复扇区", "硬盘自检中发现无法读取的扇区"},
+	"Reserved_Block_Count":    {"SSD 预留块", "SSD 的备用存储块接近耗尽"},
+}
+
+// formatSmartAttrWarning 生成客户可读的属性告警:是什么、什么含义、该做什么。
+// whenFailed 非空表示 SMART 本身已把该属性标记为异常(比 raw>0 更严重一级)。
+func formatSmartAttrWarning(name string, id int, raw int64, whenFailed string) string {
+	entry, ok := smartAttrLabels[name]
+	if !ok {
+		entry = struct{ label, meaning string }{name, "该指标数值不为零"}
+	}
+	message := fmt.Sprintf("SMART 自检提示:%s计数为 %d——%s,建议留意该数字是否增长并保持数据备份(%s",
+		entry.label, raw, entry.meaning, name)
+	if whenFailed != "" && whenFailed != "-" {
+		message += fmt.Sprintf(",SMART 已标记该属性状态为 %s", whenFailed)
+	}
+	message += ")"
+	return message
+}
+
 type smartResult struct {
 	Passed         *bool
 	TemperatureC   float64
@@ -274,7 +301,9 @@ func (m *Manager) cachedStorageActivity(id, kname string) (string, *float64) {
 func (m *Manager) collectStorage(forceSMART bool) StorageStatus {
 	status := StorageStatus{UpdatedAt: time.Now()}
 	byPathDir := m.rooted("/dev/disk/by-path")
-	if _, err := os.Stat(byPathDir); err != nil {
+	if _, err := os.Stat(byPathDir); err != nil && len(m.sysfsByPathEntries()) == 0 {
+		// 宿主既没有 udev by-path 链接，也无法从 sysfs 合成映射（不认识的
+		// 块设备布局）——这才真正放弃；群晖 DSM 走 sysfs 兜底继续。
 		status.LastError = fmt.Sprintf("无法读取硬盘总线路径: %v", err)
 		for _, spec := range storageSlotSpecs {
 			status.Slots = append(status.Slots, StorageSlot{
@@ -554,10 +583,20 @@ func (m *Manager) resolveStorageDevice(spec storageSlotSpec) (string, string, er
 			break
 		}
 		if actual == "" {
+			// 无 by-path 目录的宿主（群晖 DSM）：对合成映射做同样的前缀匹配
+			if kname, ok := m.sysfsByPathPrefix(spec.BusPath); ok {
+				return "/dev/" + kname, kname, nil
+			}
 			return "", "", fs.ErrNotExist
 		}
 	}
 	if _, err := os.Lstat(actual); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			// 同上：从 sysfs 合成的 by-path 映射里精确查找
+			if kname, ok := m.sysfsByPathEntries()[filepath.Base(spec.BusPath)]; ok {
+				return "/dev/" + kname, kname, nil
+			}
+		}
 		return "", "", err
 	}
 	resolved, err := filepath.EvalSymlinks(actual)
@@ -577,7 +616,9 @@ func (m *Manager) readBlockTopology() (map[string]blockInfo, error) {
 	}
 	path, err := exec.LookPath("lsblk")
 	if err != nil {
-		return nil, errors.New("未找到 lsblk，无法判断硬盘是否已使用")
+		// 没有 lsblk 的宿主（群晖 DSM）：用 /proc/mdstat + /proc/mounts
+		// 推断使用状态；型号/序列号/容量由 collectStorage 的 sysfs 回退补齐。
+		return m.readBlockTopologyFromProc(), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -850,7 +891,13 @@ func findSmartctl() (string, error) {
 }
 
 func readSMART(smartctl, device string, standbyAware, force bool) (smartResult, error) {
-	args := []string{"-j"}
+	// DSM 自带 smartctl 6.5,没有 -j JSON 输出(7.0 起才有),按版本走
+	// 人类可读输出的解析路径;fnOS 的 7.x 仍走 JSON。
+	legacy := smartctlIsLegacy(smartctl)
+	args := []string{}
+	if !legacy {
+		args = append(args, "-j")
+	}
 	if standbyAware && !force {
 		args = append(args, "-n", "standby")
 	}
@@ -858,6 +905,16 @@ func readSMART(smartctl, device string, standbyAware, force bool) (smartResult, 
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	output, commandErr := exec.CommandContext(ctx, smartctl, args...).CombinedOutput()
+	if legacy {
+		result, parseErr := parseSMARTLegacy(output)
+		if parseErr == nil {
+			return result, nil
+		}
+		if commandErr != nil {
+			return smartResult{}, fmt.Errorf("smartctl %s: %w", device, commandErr)
+		}
+		return smartResult{}, parseErr
+	}
 	result, parseErr := parseSMART(output)
 	if parseErr == nil {
 		return result, nil
@@ -866,6 +923,128 @@ func readSMART(smartctl, device string, standbyAware, force bool) (smartResult, 
 		return smartResult{}, fmt.Errorf("smartctl %s: %w", device, commandErr)
 	}
 	return smartResult{}, parseErr
+}
+
+var smartctlLegacyOnce struct {
+	sync.Once
+	legacy bool
+}
+
+// smartctlIsLegacy 检测 smartctl 主版本是否低于 7(无 JSON 输出),进程内缓存。
+func smartctlIsLegacy(smartctl string) bool {
+	smartctlLegacyOnce.Do(func() {
+		out, err := exec.Command(smartctl, "--version").CombinedOutput()
+		if err != nil {
+			return
+		}
+		m := regexp.MustCompile(`smartctl (?:version )?(\d+)\.`).FindSubmatch(out)
+		if m == nil {
+			return
+		}
+		if major, err := strconv.Atoi(string(m[1])); err == nil {
+			smartctlLegacyOnce.legacy = major > 0 && major < 7
+		}
+	})
+	return smartctlLegacyOnce.legacy
+}
+
+// parseSMARTLegacy 解析 smartctl 6.x 的人类可读输出(群晖 DSM 自带 6.5)。
+// 覆盖:整体健康(PASSED/FAILED)、ATA 属性表温度(194,回退 190)与故障属性
+// 告警、NVMe 文本温度行、-n standby 的休眠提示(exit(2))。
+func parseSMARTLegacy(data []byte) (smartResult, error) {
+	text := string(data)
+	lower := strings.ToLower(text)
+	result := smartResult{}
+	if passedIdx := strings.Index(lower, "overall-health"); passedIdx >= 0 {
+		line := text[passedIdx:]
+		if nl := strings.IndexAny(line, "\r\n"); nl >= 0 {
+			line = line[:nl]
+		}
+		lineLower := strings.ToLower(line)
+		passed := strings.Contains(lineLower, "passed") && !strings.Contains(lineLower, "failed")
+		result.Passed = &passed
+	}
+	if strings.Contains(lower, "device is in standby") ||
+		(strings.Contains(lower, "standby") && !strings.Contains(lower, "temperature_celsius")) {
+		result.PowerMode = "standby"
+		return result, nil
+	}
+	// NVMe 文本输出:Temperature: 38 Celsius
+	if m := regexp.MustCompile(`Temperature:\s+(\d+)\s+Celsius`).FindStringSubmatch(text); m != nil {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			result.TemperatureC = v
+		}
+	}
+	if m := regexp.MustCompile(`Critical Warning:\s+(\d+)`).FindStringSubmatch(text); m != nil {
+		result.Critical, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	if m := regexp.MustCompile(`Percentage Used:\s+(\d+)%`).FindStringSubmatch(text); m != nil {
+		result.PercentageUsed, _ = strconv.ParseInt(m[1], 10, 64)
+	}
+	// SATA 故障属性列表与 JSON 路径同一份名单(按属性名精确匹配)
+	problemAttrs := map[string]bool{
+		"Reallocated_Sector_Ct":   true, // 5
+		"Reported_Uncorrect":      true, // 187
+		"Reallocated_Event_Count": true, // 196
+		"Current_Pending_Sector":  true, // 197
+		"Offline_Uncorrectable":   true, // 198
+		"Reserved_Block_Count":    true, // 177（SSD 真正的预留块用尽）
+	}
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 {
+			continue
+		}
+		id, err := strconv.Atoi(fields[0])
+		if err != nil {
+			continue
+		}
+		name := fields[1]
+		// 温度:194 RAW 首个数字即当前温度("45 (Min/Max 0/60)" → 45)。
+		// 必须放在 problemAttrs 的 continue 之前——194 不是故障属性。
+		if !seenTemperature(result) && name == "Temperature_Celsius" && id == 194 {
+			if token := strings.Fields(fields[9]); len(token) > 0 {
+				if v, err := strconv.ParseFloat(token[0], 64); err == nil {
+					result.TemperatureC = v
+				}
+			}
+		}
+		if !problemAttrs[name] {
+			continue
+		}
+		// when_failed 列位随 smartctl 版本/状态漂移(FAILING_NOW 占 Updated 列),
+		// 在 6..8 列范围内按值识别,不认死列位
+		whenFailed := ""
+		rawNum, _ := strconv.ParseInt(fields[9], 10, 64)
+		for _, f := range fields[6:9] {
+			lower := strings.ToLower(f)
+			if lower == "failing_now" || lower == "in_the_past" {
+				whenFailed = f
+			}
+		}
+		if rawNum > 0 || whenFailed != "" {
+			result.AttrWarnings = append(result.AttrWarnings, formatSmartAttrWarning(name, id, rawNum, whenFailed))
+		}
+	}
+	// 无 194 的盘回退 190 Airflow_Temperature_Ceiling
+	if !seenTemperature(result) {
+		for _, line := range strings.Split(text, "\n") {
+			fields := strings.Fields(line)
+			if len(fields) >= 10 && fields[1] == "Airflow_Temperature_Ceiling" {
+				if token := strings.Fields(fields[9]); len(token) > 0 {
+					if v, err := strconv.ParseFloat(token[0], 64); err == nil {
+						result.TemperatureC = v
+					}
+				}
+				break
+			}
+		}
+	}
+	return result, nil
+}
+
+func seenTemperature(result smartResult) bool {
+	return result.TemperatureC != 0
 }
 
 func parseSMART(data []byte) (smartResult, error) {
@@ -910,12 +1089,12 @@ func parseSMART(data []byte) (smartResult, error) {
 	// 属性名必须精确匹配，不同厂商同一 id 可能表示不同含义
 	// （比如 id=177 在 SSD 上可能是 Wear_Leveling_Count，不是 Reserved_Block_Count）。
 	problemAttrs := map[string]bool{
-		"Reallocated_Sector_Ct":  true, // 5
-		"Reported_Uncorrect":     true, // 187
-		"Reallocated_Event_Count":true, // 196
-		"Current_Pending_Sector": true, // 197
-		"Offline_Uncorrectable":  true, // 198
-		"Reserved_Block_Count":   true, // 177（SSD 真正的预留块用尽）
+		"Reallocated_Sector_Ct":   true, // 5
+		"Reported_Uncorrect":      true, // 187
+		"Reallocated_Event_Count": true, // 196
+		"Current_Pending_Sector":  true, // 197
+		"Offline_Uncorrectable":   true, // 198
+		"Reserved_Block_Count":    true, // 177（SSD 真正的预留块用尽）
 	}
 	var attrWarnings []string
 	for _, entry := range document.AtaSmartAttributes.Table {
@@ -924,8 +1103,7 @@ func parseSMART(data []byte) (smartResult, error) {
 		}
 		whenFailed := strings.TrimSpace(entry.WhenFailed)
 		if entry.Raw.Value > 0 || whenFailed != "" {
-			attrWarnings = append(attrWarnings, fmt.Sprintf("SMART 属性 %s(id=%d) 异常: raw=%d when_failed=%q",
-				entry.Name, entry.ID, entry.Raw.Value, whenFailed))
+			attrWarnings = append(attrWarnings, formatSmartAttrWarning(entry.Name, entry.ID, entry.Raw.Value, whenFailed))
 		}
 	}
 	// smartctl -n standby reports sleeping drives via smartctl.messages

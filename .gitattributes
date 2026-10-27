@@ -12,5 +12,10 @@
 manifest text eol=lf
 cmd/* text eol=lf
 config/* text eol=lf
+synology/scripts/* text eol=lf
+synology/INFO text eol=lf
+synology/conf/* text eol=lf
+synology/ui/* text eol=lf
 *.png binary
 *.fpk binary
+*.spk binary

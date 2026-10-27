@@ -1,0 +1,26 @@
+#!/bin/sh
+# 群晖 DSM 卸载前：优雅停服务并兜底 release-fans。
+# 实测 DSM 7（RR）上安装期脚本也以套件用户运行（非 root），所以停服必须走
+# start-stop-status 薄壳（root 上下文直接执行；套件用户时经 SPM 提权）——
+# DSM 卸载流程会先调 start-stop-status stop，这里是二次兜底；SPM 已被卸时
+# 停服失败不阻断卸载，守护进程恢复逻辑以 DSM 的 stop 调用为准。
+set -eu
+
+PKG="tad-module"
+PKGDEST="${SYNOPKG_PKGDEST:-/var/packages/${PKG}}"
+PKG_ETC="${SYNOPKG_PKGETC:-${PKGDEST}/etc}"
+PKG_VAR="${SYNOPKG_PKGVAR:-${PKGDEST}/var}"
+BIN="${PKGDEST}/bin/tad-module"
+HERE="$(CDPATH= cd -- "$(dirname "$0")" && pwd)"
+
+if [ -f "${HERE}/start-stop-status" ]; then
+  sh "${HERE}/start-stop-status" stop || true
+fi
+
+if [ -x "${BIN}" ] && [ -f "${PKG_ETC}/config.json" ]; then
+  "${BIN}" release-fans \
+    --config "${PKG_ETC}/config.json" \
+    --state "${PKG_VAR}/original-state.json" || true
+fi
+
+exit 0
