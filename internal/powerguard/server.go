@@ -178,7 +178,9 @@ func (s *Server) buildCoreHandler() http.Handler {
 
 	return s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if strings.HasPrefix(path, s.BasePath) {
+		// BasePath 为 "/" 时是独立部署（Windows 版等），请求本就在根路径下，
+		// 任何前缀剥除都会把 "/api/status" 变成 "api/status" 导致 404。
+		if s.BasePath != "/" && strings.HasPrefix(path, s.BasePath) {
 			path = strings.TrimPrefix(path, s.BasePath)
 			if path == "" {
 				path = "/"

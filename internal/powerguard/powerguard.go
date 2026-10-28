@@ -549,21 +549,25 @@ func (m *Manager) LogSettings() LogConfig {
 	return cfg.Log
 }
 
+// CPUModel 返回 CPU 型号串（如 "Intel(R) Celeron(R) N100"），供 DetectProfile
+// 识别功耗档案。读取方式随平台不同（Linux 读 /proc/cpuinfo，Windows 读注册表，
+// 见 cpu_model_other.go / cpu_model_windows.go）。
 func (m *Manager) CPUModel() (string, error) {
-	data, err := os.ReadFile(m.rooted("/proc/cpuinfo"))
-	if err != nil {
-		return "", fmt.Errorf("read /proc/cpuinfo: %w", err)
-	}
+	return m.readCPUModelOS()
+}
+
+// parseProcCPUInfoModel 从 /proc/cpuinfo 内容提取首个非空 "model name" 行。
+func parseProcCPUInfoModel(data []byte) string {
 	for _, line := range strings.Split(string(data), "\n") {
 		parts := strings.SplitN(line, ":", 2)
 		if len(parts) == 2 && strings.TrimSpace(parts[0]) == "model name" {
 			model := strings.TrimSpace(parts[1])
 			if model != "" {
-				return model, nil
+				return model
 			}
 		}
 	}
-	return "", errors.New("CPU model name was not found in /proc/cpuinfo")
+	return ""
 }
 
 func (m *Manager) deviceSystemInfo() (string, string, string) {

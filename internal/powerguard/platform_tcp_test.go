@@ -424,6 +424,29 @@ func TestCoreHandlerTrimsCustomBasePath(t *testing.T) {
 	}
 }
 
+func TestCoreHandlerRootBasePathServesAtRoot(t *testing.T) {
+	// Windows 独立部署传 --base-path /：根路径伺服，API 不得被剥掉前导斜杠
+	// （回归：TrimPrefix 会把 "/api/status" 变成 "api/status" 落进 FileServer 404）。
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte("<html>standalone-ok</html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Manager: &Manager{}, WebRoot: dir, BasePath: "/"}
+	handler := server.buildCoreHandler()
+
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+	if recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "standalone-ok") {
+		t.Fatalf("root-served static page broken: %d %s", recorder.Code, recorder.Body.String())
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if recorder.Code == http.StatusNotFound {
+		t.Fatal("/api/status must reach the API mux when base path is /")
+	}
+}
+
 func TestTCPHandlerRejectsPortStrippedHost(t *testing.T) {
 	// PR#39 review:剥掉端口的 Host(如 proxy_set_header Host \$host)属于
 	// 不受信反代配置——端口对不上就是拒绝,不再放宽

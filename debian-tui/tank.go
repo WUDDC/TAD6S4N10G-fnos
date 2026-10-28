@@ -7,6 +7,11 @@
 // Go native (stdlib only), no python/curses. Build:
 //
 //	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o tank .
+//go:build linux
+
+// tank 仅支持 Linux：终端原始模式依赖 TCGETS/termios syscall，Unix socket 默认
+// 走 /run/tank/tad-module.sock。Windows 构建经 ./... 全量编译时会因此失败，
+// 故显式收窄到 linux。
 package main
 
 import (
