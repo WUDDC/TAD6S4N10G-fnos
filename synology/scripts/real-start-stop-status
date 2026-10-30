@@ -139,7 +139,7 @@ ensure_nginx() {
   # include conf.d/dsm.*.conf。
   # 上游 review(PR#39)：/webman/3rdparty 路径并无 DSM 登录校验——反代不得
   # 注入管理员身份，只带共享密钥标识来源；会话与管理员组校验由后端
-  # (authenticate.cgi + administrators)完成。写不进或 nginx -t 不过：
+  # (会话注册表优先、authenticate.cgi 兜底 + administrators)完成。写不进或 nginx -t 不过：
   # 降级退出并留痕，绝不 reload 一个校验失败的配置。
   mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null || {
     echo "tad-module: 无法创建 ${NGINX_CONF_DIR}（/usr/local 不可写?），桌面嵌入入口不可用；可改用 ${HTTP_ADDR} 直连。" >&2
@@ -169,7 +169,7 @@ location ^~ /webman/3rdparty/tad-module/ {
     proxy_set_header Host $http_host;
     proxy_set_header X-Real-IP $remote_addr;
     # 仅共享密钥标识"来自可信反代";管理员身份由后端校验 DSM 会话
-    # (authenticate.cgi + administrators 组)后自行注入
+    # (会话注册表优先、authenticate.cgi 兜底 + administrators 组)后自行注入
     proxy_set_header X-Tad-Proxy-Token "@TOKEN@";
     proxy_set_header X-Forwarded-Proto $scheme;
     proxy_read_timeout 300s;

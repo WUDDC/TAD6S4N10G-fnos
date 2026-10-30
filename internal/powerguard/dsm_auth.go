@@ -19,7 +19,8 @@ import (
 // 无条件注入管理员身份——否则任何能到达 5000/5001 端口的人（含未登录者与
 // QuickConnect/端口映射场景下的公网）都会被当作管理员。
 //
-// 校验机制与 SPM 的 CGI 同源：本地执行 DSM 自带的
+// 优先读取 DSM 7 本机会话注册表；没有有效匹配时，与 SPM 的 CGI 同源：
+// 本地执行 DSM 自带的
 // /usr/syno/synoman/webman/modules/authenticate.cgi，把请求的完整 Cookie 头
 // 经 HTTP_COOKIE 环境变量传入；有效会话时它以退出码 0 输出用户名，无效/
 // 缺失时非零退出且无输出（真机实测：无 cookie exit=5，伪/空 id exit=4）。
@@ -39,8 +40,8 @@ const (
 )
 
 // DSMSessionAuth 校验请求携带的 DSM 会话并要求管理员身份。
-// 正向结果按会话 id 短暂缓存（面板每 5 秒轮询，避免每个请求都起进程）；
-// 拒绝不缓存——伪会话 id 无限多，缓存反而给攻击者刷内存的口子。
+// 已识别会话的管理员判定按 id 缓存 30 秒（面板每 5 秒轮询，避免反复起进程）；
+// 未知会话的拒绝不缓存——伪会话 id 无限多，缓存反而给攻击者刷内存的口子。
 type DSMSessionAuth struct {
 	// AuthenticateBin 会话校验可执行文件（测试可注入替身脚本）
 	AuthenticateBin string
