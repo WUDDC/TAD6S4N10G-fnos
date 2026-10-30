@@ -163,20 +163,29 @@ func probe(args []string) error {
 	return nil
 }
 
-// serve 启动守护进程: 应用配置、挂载 HTTP(socket) 服务与各后台循环, 退出时恢复原始功耗/风扇状态
+// serve 启动守护进程: 应用配置、挂载 HTTP(socket/TCP) 服务与各后台循环, 退出时恢复原始功耗/风扇状态
 func serve(args []string) error {
 	set := flag.NewFlagSet("serve", flag.ContinueOnError)
 	config := set.String("config", "", "config file")
 	state := set.String("state", "", "state file")
 	socket := set.String("socket", "", "Unix socket")
+	httpAddr := set.String("http", "", "optional TCP listen address, e.g. :8123 (DSM deployment)")
+	authFile := set.String("auth-file", "", "HTTP Basic auth credentials JSON for the TCP listener")
+	dsmAuth := set.Bool("dsm-auth", false, "authenticate TCP requests via the DSM session (authenticate.cgi) and require the administrators group (DSM embedded mode)")
+	proxyTokenFile := set.String("proxy-token-file", "", "shared secret file agreed with the trusted reverse proxy (DSM nginx)")
+	socketGroup := set.String("socket-group", "www-data", "unix socket group, or 'none' to keep it root-only")
+	basePath := set.String("base-path", "", "URL prefix to trim from requests (fnOS default /app/tad-module; DSM embedded /webman/3rdparty/tad-module)")
 	webRoot := set.String("web-root", "", "static web root")
 	logPath := set.String("log", "", "log file")
 	root := set.String("sys-root", "/", "alternate system root (testing only)")
 	if err := set.Parse(args); err != nil {
 		return err
 	}
-	if *config == "" || *state == "" || *socket == "" || *webRoot == "" {
-		return errors.New("--config, --state, --socket and --web-root are required")
+	if *config == "" || *state == "" || *webRoot == "" {
+		return errors.New("--config, --state and --web-root are required")
+	}
+	if *socket == "" && *httpAddr == "" {
+		return errors.New("one of --socket and --http is required")
 	}
 	if err := requireRoot(); err != nil {
 		return err
@@ -248,7 +257,29 @@ func serve(args []string) error {
 		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler,
+		// BasePath: 不传 --base-path 时保持 fnOS 宿主的固定前缀;DSM 嵌入模式
+		// 传 /webman/3rdparty/tad-module,与 nginx 反代的前缀一致
+		tadBasePath := "/app/tad-module"
+		if *basePath != "" {
+			tadBasePath = *basePath
+		}
+		// DSM 桌面嵌入模式:经 DSM 自带 authenticate.cgi 校验会话并要求
+		// administrators 组(路径随 sys-root,测试可注入替身)
+		var dsmSessionAuth *powerguard.DSMSessionAuth
+		if *dsmAuth {
+			dsmSessionAuth = powerguard.NewDSMSessionAuth()
+			dsmSessionAuth.AuthenticateBin = filepath.Join(*root, strings.TrimPrefix(powerguard.DSMAuthenticateBinPath(), "/"))
+			dsmSessionAuth.GroupFile = filepath.Join(*root, "etc/group")
+			dsmSessionAuth.SessionFile = filepath.Join(*root, "usr/syno/etc/private/session/current.users")
+		}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: tadBasePath, Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler,
+			// TCP 直连（群晖部署）: DSM 会话鉴权或 Basic 凭据; 非回环绑定
+			// 而两者皆无时服务拒绝启动
+			HTTPAddr:       *httpAddr,
+			AuthFile:       *authFile,
+			DSMAuth:        dsmSessionAuth,
+			ProxyTokenFile: *proxyTokenFile,
+			SocketGroup:    *socketGroup,
 			// 网页可访问时滴一声：只在系统刚启动的窗口内响，升级/手动重启服务
 			// （此时系统已运行很久）不再重复响。
 			OnReady: func() {

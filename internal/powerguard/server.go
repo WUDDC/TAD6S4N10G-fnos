@@ -2,6 +2,7 @@ package powerguard
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -29,20 +31,39 @@ type Server struct {
 	History     *HistoryStore
 	LogPath     string       // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
 	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 直接挂在 /api/crps/, handler 自行改写为 /api/<ep>
-	// OnReady 在 socket 监听成功、网页已可访问后调用一次；用于开机提示音等
-	// 「服务就绪」动作。回调在 Serve 之前同步执行，实现方需自行避免阻塞。
+	// HTTPAddr 可选 TCP 监听地址（如 ":8123"），供群晖 DSM 等没有反向代理网关
+	// 的平台直接对外服务；为空时不监听 TCP。绑定非回环地址时必须同时配置
+	// AuthFile，否则 ListenAndServe 拒绝启动（fail-closed）。
+	HTTPAddr string
+	// AuthFile TCP 监听使用的 HTTP Basic 认证凭据文件（JSON: username/password，
+	// 建议 root-only）。fnOS 的 Unix socket 路径不读它——宿主网关已注入鉴权头。
+	AuthFile string
+	// DSMSessionAuth DSM 桌面嵌入模式的会话鉴权(nil=不启用):经 DSM
+	// authenticate.cgi 校验会话并要求 administrators 组,通过才注入管理员
+	// 身份。与 AuthFile 互斥(优先于 Basic)。
+	DSMAuth *DSMSessionAuth
+	// ProxyTokenFile 与可信反代(DSM nginx)的共享密钥文件:配置后 TCP 路径
+	// 要求每个请求携带匹配的 X-Tad-Proxy-Token 头,反代注入、root-only 保存。
+	ProxyTokenFile string
+	// OnReady 在任一监听就绪、网页已可访问后调用一次；用于开机提示音等
+	// 「服务就绪」动作。实现方需自行避免阻塞。
 	OnReady func()
 }
 
 const configRequestMaxBytes = 3 << 20
 
-// ListenAndServe 在 Unix socket 上启动 HTTP 服务 (含可选 CRPS 子板块挂载), 阻塞至服务退出
+// ListenAndServe 启动 HTTP 服务, 阻塞至任一监听退出。支持两路监听:
+//   - Unix socket（fnOS 宿主走宿主网关鉴权; Debian TUI 用它给 tank 供状态）
+//   - TCP 地址（群晖 DSM 等无反向代理网关的平台; Basic 认证把管理员身份注入
+//     与宿主同一套 X-Trim-Isadmin 校验链, 并对跨站写请求做同源防护）
+//
+// 两路共用同一套路由与安全头; 配置了哪路就起哪路, 至少要配一路。
 func (s *Server) ListenAndServe() error {
 	if s.Manager == nil {
 		return errors.New("manager is required")
 	}
-	if s.Socket == "" {
-		return errors.New("socket path is required")
+	if s.Socket == "" && s.HTTPAddr == "" {
+		return errors.New("socket or http address is required")
 	}
 	if s.BasePath == "" {
 		s.BasePath = "/app/tad-module"
@@ -50,46 +71,50 @@ func (s *Server) ListenAndServe() error {
 	if s.Logger == nil {
 		s.Logger = log.Default()
 	}
-	if s.SocketGroup == "" {
-		s.SocketGroup = "www-data"
+
+	core := s.buildCoreHandler()
+	type served struct {
+		name string
+		err  error
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Socket), 0o755); err != nil {
-		return err
-	}
-	if info, err := os.Lstat(s.Socket); err == nil {
-		if info.Mode()&os.ModeSocket == 0 {
-			return fmt.Errorf("refusing to remove non-socket path %s", s.Socket)
-		}
-		if err := os.Remove(s.Socket); err != nil {
+	errs := make(chan served, 2)
+	servers := 0
+	if s.Socket != "" {
+		listener, err := s.listenUnix()
+		if err != nil {
 			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return err
+		defer listener.Close()
+		server := &http.Server{Handler: core, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+		go func() { errs <- served{"socket", server.Serve(listener)} }()
+		servers++
 	}
-	listener, err := net.Listen("unix", s.Socket)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	defer os.Remove(s.Socket)
-	group, err := user.LookupGroup(s.SocketGroup)
-	if err != nil {
-		return fmt.Errorf("lookup socket group %s: %w", s.SocketGroup, err)
-	}
-	gid, err := strconv.Atoi(group.Gid)
-	if err != nil {
-		return fmt.Errorf("parse socket group %s gid %q: %w", s.SocketGroup, group.Gid, err)
-	}
-	if err := os.Chown(s.Socket, -1, gid); err != nil {
-		return fmt.Errorf("set socket group %s: %w", s.SocketGroup, err)
-	}
-	if err := os.Chmod(s.Socket, 0o660); err != nil {
-		return err
+	if s.HTTPAddr != "" {
+		tcpHandler, err := s.buildTCPHandler(core)
+		if err != nil {
+			return err
+		}
+		listener, err := net.Listen("tcp", s.HTTPAddr)
+		if err != nil {
+			return err
+		}
+		defer listener.Close()
+		server := &http.Server{Handler: tcpHandler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+		go func() { errs <- served{"tcp", server.Serve(listener)} }()
+		servers++
 	}
 	if s.OnReady != nil {
 		s.OnReady()
 	}
+	// 任一路退出即整体退出, 由服务管理器(systemd/DSM start-stop-status)拉起重试;
+	// 其余路经进程退出兜底关闭
+	crashed := <-errs
+	s.Logger.Printf("%s listener stopped: %v", crashed.name, crashed.err)
+	return crashed.err
+}
 
+// buildCoreHandler 组装共用路由（API + 静态站点）、BasePath 前缀改写与安全头。
+func (s *Server) buildCoreHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/history", s.handleHistory)
@@ -151,7 +176,7 @@ func (s *Server) ListenAndServe() error {
 	}
 	mux.Handle("/", http.FileServer(http.Dir(s.WebRoot)))
 
-	handler := s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return s.securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		if strings.HasPrefix(path, s.BasePath) {
 			path = strings.TrimPrefix(path, s.BasePath)
@@ -162,8 +187,287 @@ func (s *Server) ListenAndServe() error {
 		}
 		mux.ServeHTTP(w, r)
 	}))
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
-	return server.Serve(listener)
+}
+
+// listenUnix 建 Unix socket 监听并设置权限。SocketGroup 为组名时 chgrp+0660
+// （宿主网关经组读取 socket）; 为 "none" 时跳过组设置, 0600 仅 root 可用——
+// 群晖 DSM 没有 www-data 组, 且 TCP 已承担对外服务, socket 仅留给本机调试。
+func (s *Server) listenUnix() (net.Listener, error) {
+	if err := os.MkdirAll(filepath.Dir(s.Socket), 0o755); err != nil {
+		return nil, err
+	}
+	if info, err := os.Lstat(s.Socket); err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("refusing to remove non-socket path %s", s.Socket)
+		}
+		if err := os.Remove(s.Socket); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	listener, err := net.Listen("unix", s.Socket)
+	if err != nil {
+		return nil, err
+	}
+	group := s.SocketGroup
+	if group == "" {
+		group = "www-data"
+	}
+	if group == "none" {
+		if err := os.Chmod(s.Socket, 0o600); err != nil {
+			listener.Close()
+			return nil, err
+		}
+		return listener, nil
+	}
+	groupInfo, err := user.LookupGroup(group)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("lookup socket group %s: %w", group, err)
+	}
+	gid, err := strconv.Atoi(groupInfo.Gid)
+	if err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("parse socket group %s gid %q: %w", group, groupInfo.Gid, err)
+	}
+	if err := os.Chown(s.Socket, -1, gid); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("set socket group %s: %w", group, err)
+	}
+	if err := os.Chmod(s.Socket, 0o660); err != nil {
+		listener.Close()
+		return nil, err
+	}
+	return listener, nil
+}
+
+// buildTCPHandler 给共享 handler 套 TCP 直连专用的同源防护与 Basic 认证。
+// 绑定非回环地址时必须提供有效凭据文件, 否则拒绝启动（fail-closed）:
+// 群晖宿主没有 fnOS 那样的登录网关, 裸暴露等于把功耗/风扇/固件写接口开放给全网段。
+func (s *Server) buildTCPHandler(core http.Handler) (http.Handler, error) {
+	credentials, err := s.loadTCPCredentials()
+	if err != nil {
+		return nil, err
+	}
+	if credentials == nil && s.DSMAuth == nil && !bindsLoopback(s.HTTPAddr) {
+		return nil, errors.New("refusing to expose the admin API on a non-loopback address without valid --auth-file credentials")
+	}
+	// 与可信反代(DSM nginx)的共享密钥:配置后,没有密钥的直连请求一律拒绝。
+	// 密钥文件 root-only,只在反代与本守护进程之间流转。
+	proxyToken, err := s.loadProxyToken()
+	if err != nil {
+		return nil, err
+	}
+	handler := http.Handler(core)
+	switch {
+	case s.DSMAuth != nil:
+		handler = s.DSMAuth.Handler(handler)
+	case credentials != nil:
+		handler = s.basicAuth(handler, *credentials)
+	}
+	handler = s.originGuard(handler)
+	if proxyToken != "" {
+		handler = s.proxyTokenGuard(proxyToken, handler)
+	}
+	// TCP 直连的第一道处理:剥掉客户端自带的 X-Trim-Isadmin。管理员身份
+	// 只能由本函数内部(DSM 会话校验/Basic 认证通过后)注入——本机任何
+	// 进程都无法再靠自带头伪造管理员。
+	return stripClientAdminHeader(handler), nil
+}
+
+// loadProxyToken 读 ProxyTokenFile;未配置返回空串(不启用密钥校验)。
+func (s *Server) loadProxyToken() (string, error) {
+	if s.ProxyTokenFile == "" {
+		return "", nil
+	}
+	data, err := os.ReadFile(s.ProxyTokenFile)
+	if err != nil {
+		return "", fmt.Errorf("read proxy token file: %w", err)
+	}
+	token := strings.TrimSpace(string(data))
+	if token == "" {
+		return "", fmt.Errorf("proxy token file %s is empty", s.ProxyTokenFile)
+	}
+	return token, nil
+}
+
+// proxyTokenGuard 校验反代共享密钥头;不匹配一律 403(不区分"缺失/错误",
+// 不给探测口子)。
+func (s *Server) proxyTokenGuard(token string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Tad-Proxy-Token")), []byte(token)) != 1 {
+			writeError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// stripClientAdminHeader 移除请求里客户端自带的 X-Trim-Isadmin(见
+// buildTCPHandler 注释)。
+func stripClientAdminHeader(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Del("X-Trim-Isadmin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// loadTCPCredentials 读取 AuthFile。文件不存在返回 (nil, nil) —— 允许仅回环
+// 监听; 文件存在但格式不合法（非 JSON、字段为空、password 为空）按错误处理,
+// 宁可不启动也不静默放行裸认证。
+func (s *Server) loadTCPCredentials() (*basicCredentials, error) {
+	if s.AuthFile == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(s.AuthFile)
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read auth file: %w", err)
+	}
+	var cred basicCredentials
+	if err := json.Unmarshal(data, &cred); err != nil {
+		return nil, fmt.Errorf("parse auth file %s: %w", s.AuthFile, err)
+	}
+	if cred.Username == "" || cred.Password == "" {
+		return nil, fmt.Errorf("auth file %s must define non-empty username and password", s.AuthFile)
+	}
+	return &cred, nil
+}
+
+type basicCredentials struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// basicAuth 校验 HTTP Basic 凭据; 通过后把宿主网关（fnOS 反向代理）注入的
+// 同一身份头补上, 所有写接口与 CRPS 子板块共用同一套 X-Trim-Isadmin 校验链。
+func (s *Server) basicAuth(next http.Handler, cred basicCredentials) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, pass, ok := r.BasicAuth()
+		userOK := subtle.ConstantTimeCompare([]byte(user), []byte(cred.Username)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(pass), []byte(cred.Password)) == 1
+		if !ok || !userOK || !passOK {
+			w.Header().Set("WWW-Authenticate", `Basic realm="tad-module", charset="UTF-8"`)
+			writeError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		r.Header.Set("X-Trim-Isadmin", "true")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// originGuard 是 TCP 直连时的 CSRF 防线: 浏览器会缓存 Basic 凭据并在后续跨站
+// 请求里自动携带, 不能只靠认证; 非 GET/HEAD/OPTIONS 请求若携带 Origin/Referer
+// 且其主机与请求目标不一致即拒绝。不带这些头的命令行/SSHPort-forward 调用不受影响。
+func (s *Server) originGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			// PR#39 review:同源校验必须严格——「没有 Origin」是非浏览器客户端
+			// 的正常形态(放行,由鉴权层把关),但「Origin: null」与畸形 Origin
+			// 是必须拒绝的异常形态,不得当作没有处理。
+			// 目标侧 scheme 只在"配置了反代共享密钥"时取 X-Forwarded-Proto
+			// (密钥守卫在最外层,到达这里的请求必经可信 nginx,该头由 nginx
+			// 覆盖写入);无密钥时客户端自带的 X-Forwarded-Proto 一律不信。
+			proto := "http"
+			if s.ProxyTokenFile != "" {
+				if forwarded := r.Header.Get("X-Forwarded-Proto"); forwarded == "http" || forwarded == "https" {
+					proto = forwarded
+				}
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				if !originAllowed(origin, r.Host, proto) {
+					writeError(w, http.StatusForbidden, "cross-origin request rejected")
+					return
+				}
+			} else if referer := r.Header.Get("Referer"); referer != "" {
+				if !originAllowed(referer, r.Host, proto) {
+					writeError(w, http.StatusForbidden, "cross-origin request rejected")
+					return
+				}
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// originAllowed 严格校验 Origin/Referer 与请求目标同源:scheme 只认 http(s)
+// 且必须与目标侧 proto 一致(https 反代下不放过 http 源,反之亦然)、主机名
+// 一致、端口按各自 scheme 的默认值归一后相等(缺失端口=该 scheme 默认端口;
+// 需要剥端口/改写 Host 的反代属于不受信配置,应当修正反代而不是放宽校验)。
+// proto 是目标侧可信 scheme:配置了反代共享密钥时来自 nginx 的
+// X-Forwarded-Proto(密钥守卫保证请求确经反代),否则固定 http(直连形态)。
+func originAllowed(source, host, proto string) bool {
+	if strings.EqualFold(strings.TrimSpace(source), "null") {
+		return false
+	}
+	parsed, err := url.Parse(strings.TrimSpace(source))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http":
+	case "https":
+	default:
+		return false
+	}
+	if !strings.EqualFold(parsed.Scheme, proto) {
+		return false
+	}
+	if !strings.EqualFold(parsed.Hostname(), hostOnly(host)) {
+		return false
+	}
+	originPort := parsed.Port()
+	if originPort == "" {
+		originPort = defaultPortForScheme(parsed.Scheme)
+	}
+	targetPort := portOnly(host)
+	if targetPort == "" {
+		targetPort = defaultPortForScheme(proto)
+	}
+	return originPort == targetPort
+}
+
+func defaultPortForScheme(scheme string) string {
+	if strings.EqualFold(scheme, "https") {
+		return "443"
+	}
+	return "80"
+}
+
+func hostOnly(hostPort string) string {
+	if host, _, err := net.SplitHostPort(hostPort); err == nil && host != "" {
+		return host
+	}
+	return strings.Trim(hostPort, "[]")
+}
+
+func portOnly(hostPort string) string {
+	if _, port, err := net.SplitHostPort(hostPort); err == nil {
+		return port
+	}
+	return ""
+}
+
+// bindsLoopback 判断监听地址是否只落在回环上（127.0.0.0/8、::1、localhost）。
+// 缺省主机（如 ":8123"）意味着绑所有接口, 不算回环。
+func bindsLoopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -1317,9 +1621,10 @@ func (s *Server) handleBIOSOnlineCheck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "仅管理员可以检查 BIOS 更新")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
-	defer cancel()
-	writeJSON(w, http.StatusOK, s.Manager.CheckBIOSOnline(ctx))
+	// 后台执行,立即返回"检查中"快照:页面渐进刷新(轮询 GET),连接断开
+	// 也不会取消进行中的检查
+	s.Manager.StartBIOSOnlineCheck()
+	writeJSON(w, http.StatusOK, s.Manager.BIOSOnline())
 }
 
 // handleBIOSOnlineFlash 按检查结果在线下载并刷写 BIOS；confirm=FLASH。

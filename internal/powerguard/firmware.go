@@ -15,7 +15,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -256,6 +258,18 @@ func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
 	if target == "" {
 		return "", errors.New("未找到 flashrom，且模块数据目录不可用，无法自动下载")
 	}
+	// 负缓存:下载的 flashrom 在本机跑不起来(如群晖 DSM 自带 libpci 过旧)
+	// 已经验证过一次就别再重复下载几 MB——曾把 BIOS 在线检查拖到 3 分钟。
+	// 标记 7 天自动过期,环境变化(系统升级带来新依赖)后仍有机会自愈;
+	// 删掉标记文件即可立即强制重试。
+	marker := filepath.Join(filepath.Dir(target), "flashrom-incompatible")
+	if data, err := os.ReadFile(marker); err == nil {
+		if stamped, perr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); perr == nil {
+			if age := time.Since(time.Unix(stamped, 0)); age >= 0 && age < 7*24*time.Hour {
+				return "", fmt.Errorf("本机此前已验证下载的 flashrom 无法运行（缺依赖库），已跳过重复下载；如需重试请删除 %s", marker)
+			}
+		}
+	}
 	data, err := downloadFirmwareFile(ctx, flashromToolURL(), firmwareToolMaxBytes)
 	if err != nil {
 		return "", fmt.Errorf("未找到 flashrom，自动下载失败: %w", err)
@@ -278,6 +292,10 @@ func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
 	// libftdi/libjaylink 时直接报错），试跑不过只删临时文件，不碰正式路径。
 	if output, err := m.runFirmwareCommand(ctx, dir, tmpPath, []string{"--version"}); err != nil {
 		_ = os.Remove(tmpPath)
+		// 写负缓存标记(best effort):缺依赖是宿主环境问题,重试下载不会变好
+		if ctx.Err() == nil {
+			_ = os.WriteFile(marker, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+		}
 		return "", fmt.Errorf("下载的 flashrom 无法运行（可能缺依赖库）: %v %s", err, trimCommandOutput(output))
 	}
 	if err := os.Rename(tmpPath, target); err != nil {
@@ -407,17 +425,72 @@ func (m *Manager) detectNIC(ctx context.Context) firmwareNICInfo {
 	info.model = model
 	flint := m.flintPath()
 	if flint == "" {
-		info.err = "未安装 MFT 工具：点击「开始升级」会自动下载并安装"
+		// 群晖 DSM 没有 MFT:先经 ethtool/dmesg 兜底展示当前固件与 PSID
+		// (刷写仍需 MFT,开始升级时才引导安装),拿不到再给原提示
+		if fw, psid, ok := m.readNICFirmwareFallback(ctx, pci); ok {
+			info.fwVersion, info.psid = fw, psid
+		} else {
+			info.err = "未安装 MFT 工具：点击「开始升级」会自动下载并安装"
+		}
 		return info
 	}
 	query, queryErr := m.runFirmwareCommand(ctx, "", flint, []string{"-d", pci, "q"})
 	if queryErr != nil {
-		info.err = fmt.Sprintf("读取网卡固件信息失败: %v（可先安装 MFT 并执行 mst start）", queryErr)
+		if fw, psid, ok := m.readNICFirmwareFallback(ctx, pci); ok {
+			info.fwVersion, info.psid = fw, psid
+		} else {
+			info.err = fmt.Sprintf("读取网卡固件信息失败: %v（可先安装 MFT 并执行 mst start）", queryErr)
+		}
 		return info
 	}
 	info.fwVersion = firstRegexpGroup(firmwareFWVersionRe, query)
 	info.psid = firstRegexpGroup(firmwarePSIDRe, query)
 	return info
+}
+
+var firmwareEthtoolFWRe = regexp.MustCompile(`(?m)^\s*firmware-version:\s*([0-9][0-9.]*)\s*(?:\(([A-Za-z0-9_\-]+)\))?`)
+
+// readNICFirmwareFallback 在没有 MFT/flint 的宿主(群晖 DSM)上读网卡固件版本
+// 与 PSID:优先 ethtool -i(真机输出 firmware-version: 14.21.2320 (MT_2470112034),
+// 版本与 PSID 同行),次选 dmesg 里 mlx5 探测行(只有版本没有 PSID)。
+// PSID 拿不到时返回部分结果:版本仍有展示价值,刷写前的 PSID 守卫照常拦截。
+func (m *Manager) readNICFirmwareFallback(ctx context.Context, pci string) (fwVersion, psid string, ok bool) {
+	if iface := m.nicInterfaceForPCI(pci); iface != "" {
+		if output, err := m.runFirmwareCommand(ctx, "", "ethtool", []string{"-i", iface}); err == nil {
+			if match := firmwareEthtoolFWRe.FindStringSubmatch(output); match != nil {
+				return match[1], match[2], true
+			}
+		}
+	}
+	if output, err := m.runFirmwareCommand(ctx, "", "dmesg", nil); err == nil {
+		re := regexp.MustCompile(regexp.QuoteMeta(pci) + `.*firmware version:\s*([0-9][0-9.]*)`)
+		if match := re.FindStringSubmatch(output); match != nil {
+			return match[1], "", true
+		}
+	}
+	return "", "", false
+}
+
+// nicInterfaceForPCI 找挂在指定 PCI 地址上的网口名(/sys/class/net/<if>/device
+// 符号链接指向该地址);找不到返回空串。
+func (m *Manager) nicInterfaceForPCI(pci string) string {
+	base := m.rooted("/sys/class/net")
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return ""
+	}
+	for _, entry := range entries {
+		link, err := os.Readlink(filepath.Join(base, entry.Name(), "device"))
+		if err != nil {
+			continue
+		}
+		// sysfs 设备名带 0000: 域前缀,而 parseMellanoxLspci 给的是剥过域的
+		// 短格式(01:00.0)——按后缀匹配两种形态都命中
+		if name := filepath.Base(link); name == pci || strings.HasSuffix(name, ":"+pci) {
+			return entry.Name()
+		}
+	}
+	return ""
 }
 
 func (m *Manager) mftInstalled() bool {
@@ -991,20 +1064,7 @@ func downloadFirmwareFile(ctx context.Context, address string, limit int64) ([]b
 func firmwareHTTPTransport() *http.Transport {
 	resolver := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			if host, port, err := net.SplitHostPort(address); err == nil {
-				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-					address = net.JoinHostPort("223.5.5.5", port)
-				}
-			}
-			if strings.HasPrefix(network, "udp") {
-				network = "udp4"
-			} else if strings.HasPrefix(network, "tcp") {
-				network = "tcp4"
-			}
-			dialer := &net.Dialer{Timeout: 5 * time.Second}
-			return dialer.DialContext(ctx, network, address)
-		},
+		Dial:     firmwareDNSDial,
 	}
 	// 克隆默认 Transport 再定向替换拨号/解析：保留 ProxyFromEnvironment 等
 	// 环境代理支持，只能经 HTTPS_PROXY 出网的环境不会被改成直连。
@@ -1018,7 +1078,75 @@ func firmwareHTTPTransport() *http.Transport {
 		KeepAlive: 30 * time.Second,
 		Resolver:  resolver,
 	}).DialContext
+	// 默认 Transport 的 TLS 握手超时是 10s;真机实测 ky.mi-d.cn 冷路径握手
+	// 可到 ~9s(贴线),CDN/DNS 抖动时直接报 TLS handshake timeout——放宽到 30s
+	clone.TLSHandshakeTimeout = 30 * time.Second
 	return clone
+}
+
+// firmwareDeadDNS 不可达 nameserver 的进程内负缓存。真机(SA6400/RR)的
+// resolv.conf 前两个服务器(192.168.254.254/10.0.0.1)从本机完全不可达,
+// Go 纯 resolver 每次查询都按序试过去——每个死服务器烧满 5s 拨号超时,
+// 单次 DNS 就 10s+,BIOS 在线检查曾因此拖到 80-180s。拨号失败的服务器
+// 短期拉黑(TTL 5 分钟),网络环境变化后自然恢复。
+var firmwareDeadDNS struct {
+	sync.Mutex
+	until map[string]time.Time
+}
+
+func firmwareDNSServerDead(host string) bool {
+	firmwareDeadDNS.Lock()
+	defer firmwareDeadDNS.Unlock()
+	if firmwareDeadDNS.until == nil {
+		return false
+	}
+	deadline, ok := firmwareDeadDNS.until[host]
+	if !ok {
+		return false
+	}
+	if time.Now().After(deadline) {
+		delete(firmwareDeadDNS.until, host)
+		return false
+	}
+	return true
+}
+
+func firmwareMarkDNSDead(host string, ttl time.Duration) {
+	firmwareDeadDNS.Lock()
+	defer firmwareDeadDNS.Unlock()
+	if firmwareDeadDNS.until == nil {
+		firmwareDeadDNS.until = map[string]time.Time{}
+	}
+	firmwareDeadDNS.until[host] = time.Now().Add(ttl)
+}
+
+// firmwareDNSDial 固件下载专用 resolver 的拨号:IPv6 nameserver 替换为
+// 223.5.5.5、强制 IPv4 传输、死服务器直接跳过(立即报错让 resolver 换
+// 下一个,不再等满拨号超时)。
+func firmwareDNSDial(ctx context.Context, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		host, port = address, "53"
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+		host = "223.5.5.5"
+		address = net.JoinHostPort(host, port)
+	}
+	if firmwareDNSServerDead(host) {
+		return nil, fmt.Errorf("dns server %s 最近不可达,已跳过", host)
+	}
+	if strings.HasPrefix(network, "udp") {
+		network = "udp4"
+	} else if strings.HasPrefix(network, "tcp") {
+		network = "tcp4"
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	conn, dialErr := dialer.DialContext(ctx, network, address)
+	// 拨号失败记为坏服务器;上下文取消/超时不算服务器的锅
+	if dialErr != nil && ctx.Err() == nil {
+		firmwareMarkDNSDead(host, 5*time.Minute)
+	}
+	return conn, dialErr
 }
 
 func firmwareMFTURL() string {

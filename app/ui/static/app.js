@@ -854,11 +854,15 @@ function renderFanHardwareWarning(fanStatus = {}) {
   const noChannel = fanStatus.driver_detected === true && !fans.length;
   const noRPM = fanStatus.driver_detected === true && fans.length
     && !fans.some((fan) => Number(fan.rpm) > 0);
+  const isDSM = currentStatus?.platform === 'dsm';
   warning.hidden = !(missingDriver || noChannel || noRPM);
-  $('fan-warning-driver-link').hidden = !missingDriver;
   if (missingDriver) {
     $('fan-warning-title').textContent = '未检测到或未加载 IT87 风扇驱动';
-    $('fan-warning-description').textContent = '风扇转速和 PWM 控制暂不可用。本插件安装时应已尝试内置 DKMS；请确认 dkms/gcc/make/linux-headers 后重启模块。';
+    // 群晖 DSM 没有 DKMS/gcc/内核头工具链，驱动只能来自引导加载器的驱动扩展
+    // （RR 的 extra 驱动等）或系统预装模块，提示要与平台一致
+    $('fan-warning-description').textContent = isDSM
+      ? '风扇转速和 PWM 控制暂不可用。群晖 DSM 不支持 DKMS 自编译：请通过引导加载器的驱动扩展（如 RR 的 extra 驱动）加载 it87 模块，或确认系统已内置该驱动，然后重启本套件。'
+      : '风扇转速和 PWM 控制暂不可用。本插件安装时应已尝试内置 DKMS；请确认 dkms/gcc/make/linux-headers 后重启模块。';
   } else if (noChannel) {
     $('fan-warning-title').textContent = '未发现可控风扇通道';
     $('fan-warning-description').textContent = 'IT87 驱动已检测，但没有同时暴露 fan、pwm 与 pwm_enable 的通道，请检查驱动适配。';
@@ -869,6 +873,8 @@ function renderFanHardwareWarning(fanStatus = {}) {
       ? FAN_OFF_RPM_NOTICE
       : '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
   }
+  // 独立 IT87 驱动 FPK 是 fnOS 包，DSM 上不可用，不展示这个兜底链接
+  $('fan-warning-driver-link').hidden = !missingDriver || isDSM;
 }
 
 function setupFanSlotSelectors() {
@@ -2923,7 +2929,7 @@ function renderFirmwareJob(job) {
     if (!button) return;
     // 网卡升级键的 disabled 归 renderFirmwareStatus 的同版本逻辑管，空闲时不得强制放开
     if (!running && id === 'firmware-nic-flash') return;
-    button.disabled = running;
+    button.disabled = running || (id === 'bios-online-check' && biosOnlinePollTimer !== null);
   });
   if (running) {
     const onlineFlash = $('bios-online-flash');
@@ -3180,11 +3186,11 @@ function renderBIOSOnline(status) {
   setText('bios-online-model', status.model);
   const current = status.current_version
     ? `${status.current_version}（${status.current_build_date || '日期未知'}）`
-    : status.current_error || '';
-  setText('bios-online-current', current);
+    : status.current_error || (status.checking ? '读取中…' : '');
+  setText('bios-online-current', status.current_version_note ? `${current} · ${status.current_version_note}` : current);
   const latest = status.candidate_version
     ? `${status.candidate_version}（${status.candidate_build_date || '日期未知'}）`
-    : '';
+    : (status.checking ? '检查中…' : '');
   setText('bios-online-latest', latest);
   setText('bios-online-zip', status.candidate_zip);
   biosOnlineCandidateLabel = latest || status.candidate_zip || '';
@@ -3205,6 +3211,10 @@ function renderBIOSOnline(status) {
     showBIOSOnlineHint(status.error, true);
   } else if (status.update_available) {
     showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），可下载更新。`);
+  } else if (status.checking) {
+    showBIOSOnlineHint(status.candidate_version
+      ? '已获取最新版本信息,正在读取本机当前 BIOS 版本…'
+      : '正在连接厂商服务器读取索引…');
   } else if (status.candidate_zip) {
     // 已是最新：不再显示 badge 状态，hint 保持空白让面板更干净
     showBIOSOnlineHint('');
@@ -3224,23 +3234,54 @@ function updateBIOSOnlineFlashButton() {
   flashButton.disabled = !biosOnlineUpdateAvailable;
 }
 
+let biosOnlinePollTimer = null;
+
+function stopBIOSOnlinePoll() {
+  if (biosOnlinePollTimer !== null) {
+    clearInterval(biosOnlinePollTimer);
+    biosOnlinePollTimer = null;
+  }
+  const button = $('bios-online-check');
+  if (button) {
+    button.disabled = false;
+    button.textContent = '检查更新';
+  }
+}
+
 async function checkBIOSOnline() {
   const button = $('bios-online-check');
   if (button) {
     button.disabled = true;
     button.textContent = '检查中…';
   }
-  showBIOSOnlineHint('正在读取云端索引并用 flashrom 读取当前 BIOS 版本（约 10–30 秒）…');
-  try {
-    renderBIOSOnline(await request('api/firmware/bios-online/check', { method: 'POST' }));
-  } catch (error) {
-    showBIOSOnlineHint(`检查失败：${error.message}`, true);
-  } finally {
-    if (button) {
-      button.disabled = false;
-      button.textContent = '检查更新';
-    }
-  }
+  showBIOSOnlineHint('正在连接厂商服务器,页面会随检查进度逐步刷新…');
+  // 渐进渲染:后端各阶段完成即发布缓存快照,轮询 GET 即可逐步拿到
+  // 候选版本 → 当前版本 → 是否可更新,无需等整个检查跑完
+  const pollOnce = async () => {
+    try {
+      renderBIOSOnline(await request('api/firmware/bios-online'));
+    } catch (error) { /* 单次轮询失败忽略,下一轮再取 */ }
+  };
+  pollOnce();
+  if (biosOnlinePollTimer !== null) clearInterval(biosOnlinePollTimer);
+  biosOnlinePollTimer = setInterval(async () => {
+    try {
+      const status = await request('api/firmware/bios-online');
+      renderBIOSOnline(status);
+      if (!status.checking) stopBIOSOnlinePoll();
+    } catch (error) { /* 忽略,下一轮再取 */ }
+  }, 2000);
+  // 触发检查:不 await(耗时阶段在服务端跑),终态由轮询渲染;这里只兜底收尾
+  request('api/firmware/bios-online/check', { method: 'POST' })
+    .then((status) => {
+      renderBIOSOnline(status);
+      // 后台检查:响应是"检查中"快照时保持轮询,终态才停
+      if (!status.checking) stopBIOSOnlinePoll();
+    })
+    .catch((error) => {
+      stopBIOSOnlinePoll();
+      showBIOSOnlineHint(`检查失败：${error.message}`, true);
+    });
 }
 
 async function flashBIOSOnline() {
@@ -6858,7 +6899,8 @@ function render(status, keepInputs = false) {
   $('app-version').textContent = versionText;
   $('about-version').textContent = versionText;
   $('device-name').textContent = status.device_name || 'TAD6S4N';
-  $('os-version').textContent = [status.os_name, status.os_version].filter(Boolean).join(' ') || 'fnOS';
+  $('os-version').textContent = [status.os_name, status.os_version].filter(Boolean).join(' ')
+    || ({ fnos: 'fnOS', dsm: '群晖 DSM' }[status.platform] || 'fnOS');
   $('cpu-model').textContent = status.cpu_model || '未识别';
   $('cpu-display-label').textContent = cpuTemperature.display_source === 'package_fallback'
     ? 'CPU 温度（Package 回退）'

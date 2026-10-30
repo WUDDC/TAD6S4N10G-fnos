@@ -1,0 +1,6 @@
+#!/bin/sh
+# 群晖 DSM 卸载后：无操作。etc/var 随套件目录由 DSM 整体删除；nginx 反代
+# 与风扇交还在 preuninst 里经 start-stop-status 薄壳(root)完成——本脚本
+# 以套件用户运行,做不了需要权限的事。
+set -eu
+exit 0

@@ -1,0 +1,19 @@
+{
+    "tadmodule.js": {
+        "com.wuddc.packages.tadmodule.AppInstance": {
+            "type": "app",
+            "title": "TAD6S4N 模块",
+            "version": "0.1",
+            "icon": "images/tad-module-{0}.png",
+            "allowMultiInstance": false,
+            "allUsers": true,
+            "appWindow": "com.wuddc.packages.tadmodule.AppWindow",
+            "depend": ["com.wuddc.packages.tadmodule.AppWindow"]
+        },
+        "com.wuddc.packages.tadmodule.AppWindow": {
+            "type": "lib",
+            "title": "TAD6S4N 模块",
+            "icon": "images/tad-module-{0}.png"
+        }
+    }
+}

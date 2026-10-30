@@ -1,6 +1,8 @@
 /.cache/
 /dist/
 /*.fpk
+/*.spk
+/*.spk.sha256
 /app/bin/tad-module
 /ICON.PNG
 /ICON_256.PNG
@@ -9,3 +11,5 @@
 /tools/fnpack.exe
 /图片_2026-08-09_132239_579.png
 /.tools/
+
+/dist-artifact*/
