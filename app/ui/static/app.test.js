@@ -124,8 +124,8 @@ function loadAppContext(overrides = {}) {
     // 继续执行、反过来改掉用例的前置状态。要用的用例自己传 overrides.TextEncoder。
     ...(overrides.TextEncoder ? { TextEncoder: overrides.TextEncoder, TextDecoder: overrides.TextDecoder || TextDecoder } : {}),
     ...(overrides.FormData ? { FormData: overrides.FormData } : {}),
-    setInterval: () => 0,
-    clearInterval: () => {},
+    setInterval: overrides.setInterval || (() => 0),
+    clearInterval: overrides.clearInterval || (() => {}),
     setTimeout: () => 0,
     clearTimeout: () => {},
     requestAnimationFrame: overrides.requestAnimationFrame || (() => 0),
@@ -3406,3 +3406,27 @@ test('切到固件页：立即拉取一次固件状态', async () => {
   assert.ok(requests.some((item) => /api\/firmware$/.test(item.url)), '进入固件页要拉取 api/firmware');
 });
 
+
+test('BIOS 在线检查重复触发只有一个轮询，任务刷新不提前启用按钮', async () => {
+  let nextTimer = 0;
+  const timers = new Map();
+  const app = loadAppContext({
+    setInterval: (callback) => { const id = nextTimer++; timers.set(id, callback); return id; },
+    clearInterval: (id) => { timers.delete(id); },
+  });
+  const check = app.resolve('checkBIOSOnline');
+  const before = timers.size;
+  await check();
+  assert.equal(timers.size, before + 1);
+  const first = app.resolve('biosOnlinePollTimer');
+  app.resolve('renderFirmwareJob')({ kind: 'bios', state: 'idle', logs: [] });
+  assert.equal(app.element('bios-online-check').disabled, true);
+  await check();
+  assert.equal(timers.size, before + 1, '重复点击不能遗留旧轮询');
+  assert.equal(timers.has(first), false, '旧interval必须被清除');
+  app.resolve('stopBIOSOnlinePoll')();
+  assert.equal(timers.size, before);
+  assert.equal(app.element('bios-online-check').disabled, false);
+  app.resolve('renderFirmwareJob')({ kind: 'bios', state: 'running', logs: [] });
+  assert.equal(app.element('bios-online-check').disabled, true);
+});

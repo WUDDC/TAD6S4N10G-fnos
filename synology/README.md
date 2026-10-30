@@ -61,8 +61,10 @@ tad-module；换端口/参数见下节「运行参数」。
 - `scripts/start-stop-status` 是薄壳：已是 root（DSM 6/调试）直接执行；
   否则 `exec spm-exec sh real-start-stop-status "$@"`，由 SPM 按 UID 提权；
 - **实测 DSM 7（RR）上安装期脚本（postinst 等）也以套件用户运行**：postinst
-  只做目录/凭据/参数文件等无需 root 的初始化，硬件初始化（配置生成、功耗
-  应用、风扇绑定）顺延到**首次 root 启动**由守护进程完成；`preuninst` 的
+  初始化目录、凭据和参数文件；其中需要 root 的硬件命令失败时降级安装。
+  配置生成和功耗应用由**首次 root 启动**的守护进程完成。DSM 首装的自动
+  风扇绑定在套件用户下会失败，首次启动不会补绑；请在风扇页手动配置并
+  开启曲线。`preuninst` 的
   停服兜底同样走薄壳（经 SPM 提权）；
 - 没装 SPM 时启动会失败并打印可操作的分步指引（fail-closed，不会静默降权
   跑一个半残的守护进程）。

@@ -927,3 +927,58 @@ func TestFirmwareDNSDialSkipsDeadServerInstantly(t *testing.T) {
 		t.Fatalf("死服务器应立即跳过,耗时 %v", elapsed)
 	}
 }
+
+func TestEnsureFlashromCancellationDoesNotCacheIncompatibility(t *testing.T) {
+	payload := append([]byte{0x7f, 'E', 'L', 'F'}, []byte("isolated-version-probe")...)
+	oldHash, oldHook := flashromExpectedSHA256, firmwareDownloadHook
+	flashromExpectedSHA256 = sha256Hex(payload)
+	defer func() { flashromExpectedSHA256, firmwareDownloadHook = oldHash, oldHook }()
+	for _, mode := range []string{"cancel", "timeout", "incompatible"} {
+		t.Run(mode, func(t *testing.T) {
+			manager := &Manager{Root: t.TempDir(), StatePath: filepath.Join(t.TempDir(), "state.json"), firmwareFlashrom: firmwareToolAbsent}
+			var ctx context.Context
+			var cancel context.CancelFunc
+			if mode == "timeout" {
+				ctx, cancel = context.WithTimeout(context.Background(), time.Millisecond)
+			} else {
+				ctx, cancel = context.WithCancel(context.Background())
+			}
+			defer cancel()
+			downloads := 0
+			firmwareDownloadHook = func(context.Context, string) ([]byte, error) { downloads++; return payload, nil }
+			manager.firmwareExec = func(context.Context, string, string, []string) (string, error) {
+				switch mode {
+				case "cancel":
+					cancel()
+					return "", ctx.Err()
+				case "timeout":
+					<-ctx.Done()
+					return "", ctx.Err()
+				default:
+					return "missing libpci", errors.New("incompatible")
+				}
+			}
+			if _, err := manager.ensureFlashrom(ctx); err == nil {
+				t.Fatal("版本探测应失败")
+			}
+			marker := filepath.Join(filepath.Dir(manager.downloadedFlashromPath()), "flashrom-incompatible")
+			_, err := os.Stat(marker)
+			if mode == "incompatible" {
+				if err != nil {
+					t.Fatalf("不兼容必须保留负缓存: %v", err)
+				}
+				if _, err := manager.ensureFlashrom(context.Background()); err == nil || downloads != 1 {
+					t.Fatal("真实不兼容应跳过重复下载")
+				}
+			} else {
+				if !os.IsNotExist(err) {
+					t.Fatalf("取消/超时不得写负缓存: %v", err)
+				}
+				manager.firmwareExec = func(context.Context, string, string, []string) (string, error) { return "flashrom v1", nil }
+				if _, err := manager.ensureFlashrom(context.Background()); err != nil || downloads != 2 {
+					t.Fatalf("后续重试应成功: downloads=%d err=%v", downloads, err)
+				}
+			}
+		})
+	}
+}

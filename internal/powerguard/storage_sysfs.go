@@ -12,13 +12,13 @@ import (
 
 // 群晖 DSM 宿主兜底：DSM（含 RR 加载的 DSM）没有 udev 的 /dev/disk/by-path
 // 链接，块设备由 syno 驱动以 sataN 命名（/dev/sataN、/sys/block/sataN）。
-// 设备的 PCI BDF 与 ATA 端口号在 sysfs 设备符号链接目标里完整可得，据此合成
+// 从设备符号链接目标取 PCI BDF 与 ATA 全局编号，再读 ata_port/ataN/port_no，合成
 // 与 by-path 等价的映射，供既有的仓位发现/解析管线使用。
 //
 // 例（TAD6S4N10G 前置仓）：
 //	/sys/block/sata1 -> ../devices/pci0000:00/0000:00:1c.2/0000:02:00.0/
 //	                    ata1/host0/target0:0:0/0:0:0:0/block/sata1
-//	合成 pci-0000:02:00.0-ata-1（与 -ata-1.0 两种 udev 命名）→ sata1
+//	若 ata1/port_no=1，合成 pci-0000:02:00.0-ata-1（与 -ata-1.0）→ sata1
 
 var (
 	sysfsBDFRe      = regexp.MustCompile(`^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$`)
@@ -38,7 +38,7 @@ func storageSysfsKnameRelevant(kname string) bool {
 }
 
 // parseSysfsBlockPath 从 /sys/block 设备符号链接目标解析 PCI BDF（取最后一个
-// pci 组件，即设备所属控制器）、ATA 端口号与 NVMe 控制器序号。
+// pci 组件，即设备所属控制器）、ATA 全局编号与 NVMe 控制器序号（ATA 本地端口另读 port_no）。
 func parseSysfsBlockPath(target string) (bdf string, ataPort int, nvmeCtrl int) {
 	ataPort, nvmeCtrl = 0, -1
 	for _, component := range strings.Split(target, "/") {
@@ -65,11 +65,18 @@ func parseSysfsBlockPath(target string) (bdf string, ataPort int, nvmeCtrl int) 
 // pci-<bdf>-ata-<端口>[.0]（SATA）、pci-<bdf>-nvme-<序号>（NVMe；Glob 前缀
 // 匹配下序号不敏感，两种习惯都生成）。无 BDF 或端口信息的设备跳过。
 func (m *Manager) sysfsByPathEntries() map[string]string {
+	entries, _ := m.sysfsStoragePaths()
+	return entries
+}
+
+// sysfsStoragePaths 同时记录无法确定 ATA 本地端口的控制器；不能将其仓位误报为空。
+func (m *Manager) sysfsStoragePaths() (map[string]string, map[string]bool) {
 	entries := map[string]string{}
+	unknown := map[string]bool{}
 	blockDir := m.rooted("/sys/block")
 	names, err := os.ReadDir(blockDir)
 	if err != nil {
-		return entries
+		return entries, unknown
 	}
 	for _, item := range names {
 		kname := item.Name()
@@ -84,6 +91,14 @@ func (m *Manager) sysfsByPathEntries() map[string]string {
 		switch {
 		case ataPort > 0 && bdf != "":
 			bdf = strings.ToLower(bdf)
+			// ataN 是全局 print_id；udev by-path 用控制器内的 port_no（从 1 起）。
+			data, err := os.ReadFile(m.rooted(fmt.Sprintf("/sys/class/ata_port/ata%d/port_no", ataPort)))
+			port, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil || parseErr != nil || port <= 0 {
+				unknown["pci-"+bdf+"-ata-"] = true
+				continue
+			}
+			ataPort = port
 			entries[fmt.Sprintf("pci-%s-ata-%d", bdf, ataPort)] = kname
 			entries[fmt.Sprintf("pci-%s-ata-%d.0", bdf, ataPort)] = kname
 		case nvmeCtrl >= 0 && bdf != "":
@@ -92,7 +107,17 @@ func (m *Manager) sysfsByPathEntries() map[string]string {
 			entries[fmt.Sprintf("pci-%s-nvme-%d", bdf, nvmeCtrl+1)] = kname
 		}
 	}
-	return entries
+	return entries, unknown
+}
+
+func (m *Manager) sysfsATAUnmappedError(busPath string) error {
+	_, unknown := m.sysfsStoragePaths()
+	for prefix := range unknown {
+		if strings.HasPrefix(filepath.Base(busPath), prefix) {
+			return fmt.Errorf("无法确认 %s 的 ATA 端口映射（port_no 缺失或无效）", busPath)
+		}
+	}
+	return nil
 }
 
 // sysfsByPathPrefix 按前缀匹配合成映射（NVMe 槽的 BusPath 以 -nvme- 结尾，

@@ -299,8 +299,12 @@ func TestDSMSessionAuthHandlerCacheRevocationBoundary(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// 该有界会话在首次授权 10 秒后到期，早于缓存窗口结束。
-			write(registry, fmt.Sprintf(`{"name":"admin","id":"cached-admin","connTime":"%d","duration":"1"}`, start.Unix()-50))
+			// 仅 expiry 使用短会话；注销/移组场景必须排除自然到期的干扰。
+			duration := "0"
+			if scenario == "expiry" {
+				duration = "1"
+			}
+			write(registry, fmt.Sprintf(`{"name":"admin","id":"cached-admin","connTime":"%d","duration":"%s"}`, start.Unix()-50, duration))
 			cgi := filepath.Join(dir, "authenticate.cgi")
 			// 确定性拒绝兜底，绝不查询宿主 DSM 或触及硬件。
 			write(cgi, "#!/bin/sh\nexit 4\n")

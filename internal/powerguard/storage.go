@@ -593,6 +593,9 @@ func (m *Manager) resolveStorageDevice(spec storageSlotSpec) (string, string, er
 			if kname, ok := m.sysfsByPathPrefix(spec.BusPath); ok {
 				return "/dev/" + kname, kname, nil
 			}
+			if err := m.sysfsATAUnmappedError(spec.BusPath); err != nil {
+				return "", "", err
+			}
 			return "", "", fs.ErrNotExist
 		}
 	}
@@ -601,6 +604,9 @@ func (m *Manager) resolveStorageDevice(spec storageSlotSpec) (string, string, er
 			// 同上：从 sysfs 合成的 by-path 映射里精确查找
 			if kname, ok := m.sysfsByPathEntries()[filepath.Base(spec.BusPath)]; ok {
 				return "/dev/" + kname, kname, nil
+			}
+			if mappingErr := m.sysfsATAUnmappedError(spec.BusPath); mappingErr != nil {
+				return "", "", mappingErr
 			}
 		}
 		return "", "", err
@@ -979,6 +985,7 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 	text := string(data)
 	lower := strings.ToLower(text)
 	result := smartResult{}
+	recognized := false
 	if passedIdx := strings.Index(lower, "overall-health"); passedIdx >= 0 {
 		line := text[passedIdx:]
 		if nl := strings.IndexAny(line, "\r\n"); nl >= 0 {
@@ -986,7 +993,10 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 		}
 		lineLower := strings.ToLower(line)
 		passed := strings.Contains(lineLower, "passed") && !strings.Contains(lineLower, "failed")
-		result.Passed = &passed
+		if strings.Contains(lineLower, "passed") || strings.Contains(lineLower, "failed") {
+			result.Passed = &passed
+			recognized = true
+		}
 	}
 	if strings.Contains(lower, "device is in standby") ||
 		(strings.Contains(lower, "standby") && !strings.Contains(lower, "temperature_celsius")) {
@@ -997,13 +1007,26 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 	if m := regexp.MustCompile(`Temperature:\s+(\d+)\s+Celsius`).FindStringSubmatch(text); m != nil {
 		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
 			result.TemperatureC = v
+			recognized = true
 		}
 	}
-	if m := regexp.MustCompile(`Critical Warning:\s+(\d+)`).FindStringSubmatch(text); m != nil {
-		result.Critical, _ = strconv.ParseInt(m[1], 10, 64)
+	if m := regexp.MustCompile(`(?m)^\s*Critical Warning:\s+(\S+)`).FindStringSubmatch(text); m != nil {
+		value, base := m[1], 10
+		if strings.HasPrefix(strings.ToLower(value), "0x") {
+			value, base = value[2:], 16
+		}
+		critical, err := strconv.ParseUint(value, base, 8)
+		if err != nil {
+			return smartResult{}, fmt.Errorf("无法解析 NVMe Critical Warning %q: %w", m[1], err)
+		}
+		result.Critical = int64(critical)
+		recognized = true
 	}
 	if m := regexp.MustCompile(`Percentage Used:\s+(\d+)%`).FindStringSubmatch(text); m != nil {
-		result.PercentageUsed, _ = strconv.ParseInt(m[1], 10, 64)
+		if value, err := strconv.ParseInt(m[1], 10, 64); err == nil {
+			result.PercentageUsed = value
+			recognized = true
+		}
 	}
 	// SATA 故障属性列表与 JSON 路径同一份名单(按属性名精确匹配)
 	problemAttrs := map[string]bool{
@@ -1030,6 +1053,7 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 			if token := strings.Fields(fields[9]); len(token) > 0 {
 				if v, err := strconv.ParseFloat(token[0], 64); err == nil {
 					result.TemperatureC = v
+					recognized = true
 				}
 			}
 		}
@@ -1039,7 +1063,10 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 		// when_failed 列位随 smartctl 版本/状态漂移(FAILING_NOW 占 Updated 列),
 		// 在 6..8 列范围内按值识别,不认死列位
 		whenFailed := ""
-		rawNum, _ := strconv.ParseInt(fields[9], 10, 64)
+		rawNum, rawErr := strconv.ParseInt(fields[9], 10, 64)
+		if rawErr == nil {
+			recognized = true
+		}
 		for _, f := range fields[6:9] {
 			lower := strings.ToLower(f)
 			if lower == "failing_now" || lower == "in_the_past" {
@@ -1058,11 +1085,15 @@ func parseSMARTLegacy(data []byte) (smartResult, error) {
 				if token := strings.Fields(fields[9]); len(token) > 0 {
 					if v, err := strconv.ParseFloat(token[0], 64); err == nil {
 						result.TemperatureC = v
+						recognized = true
 					}
 				}
 				break
 			}
 		}
+	}
+	if !recognized {
+		return smartResult{}, errors.New("smartctl 输出没有可识别的 SMART 数据")
 	}
 	return result, nil
 }

@@ -579,3 +579,46 @@ func TestStartBIOSOnlineCheckRunsInBackground(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckBIOSOnlineDMIDatePrecision(t *testing.T) {
+	for _, tc := range []struct {
+		date string
+		want bool
+	}{
+		{"06/23/2026", true}, {"06/24/2026", false}, {"06/25/2026", false},
+	} {
+		t.Run(tc.date, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(root, "proc"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "proc/cpuinfo"), []byte("Intel N100"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			manager := &Manager{Root: root, firmwareFlashrom: firmwareToolAbsent}
+			manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+				if name == "dmidecode" {
+					if args[0] == "-s" {
+						return "5.27\n", nil
+					}
+					return "Release Date: " + tc.date + "\n", nil
+				}
+				return "", errors.New("unexpected command " + name)
+			}
+			restore := firmwareDownloadHook
+			firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+				if strings.Contains(address, "zip.txt") {
+					return []byte(biosIndexFixture), nil
+				}
+				return nil, errors.New("unexpected download")
+			}
+			defer func() { firmwareDownloadHook = restore }()
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			status := manager.CheckBIOSOnline(ctx)
+			if status.Error != "" || status.CurrentVersionNote == "" || status.CandidateVersion == "" || status.UpdateAvailable != tc.want {
+				t.Fatalf("DMI date=%s wantUpdate=%v status=%+v", tc.date, tc.want, status)
+			}
+		})
+	}
+}

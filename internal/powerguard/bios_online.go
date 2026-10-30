@@ -536,7 +536,13 @@ func (m *Manager) CheckBIOSOnline(ctx context.Context) BIOSOnlineStatus {
 		publish()
 		return status
 	}
-	if !fid.BuildDate.IsZero() && candidate.BuildDate.After(fid.BuildDate) {
+	candidateDate := candidate.BuildDate
+	if fid.degraded {
+		// DMI 只有日期精度；同一天的候选不能仅因带时分就被判为更新。
+		year, month, day := candidateDate.Date()
+		candidateDate = time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+	}
+	if !fid.BuildDate.IsZero() && candidateDate.After(fid.BuildDate) {
 		status.UpdateAvailable = true
 	}
 	publish()

@@ -2929,7 +2929,7 @@ function renderFirmwareJob(job) {
     if (!button) return;
     // 网卡升级键的 disabled 归 renderFirmwareStatus 的同版本逻辑管，空闲时不得强制放开
     if (!running && id === 'firmware-nic-flash') return;
-    button.disabled = running;
+    button.disabled = running || (id === 'bios-online-check' && biosOnlinePollTimer !== null);
   });
   if (running) {
     const onlineFlash = $('bios-online-flash');
@@ -3237,7 +3237,7 @@ function updateBIOSOnlineFlashButton() {
 let biosOnlinePollTimer = null;
 
 function stopBIOSOnlinePoll() {
-  if (biosOnlinePollTimer) {
+  if (biosOnlinePollTimer !== null) {
     clearInterval(biosOnlinePollTimer);
     biosOnlinePollTimer = null;
   }
@@ -3263,6 +3263,7 @@ async function checkBIOSOnline() {
     } catch (error) { /* 单次轮询失败忽略,下一轮再取 */ }
   };
   pollOnce();
+  if (biosOnlinePollTimer !== null) clearInterval(biosOnlinePollTimer);
   biosOnlinePollTimer = setInterval(async () => {
     try {
       const status = await request('api/firmware/bios-online');

@@ -1,6 +1,9 @@
 package powerguard
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -126,7 +129,6 @@ func TestParseSMARTLegacyNVMe(t *testing.T) {
 	}
 }
 
-
 func TestFormatSmartAttrWarningReadable(t *testing.T) {
 	// 真机形态:客户在弹窗里看到的完整信息必须是白话
 	got := formatSmartAttrWarning("Offline_Uncorrectable", 198, 6, "")
@@ -143,5 +145,68 @@ func TestFormatSmartAttrWarningReadable(t *testing.T) {
 	got = formatSmartAttrWarning("Weird_Attr", 250, 2, "")
 	if !strings.Contains(got, "Weird_Attr") || !strings.Contains(got, "2") {
 		t.Fatalf("未知属性兜底文案异常: %s", got)
+	}
+}
+
+func TestParseSMARTLegacyNVMeCriticalWarningFormats(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		want    int64
+		invalid bool
+	}{
+		{"0x00", 0, false}, {"0x01", 1, false}, {"0x0a", 10, false}, {"0XFF", 255, false},
+		{"0", 0, false}, {"1", 1, false}, {"08", 8, false}, {"10", 10, false},
+		{"0xGG", 0, true}, {"256", 0, true}, {"-1", 0, true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			result, err := parseSMARTLegacy([]byte("Critical Warning: " + tc.value + "\n"))
+			if tc.invalid {
+				if err == nil {
+					t.Fatal("畸形状态不得按健康的0处理")
+				}
+				return
+			}
+			if err != nil || result.Critical != tc.want {
+				t.Fatalf("Critical=%d err=%v want=%d", result.Critical, err, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadSMARTLegacyPreservesCommandFailure(t *testing.T) {
+	// 每个替身均声明6.5；不查找真实smartctl，不打开设备。
+	smartctlLegacyProbe.mu.Lock()
+	old := smartctlLegacyProbe.legacy
+	legacy := true
+	smartctlLegacyProbe.legacy = &legacy
+	smartctlLegacyProbe.mu.Unlock()
+	defer func() {
+		smartctlLegacyProbe.mu.Lock()
+		smartctlLegacyProbe.legacy = old
+		smartctlLegacyProbe.mu.Unlock()
+	}()
+	for _, tc := range []struct {
+		name, output string
+		code         int
+		wantErr      bool
+	}{
+		{"empty-failure", "", 2, true}, {"open-failure", "Permission denied", 2, true},
+		{"empty-success", "", 0, true}, {"health-bit", "SMART overall-health self-assessment test result: FAILED", 8, false},
+		{"standby", "Device is in STANDBY mode", 2, false}, {"valid-zero", "Critical Warning: 0x00", 8, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "smartctl")
+			script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '%s'\nexit %d\n", tc.output, tc.code)
+			if err := os.WriteFile(path, []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			_, err := readSMART(path, "/not-a-device", false, false)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("wantErr=%v got=%v", tc.wantErr, err)
+			}
+			if tc.wantErr && tc.code != 0 && !strings.Contains(err.Error(), "exit status 2") {
+				t.Fatalf("丢失原命令错误: %v", err)
+			}
+		})
 	}
 }

@@ -293,7 +293,9 @@ func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
 	if output, err := m.runFirmwareCommand(ctx, dir, tmpPath, []string{"--version"}); err != nil {
 		_ = os.Remove(tmpPath)
 		// 写负缓存标记(best effort):缺依赖是宿主环境问题,重试下载不会变好
-		_ = os.WriteFile(marker, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+		if ctx.Err() == nil {
+			_ = os.WriteFile(marker, []byte(strconv.FormatInt(time.Now().Unix(), 10)), 0o600)
+		}
 		return "", fmt.Errorf("下载的 flashrom 无法运行（可能缺依赖库）: %v %s", err, trimCommandOutput(output))
 	}
 	if err := os.Rename(tmpPath, target); err != nil {

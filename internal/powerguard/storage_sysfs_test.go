@@ -1,8 +1,11 @@
 package powerguard
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -12,6 +15,17 @@ func mustSymlink(t *testing.T, link, target string) {
 		t.Fatal(err)
 	}
 	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeATAPortFixture(t *testing.T, root, ata, port string) {
+	t.Helper()
+	dir := filepath.Join(root, "sys/class/ata_port", ata)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "port_no"), []byte(port+"\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -31,6 +45,8 @@ func TestSysfsByPathEntriesDSM(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	writeATAPortFixture(t, root, "ata1", "1")
+	writeATAPortFixture(t, root, "ata2", "2")
 	m := &Manager{Root: root}
 	entries := m.sysfsByPathEntries()
 	cases := map[string]string{
@@ -61,6 +77,7 @@ func TestResolveStorageDeviceViaSysfsFallback(t *testing.T) {
 	mustSymlink(t, filepath.Join(blockDir, "nvme0n1"),
 		"../devices/pci0000:00/0000:00:1c.0/0000:01:00.0/nvme/nvme0/nvme0n1")
 
+	writeATAPortFixture(t, root, "ata1", "1")
 	m := &Manager{Root: root}
 	device, kname, err := m.resolveStorageDevice(storageSlotSpec{
 		ID: "front-1", BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-1",
@@ -200,5 +217,52 @@ func TestReadBlockTopologyFromProcInactiveArrayMembers(t *testing.T) {
 		if !ok || !info.Used {
 			t.Fatalf("inactive 阵列成员 %s 应判在用: %+v", kname, info)
 		}
+	}
+}
+
+func TestSysfsATAPortUsesControllerLocalNumber(t *testing.T) {
+	root := t.TempDir()
+	for _, disk := range []struct{ kname, bdf, ata, port string }{
+		{"sata1", "0000:02:00.0", "ata7", "1"},
+		{"sata2", "0000:03:00.0", "ata8", "1"},
+	} {
+		mustSymlink(t, filepath.Join(root, "sys/block", disk.kname), "../devices/pci0000:00/"+disk.bdf+"/"+disk.ata+"/host0/target0:0:0/0:0:0:0/block/"+disk.kname)
+		writeATAPortFixture(t, root, disk.ata, disk.port)
+	}
+	m := &Manager{Root: root}
+	for _, bdf := range []string{"0000:02:00.0", "0000:03:00.0"} {
+		name := "pci-" + bdf + "-ata-1"
+		got := m.sysfsByPathEntries()[name]
+		if got == "" {
+			t.Fatalf("缺控制器本地端口: %v", m.sysfsByPathEntries())
+		}
+		if _, _, err := m.resolveStorageDevice(storageSlotSpec{BusPath: "/dev/disk/by-path/" + name}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if m.sysfsByPathEntries()["pci-0000:02:00.0-ata-7"] != "" {
+		t.Fatal("不得使用全局 ATA 编号")
+	}
+}
+
+func TestSysfsATAUnknownPortDoesNotInventSlot(t *testing.T) {
+	for _, port := range []string{"missing", "0", "-1", "garbage", "99999999999999999999999999999999"} {
+		t.Run(port, func(t *testing.T) {
+			root := t.TempDir()
+			mustSymlink(t, filepath.Join(root, "sys/block/sata1"), "../devices/pci0000:00/0000:02:00.0/ata7/host0/target0:0:0/0:0:0:0/block/sata1")
+			// 保留另一个可识别 NVMe，覆盖部分控制器未知时的逐仓回退。
+			mustSymlink(t, filepath.Join(root, "sys/block/nvme0n1"), "../devices/pci0000:00/0000:01:00.0/nvme/nvme0/nvme0n1")
+			if port != "missing" {
+				writeATAPortFixture(t, root, "ata7", port)
+			}
+			m := &Manager{Root: root}
+			if len(m.sysfsByPathEntries()) != 2 {
+				t.Fatalf("仅应留下 NVMe 映射: %v", m.sysfsByPathEntries())
+			}
+			_, _, err := m.resolveStorageDevice(storageSlotSpec{BusPath: "/dev/disk/by-path/pci-0000:02:00.0-ata-1"})
+			if err == nil || errors.Is(err, fs.ErrNotExist) || !strings.Contains(err.Error(), "port_no") {
+				t.Fatalf("必须明确未知映射，不能误报空仓: %v", err)
+			}
+		})
 	}
 }
