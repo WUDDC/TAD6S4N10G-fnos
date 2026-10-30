@@ -43,6 +43,8 @@ jobs:
           node --check app/ui/static/crps/app.js
           node --test app/ui/static/crps/app.test.js
           bash -n cmd/* scripts/build.sh scripts/build-spk.sh
+          sh -n synology/scripts/*
+          python3 scripts/test-synology.py
 
       - name: Download official fnpack
         run: |

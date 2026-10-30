@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 打包 | `manifest` + fnpack → `.fpk` | `synology/` + `scripts/build-spk.sh` → `.spk` |
 | 界面入口 | fnOS 应用中心，宿主网关反代到 Unix socket | **DSM 桌面嵌入**：DSM nginx 反代 `/webman/3rdparty/tad-module/` → 本机回环 `127.0.0.1:8123`，主菜单图标直达 |
-| 管理员鉴权 | fnOS 网关注入 `X-Trim-Isadmin` | **DSM 登录态**（`/webman` 前缀天然受 DSM 登录保护）；nginx 反代注入同一 `X-Trim-Isadmin` 身份头，**写接口校验链与主线完全一致** |
+| 管理员鉴权 | fnOS 网关注入 `X-Trim-Isadmin` | **后端校验 DSM 会话及 administrators 组**（注册表优先、CGI 兜底）；nginx 仅携带共享密钥，认证后由后端注入 `X-Trim-Isadmin` |
 | root 权限 | fnOS 模块即 root | **DSM 7 禁止第三方套件以 root 运行**：服务经 [SimplePermissionManager](https://github.com/XPEnology-Community/SimplePermissionManager)（SPM）的 `spm-exec` 提权（见下） |
 | it87 风扇驱动 | 无独立 FPK 时经 DKMS 自动编译 | DSM 无 DKMS/gcc/内核头：只探测/加载系统已有的 it87 模块（引导加载器 extra 驱动等），缺驱动时风扇页给 DSM 专属提示 |
 | 平台探测 | `/etc/issue`、`/etc/fnos-release` | 新增 `DetectPlatform`：识别 `fnos` / `dsm` / `generic`，随 `/api/status` 的 `platform` 字段下发 |
@@ -43,8 +43,7 @@ GPIO 按键、SMART 读取都是 root 硬件通路。SPM 提供 setuid 入口 `s
 2. 安装 **SimplePermissionManager**，打开其界面点 **Active** 激活。
 3. 套件中心 → 手动安装 → 选择本套件 `.spk`。
 4. 打开 SPM → **Package 标签 → 勾选启用 tad-module**。
-5. 套件中心启动「TAD6S4N 模块」；DSM 主面板出现图标，或直接访问
-   `http://<NAS>:8123`。
+5. 套件中心启动「TAD6S4N 模块」；DSM 主面板出现图标（默认回环监听，局域网不能直连 8123）。
 6. 浏览器打开 DSM 桌面 → 主菜单「TAD6S4N 模块」（或直接访问
    `http://<NAS>:5000/webman/3rdparty/tad-module/`），**鉴权就是 DSM 登录，无需额外密码**。
    实际路径按安装卷不同而不同：程序与配置在 `<安装卷>/@appstore/tad-module/`，
@@ -72,10 +71,14 @@ tad-module；换端口/参数见下节「运行参数」。
 裸露。DSM 的 `/webman/3rdparty/` 路径**本身没有登录校验**（第三方套件的 CGI
 历来要自己做），因此鉴权不依赖该前缀，而是三层防线：
 
-1. **DSM 会话 + 管理员组**：每个请求由后端经 DSM 自带的
-   `authenticate.cgi`（本地执行、转发会话 Cookie）校验登录态，且要求用户在
-   `administrators` 组——未登录、非管理员一律 401；有效会话短暂缓存以支撑
-   页面轮询；
+1. **DSM 会话 + 管理员组**：后端优先读取 root-only 会话注册表
+   `/usr/syno/etc/private/session/current.users`，未匹配时再本地执行 DSM 自带的
+   `authenticate.cgi`（转发完整会话 Cookie）兜底；两种路径均须确认用户属于
+   `administrators` 组才注入管理员身份，认证失败返回 401。
+   会话判定缓存 **30 秒**以支撑页面轮询；在此窗口内注销（删除注册表记录）、
+   有界会话到期或移出管理员组，原授权最多仍可使用 30 秒，窗口结束后的请求
+   才重新校验。不会因持续请求延长缓存期限。注册表字段语义来自 DSM 7.3.2
+   实测，缺失、畸形或未知取值不作为授权依据；CGI 兜底也失败则拒绝；
 2. **反代共享密钥**：nginx 与守护进程之间用 root-only 随机 token
    （`etc/proxy-token`）标识来源，无密钥的直连请求（含本机进程）一律 403；
    客户端自带的 `X-Trim-Isadmin` 头在 TCP 路径上先被剥除，管理员身份只能由
@@ -101,7 +104,7 @@ DSM 防火墙开启时，此模式需放行 TCP 8123。
 真机教训：DSM/RR 上 `/usr/local` 不保证可写，运行参数一律放套件 etc/ 内）：
 
 ```sh
-HTTP_ADDR=":8123"     # 监听地址；127.0.0.1:8123 = 仅本机
+HTTP_ADDR="127.0.0.1:8123"  # 默认仅本机；改为 0.0.0.0:8123 启用 Basic 直连
 IT87_FORCE_ID=""      # 仅当系统自带 it87 模块时生效，如 force_id="IT8620E"
 ```
 
@@ -119,8 +122,6 @@ DSM 没有 DKMS 工具链，本套件不会编译内核模块。驱动来源（�
 
 ## 套件目录布局
 
-```
-/var/packages/tad-module/
 实际布局（卷安装；`/var/packages/tad-module` 部分是空壳，以 ps 里的实际路径为准）：
 
 ```
@@ -132,7 +133,6 @@ DSM 没有 DKMS 工具链，本套件不会编译内核模块。驱动来源（�
 
 <安装卷>/@appdata/tad-module/       # 运行数据（升级保留）
 ├── original-state.json、history.db、tad-module.log、tad-module.pid
-```
 ```
 
 卸载时 `preuninst` 先优雅停服务（守护进程 SIGTERM 退出前恢复功耗/风扇原始
@@ -161,8 +161,12 @@ XPEnology-Community 根密钥签发，脚本旁放 `.sig` JSON（sha256 + 签名
   Basic 认证的独立端口方式访问。
 - DSM 6 未验证：目标只有 DSM 7.x（第三方 root 限制正是 7.0 引入，DSM 6 走
   薄壳的 root 直跑分支理论上可用）。
-- 主面板入口的端口固定 8123；若改 `HTTP_ADDR` 端口，请同步编辑
-  `<安装卷>/@appstore/tad-module/ui/tad-module` 里的 `port`。
-- Release CI 仍只发 fpk；SPK 发布流水线待真机验证后再接入。
+- DSM 桌面入口使用同源反代；修改回环 `HTTP_ADDR` 端口后重启套件，启动脚本
+  会同步更新 nginx upstream，无需修改桌面资源。
+- Release CI 已同时构建 FPK、SPK 和各自 SHA-256 校验文件；标签发布还附带
+  Debian TUI `tank-linux-amd64`。从对应版本的 GitHub Release 下载：fnOS 在
+  应用中心手动安装/升级 `.fpk`，DSM 在套件中心手动安装/升级 `.spk`（升级
+  保留配置和运行数据）；下载后可用 `sha256sum -c <包名>.sha256` 验证。
+  标签 `v<版本>` 必须与 `manifest` 版本一致；旧版本资产不覆盖。
 - CRPS、固件刷写、按键映射等板块依赖硬件通路（`/dev/port`、PMBus），
   在 RR 的 DSM 上可用性取决于引导配置，与 fnOS 版相同的降级逻辑照常生效。

@@ -44,18 +44,25 @@ fi
 echo "==> 编译后端（版本 ${VERSION}）"
 mkdir -p "${PROJECT_ROOT}/app/bin"
 # 编译目标固定为 DSM x86_64:本地 go 分支若沿用宿主目标(macOS/Windows/ARM)
-# 会产出无法在目标机运行的包,且仍能通过执行位检查——末尾必须复核 ELF 魔数
+# 会产出无法在目标机运行的包,且仍能通过执行位检查——末尾必须复核 ELF64、小端与 x86_64 架构
 if command -v go >/dev/null 2>&1; then
   GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
   GOCACHE="${PROJECT_ROOT}/.cache/go-build" GOTMPDIR="${PROJECT_ROOT}/.cache/go-tmp" \
   go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o app/bin/tad-module ./backend/powerguard
 else
-  GO build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+  MSYS_NO_PATHCONV=1 docker run --rm \
+    -v "${DOCKER_SRC}:/src" -w /src \
+    -e GOOS=linux -e GOARCH=amd64 -e CGO_ENABLED=0 \
+    -e GOCACHE=/src/.cache/go-build -e GOTMPDIR=/src/.cache/go-tmp \
+    -e GOMODCACHE=/src/.cache/gomod \
+    golang:1.25 go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
     -o app/bin/tad-module ./backend/powerguard
 fi
-if [ "$(head -c 4 "${PROJECT_ROOT}/app/bin/tad-module" | od -An -tx1 | tr -d ' \n')" != "7f454c46" ]; then
-  echo "产物不是 Linux ELF（编译目标错误?），拒绝出包" >&2
+ELF_IDENT="$(od -An -tx1 -N6 "${PROJECT_ROOT}/app/bin/tad-module" | tr -d ' \n')"
+ELF_MACHINE="$(od -An -tx1 -j18 -N2 "${PROJECT_ROOT}/app/bin/tad-module" | tr -d ' \n')"
+if [[ "${ELF_IDENT}" != "7f454c460201" || "${ELF_MACHINE}" != "3e00" ]]; then
+  echo "产物不是 x86_64 小端 ELF64（编译目标错误?），拒绝出包" >&2
   exit 1
 fi
 

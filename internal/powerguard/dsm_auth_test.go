@@ -1,12 +1,15 @@
 package powerguard
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeDSMAuth 替身:按会话 id 的值决定输出——有效会话输出用户名并以 0 退出,
@@ -41,16 +44,16 @@ func TestDSMSessionAuthAuthorizesAdminOnly(t *testing.T) {
 	bin := fakeDSMAuth(t)
 	auth := &DSMSessionAuth{AuthenticateBin: bin, GroupFile: adminGroupFixture(t)}
 
-	if ok, user := auth.authorize(""); ok || user != "" {
+	if ok, user := auth.authorize(context.Background(), ""); ok || user != "" {
 		t.Fatal("无 Cookie 必须拒绝")
 	}
-	if ok, user := auth.authorize("id=bogus; other=1"); ok || user != "" {
+	if ok, user := auth.authorize(context.Background(), "id=bogus; other=1"); ok || user != "" {
 		t.Fatal("伪会话必须拒绝")
 	}
-	if ok, user := auth.authorize("id=good-user"); ok || user != "" {
+	if ok, user := auth.authorize(context.Background(), "id=good-user"); ok || user != "" {
 		t.Fatal("已登录但非 administrators 组不得成为管理员")
 	}
-	ok, user := auth.authorize("id=good-admin; StayLogin=1")
+	ok, user := auth.authorize(context.Background(), "id=good-admin; StayLogin=1")
 	if !ok || user != "admin" {
 		t.Fatalf("管理员会话应通过: %v %q", ok, user)
 	}
@@ -76,7 +79,7 @@ func TestDSMSessionAuthCachesPositive(t *testing.T) {
 	auth := &DSMSessionAuth{AuthenticateBin: wrapper, GroupFile: adminGroupFixture(t)}
 
 	for i := 0; i < 3; i++ {
-		if ok, _ := auth.authorize("id=good-admin"); !ok {
+		if ok, _ := auth.authorize(context.Background(), "id=good-admin"); !ok {
 			t.Fatalf("第 %d 次校验应通过", i+1)
 		}
 	}
@@ -85,7 +88,7 @@ func TestDSMSessionAuthCachesPositive(t *testing.T) {
 		t.Fatalf("正向缓存应只执行一次校验,实际 %s 次", got)
 	}
 	// 不同会话 id 不共享缓存
-	if ok, _ := auth.authorize("id=good-user"); ok {
+	if ok, _ := auth.authorize(context.Background(), "id=good-user"); ok {
 		t.Fatal("非管理员会话不得放行")
 	}
 }
@@ -215,25 +218,25 @@ func TestDSMSessionAuthViaRegistry(t *testing.T) {
 		GroupFile:       adminGroupFixture(t),
 		SessionFile:     sessionRegistryFixture(t),
 	}
-	ok, user := auth.authorize("id=goodwebui")
+	ok, user := auth.authorize(context.Background(), "id=goodwebui")
 	if !ok || user != "heweicai" {
 		t.Fatalf("注册表命中应放行: %v %q", ok, user)
 	}
 	// 有界会话已过期:拒绝
-	if ok, _ := auth.authorize("id=expiredbounded"); ok {
+	if ok, _ := auth.authorize(context.Background(), "id=expiredbounded"); ok {
 		t.Fatal("过期有界会话应拒绝")
 	}
 	// 会话有效但非 administrators 组:拒绝
-	if ok, _ := auth.authorize("id=plain-session"); ok {
+	if ok, _ := auth.authorize(context.Background(), "id=plain-session"); ok {
 		t.Fatal("非管理员会话应拒绝")
 	}
 	// 未知会话(=已注销,DSM 删行):拒绝
-	if ok, _ := auth.authorize("id=nope"); ok {
+	if ok, _ := auth.authorize(context.Background(), "id=nope"); ok {
 		t.Fatal("未注册会话应拒绝")
 	}
 	// fail-closed:字段缺失/畸形/未知取值一律拒绝,不得默认授权
 	for _, sid := range []string{"no-duration", "garbage-duration", "garbage-conntime", "unknown-negative", "overflow-duration", "zero-conntime", "missing-name"} {
-		if ok, _ := auth.authorize("id=" + sid); ok {
+		if ok, _ := auth.authorize(context.Background(), "id="+sid); ok {
 			t.Fatalf("畸形/未知取值会话 %s 必须拒绝", sid)
 		}
 	}
@@ -248,7 +251,7 @@ func TestDSMSessionAuthNegativeCacheDoesNotGrant(t *testing.T) {
 		SessionFile:     sessionRegistryFixture(t),
 	}
 	for i := 0; i < 2; i++ {
-		if ok, user := auth.authorize("id=plain-session"); ok || user != "" {
+		if ok, user := auth.authorize(context.Background(), "id=plain-session"); ok || user != "" {
 			t.Fatalf("第 %d 次(含负缓存命中)非管理员必须拒绝: %v %q", i+1, ok, user)
 		}
 	}
@@ -278,5 +281,94 @@ func TestDSMSessionAuthHandlerRejectsNonAdminRepeatedly(t *testing.T) {
 	}
 	if called != 0 {
 		t.Fatalf("非管理员请求不得触达下游处理器, called=%d", called)
+	}
+}
+
+// 先填充正缓存，再撤销同一会话；不能用冷缓存未知 id 替代注销。
+func TestDSMSessionAuthHandlerCacheRevocationBoundary(t *testing.T) {
+	for _, scenario := range []string{"logout", "expiry", "remove-admin"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir := t.TempDir()
+			clock := time.Unix(1800000000, 0)
+			start := clock
+			registry := filepath.Join(dir, "current.users")
+			group := adminGroupFixture(t)
+			write := func(path, data string) {
+				t.Helper()
+				if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// 该有界会话在首次授权 10 秒后到期，早于缓存窗口结束。
+			write(registry, fmt.Sprintf(`{"name":"admin","id":"cached-admin","connTime":"%d","duration":"1"}`, start.Unix()-50))
+			cgi := filepath.Join(dir, "authenticate.cgi")
+			// 确定性拒绝兜底，绝不查询宿主 DSM 或触及硬件。
+			write(cgi, "#!/bin/sh\nexit 4\n")
+			if err := os.Chmod(cgi, 0755); err != nil {
+				t.Fatal(err)
+			}
+			auth := &DSMSessionAuth{SessionFile: registry, GroupFile: group, AuthenticateBin: cgi, now: func() time.Time { return clock }}
+			calls := 0
+			handler := auth.Handler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if !IsAdminRequest(r) {
+					t.Error("管理员身份未由 Handler 注入")
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			request := func(want int) {
+				t.Helper()
+				r := httptest.NewRequest(http.MethodPost, "/api/config/global", nil)
+				r.Header.Set("Cookie", "id=cached-admin")
+				rec := httptest.NewRecorder()
+				before := calls
+				handler.ServeHTTP(rec, r)
+				if rec.Code != want {
+					t.Fatalf("elapsed=%s: got %d, want %d", clock.Sub(start), rec.Code, want)
+				}
+				if want == http.StatusUnauthorized && calls != before {
+					t.Fatal("拒绝的请求触达了下游")
+				}
+			}
+			request(http.StatusOK)
+			if got := auth.entries["cached-admin"].expires; !got.Equal(start.Add(30 * time.Second)) {
+				t.Fatalf("缓存期限应为30秒: %s", got)
+			}
+			switch scenario {
+			case "logout":
+				write(registry, "")
+			case "remove-admin":
+				write(group, "administrators:x:101:other\n")
+			}
+			clock = start.Add(10 * time.Second)
+			request(http.StatusOK) // expiry 已到期；约定窗口内仍使用原判定
+			clock = start.Add(30*time.Second - time.Nanosecond)
+			request(http.StatusOK)
+			if calls != 3 {
+				t.Fatalf("有效窗口内调用次数=%d", calls)
+			}
+			clock = start.Add(30 * time.Second)
+			request(http.StatusUnauthorized)
+			clock = start.Add(31 * time.Second)
+			request(http.StatusUnauthorized)
+			if calls != 3 {
+				t.Fatalf("过期后不应再调用下游: %d", calls)
+			}
+		})
+	}
+}
+
+func TestDSMSessionAuthCGIRespectsCanceledRequestAndLimit(t *testing.T) {
+	auth := &DSMSessionAuth{AuthenticateBin: fakeDSMAuth(t), GroupFile: adminGroupFixture(t)}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if ok, _ := auth.authorize(ctx, "id=good-admin"); ok {
+		t.Fatal("已取消请求不得启动 CGI 并授权")
+	}
+	// 满槽时必须立即拒绝，且不得误用有效 CGI 授权。
+	auth.cgiSlots = make(chan struct{}, 1)
+	auth.cgiSlots <- struct{}{}
+	if ok, _ := auth.authorize(context.Background(), "id=good-admin"); ok {
+		t.Fatal("CGI 并发已满仍授权")
 	}
 }

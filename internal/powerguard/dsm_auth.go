@@ -2,6 +2,7 @@ package powerguard
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -53,8 +54,10 @@ type DSMSessionAuth struct {
 	// AdminGroup 要求的组名，空则用 administrators
 	AdminGroup string
 
-	mu      sync.Mutex
-	entries map[string]dsmAuthEntry
+	mu       sync.Mutex
+	entries  map[string]dsmAuthEntry
+	now      func() time.Time // 测试时推进时钟，避免真实等待缓存窗口
+	cgiSlots chan struct{}    // 懒初始化；限制慢 CGI 子进程并发
 }
 
 type dsmAuthEntry struct {
@@ -87,12 +90,12 @@ func dsmSessionID(cookieHeader string) string {
 
 // authorize 校验会话并要求 administrators 组成员。cookieHeader 是请求的
 // 完整 Cookie 头原样转发给 authenticate.cgi。
-func (a *DSMSessionAuth) authorize(cookieHeader string) (bool, string) {
+func (a *DSMSessionAuth) authorize(parent context.Context, cookieHeader string) (bool, string) {
 	sid := dsmSessionID(cookieHeader)
 	if sid == "" {
 		return false, ""
 	}
-	now := time.Now()
+	now := a.currentTime()
 	a.mu.Lock()
 	if entry, ok := a.entries[sid]; ok {
 		if now.Before(entry.expires) {
@@ -106,16 +109,28 @@ func (a *DSMSessionAuth) authorize(cookieHeader string) (bool, string) {
 	// 优先 DSM 7 会话注册表(本机文件,root-only):DSM 7.3/RR 上
 	// authenticate.cgi 已无法校验 webui 会话(SPM 的 CGI 同样失效)。
 	// 注册表只证明"已登录",管理员身份仍须过组校验
-	if user, ok := a.authorizeViaSessionRegistry(sid, time.Now()); ok {
+	if user, ok := a.authorizeViaSessionRegistry(sid, now); ok {
 		if a.userIsAdmin(user) {
-			a.remember(sid, user, time.Now())
+			a.remember(sid, user, now)
 			return true, user
 		}
-		a.remember(sid, "", time.Now())
+		a.remember(sid, "", now)
 		return false, ""
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dsmAuthExecuteTimeout)
+	a.mu.Lock()
+	if a.cgiSlots == nil {
+		a.cgiSlots = make(chan struct{}, 4)
+	}
+	slots := a.cgiSlots
+	a.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	default:
+		return false, ""
+	}
+	ctx, cancel := context.WithTimeout(parent, dsmAuthExecuteTimeout)
 	defer cancel()
 	command := exec.CommandContext(ctx, a.AuthenticateBin)
 	command.Env = append(os.Environ(), "HTTP_COOKIE="+cookieHeader)
@@ -164,7 +179,7 @@ func (a *DSMSessionAuth) authorizeViaSessionRegistry(sid string, now time.Time) 
 		if json.Unmarshal([]byte(line), &entry) != nil {
 			continue
 		}
-		if entry.ID == "" || entry.ID != sid || entry.Name == "" {
+		if entry.ID == "" || subtle.ConstantTimeCompare([]byte(entry.ID), []byte(sid)) != 1 || entry.Name == "" {
 			continue
 		}
 		// fail-closed(PR#39 review 三轮):注册表是本路径唯一的授权依据,
@@ -204,6 +219,13 @@ func (a *DSMSessionAuth) authorizeViaSessionRegistry(sid string, now time.Time) 
 	return "", false
 }
 
+func (a *DSMSessionAuth) currentTime() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
 func (a *DSMSessionAuth) remember(sid, user string, now time.Time) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -241,7 +263,7 @@ func (a *DSMSessionAuth) userIsAdmin(user string) bool {
 // 相同的管理员身份头，其余一律 401。
 func (a *DSMSessionAuth) Handler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if ok, _ := a.authorize(r.Header.Get("Cookie")); ok {
+		if ok, _ := a.authorize(r.Context(), r.Header.Get("Cookie")); ok {
 			r.Header.Set("X-Trim-Isadmin", "true")
 			next.ServeHTTP(w, r)
 			return

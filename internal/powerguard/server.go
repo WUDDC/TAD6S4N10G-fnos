@@ -443,7 +443,7 @@ func hostOnly(hostPort string) string {
 	if host, _, err := net.SplitHostPort(hostPort); err == nil && host != "" {
 		return host
 	}
-	return hostPort
+	return strings.Trim(hostPort, "[]")
 }
 
 func portOnly(hostPort string) string {

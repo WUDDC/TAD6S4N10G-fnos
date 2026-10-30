@@ -97,9 +97,12 @@ ensure_web_auth() {
   # 仅非回环监听需要：没有凭据文件就生成一份（守护进程 fail-closed，
   # 非回环无凭据会拒绝启动）。密码同时打印在启动日志里可见的文件中。
   [ -f "${AUTH}" ] && return 0
-  PASSWORD="$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 24)"
-  printf '{"username":"admin","password":"%s"}\n' "${PASSWORD}" > "${AUTH}"
-  printf '%s\n' "${PASSWORD}" > "${PKG_ETC}/initial-password.txt"
+  (
+    umask 077
+    PASSWORD="$(tr -dc A-Za-z0-9 < /dev/urandom | head -c 24)"
+    printf '{"username":"admin","password":"%s"}\n' "${PASSWORD}" > "${AUTH}"
+    printf '%s\n' "${PASSWORD}" > "${PKG_ETC}/initial-password.txt"
+  )
   chmod 600 "${AUTH}" "${PKG_ETC}/initial-password.txt"
 }
 
@@ -109,7 +112,7 @@ ensure_proxy_token() {
   if [ -s "${PROXY_TOKEN}" ]; then
     return 0
   fi
-  tr -dc A-Za-z0-9 < /dev/urandom | head -c 40 > "${PROXY_TOKEN}"
+  (umask 077; tr -dc A-Za-z0-9 < /dev/urandom | head -c 40 > "${PROXY_TOKEN}")
   chmod 600 "${PROXY_TOKEN}"
 }
 
@@ -146,15 +149,18 @@ ensure_nginx() {
   rm -f "${NGINX_CONF_DIR}/${PKG}.conf" 2>/dev/null || true
   ensure_proxy_token
   TOKEN="$(cat "${PROXY_TOKEN}")"
-  if [ -f "${NGINX_CONF}" ] && grep -q "tad-module-managed v5" "${NGINX_CONF}" \
-      && grep -q "X-Tad-Proxy-Token \"${TOKEN}\"" "${NGINX_CONF}" 2>/dev/null; then
-    return 0
-  fi
   # upstream 跟随 HTTP_ADDR(剥可能的 scheme 前缀),不能写死 127.0.0.1:8123
   UPSTREAM="${HTTP_ADDR#http://}"
   UPSTREAM="${UPSTREAM#https://}"
   [ -n "${UPSTREAM}" ] || UPSTREAM="127.0.0.1:8123"
-  cat > "${NGINX_CONF}" <<'EOF'
+  if [ -f "${NGINX_CONF}" ] && grep -q "tad-module-managed v5" "${NGINX_CONF}" \
+      && grep -Fq "X-Tad-Proxy-Token \"${TOKEN}\"" "${NGINX_CONF}" 2>/dev/null \
+      && grep -Fqx "    proxy_pass http://${UPSTREAM};" "${NGINX_CONF}"; then
+    return 0
+  fi
+  (
+    umask 077
+    cat > "${NGINX_CONF}" <<'EOF'
 # tad-module-managed v5 —— 由 tad-module 套件启动脚本维护，勿手改
 # ^~ 必需：DSM 全局正则（~ /api/、~* .css/.js）优先级高于普通前缀，会截胡
 location ^~ /webman/3rdparty/tad-module/ {
@@ -169,7 +175,8 @@ location ^~ /webman/3rdparty/tad-module/ {
     proxy_read_timeout 300s;
 }
 EOF
-  sed -i -e "s|@TOKEN@|${TOKEN}|" -e "s|@UPSTREAM@|${UPSTREAM}|" "${NGINX_CONF}"
+    sed -i -e "s|@TOKEN@|${TOKEN}|" -e "s|@UPSTREAM@|${UPSTREAM}|" "${NGINX_CONF}"
+  )
   chmod 600 "${NGINX_CONF}"
   if ! nginx -t >/dev/null 2>&1; then
     echo "tad-module: nginx -t 校验失败，已撤回反代配置（不影响 DSM 现有配置）。" >&2

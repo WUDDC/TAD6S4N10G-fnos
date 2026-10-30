@@ -239,7 +239,11 @@ func TestOriginAllowedStrict(t *testing.T) {
 	}{
 		{"http://10.25.11.2:5000", "10.25.11.2:5000", "http", true},
 		{"https://nas.example.com:5001", "nas.example.com:5001", "https", true},
-		{"http://nas", "nas", "http", true},             // 双侧默认 80
+		{"http://nas", "nas", "http", true},
+		{"https://[2001:db8::1]", "[2001:db8::1]", "https", true},
+		{"http://[::1]:8123", "[::1]:8123", "http", true},
+		{"http://[::1]:9000", "[::1]:8123", "http", false},
+		{"http://nas:443", "nas", "http", false},        // 双侧默认 80
 		{"https://nas", "nas", "https", true},           // 合法 HTTPS 443:Host 无显式端口(review 用例)
 		{"https://nas", "nas:443", "https", true},       // 源省略端口=https 默认 443
 		{"https://nas:8123", "nas:8123", "http", false}, // 同 host/port 但 scheme 不同(review 用例)
