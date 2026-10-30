@@ -42,8 +42,8 @@ jobs:
           node --test app/ui/static/app.test.js
           node --check app/ui/static/crps/app.js
           node --test app/ui/static/crps/app.test.js
-          bash -n cmd/* scripts/build.sh scripts/build-spk.sh
-          sh -n synology/scripts/*
+          for script in cmd/* scripts/build.sh scripts/build-spk.sh; do bash -n "$script"; done
+          for script in synology/scripts/*; do sh -n "$script"; done
           python3 scripts/test-synology.py
 
       - name: Download official fnpack

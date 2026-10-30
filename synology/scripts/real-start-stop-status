@@ -58,10 +58,27 @@ if [ -f "${CFG_FILE}" ]; then
   . "${CFG_FILE}" || true
 fi
 
+# PID 可能跨重启残留或被复用；同时验证进程、启动 tick 和本次 boot。
+process_identity() {
+  start="$(sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}')"
+  boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" || return 1
+  [ -n "${start}" ] && [ -n "${boot}" ] || return 1
+  printf '%s %s\n' "${start}" "${boot}"
+}
+
 daemon_pid() {
-  if [ -f "${PIDFILE}" ]; then
-    cat "${PIDFILE}" 2>/dev/null || true
-  fi
+  [ -f "${PIDFILE}" ] || return 0
+  read -r pid saved_start saved_boot extra < "${PIDFILE}" || return 0
+  case "${pid}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${pid}" -gt 0 ] 2>/dev/null || return 0
+  [ -z "${extra}" ] && [ -n "${saved_start}" ] && [ -n "${saved_boot}" ] || return 0
+  identity="$(process_identity "${pid}")" || return 0
+  [ "${identity}" = "${saved_start} ${saved_boot}" ] || return 0
+  executable="$(readlink -f "/proc/${pid}/exe" 2>/dev/null)" || return 0
+  expected="$(readlink -f "${BIN}" 2>/dev/null)" || return 0
+  [ "${executable}" = "${expected}" ] || return 0
+  [ "$(tr '\000' '\n' < "/proc/${pid}/cmdline" 2>/dev/null | sed -n '2p')" = serve ] || return 0
+  printf '%s\n' "${pid}"
 }
 
 is_loopback_addr() {
@@ -141,13 +158,14 @@ ensure_nginx() {
   # 注入管理员身份，只带共享密钥标识来源；会话与管理员组校验由后端
   # (会话注册表优先、authenticate.cgi 兜底 + administrators)完成。写不进或 nginx -t 不过：
   # 降级退出并留痕，绝不 reload 一个校验失败的配置。
+  # 反代配置不可写时仍须提供后端启动所需的 token。
+  ensure_proxy_token
   mkdir -p "${NGINX_CONF_DIR}" 2>/dev/null || {
-    echo "tad-module: 无法创建 ${NGINX_CONF_DIR}（/usr/local 不可写?），桌面嵌入入口不可用；可改用 ${HTTP_ADDR} 直连。" >&2
+    echo "tad-module: 无法创建 ${NGINX_CONF_DIR}（/usr/local 不可写?），桌面嵌入入口不可用；可改为非回环监听的 Basic 认证直连模式。" >&2
     return 1
   }
   # 旧文件名（不带 dsm. 前缀，DSM 不加载）清理
   rm -f "${NGINX_CONF_DIR}/${PKG}.conf" 2>/dev/null || true
-  ensure_proxy_token
   TOKEN="$(cat "${PROXY_TOKEN}")"
   # upstream 跟随 HTTP_ADDR(剥可能的 scheme 前缀),不能写死 127.0.0.1:8123
   UPSTREAM="${HTTP_ADDR#http://}"
@@ -184,7 +202,8 @@ EOF
     return 1
   fi
   if ! systemctl reload nginx >/dev/null 2>&1; then
-    echo "tad-module: nginx reload 失败，反代配置已写入但未生效（可稍后手动 systemctl reload nginx）。" >&2
+    echo "tad-module: nginx reload 失败，已撤回待应用配置；下次启动会重试。" >&2
+    rm -f "${NGINX_CONF}"
     return 1
   fi
 }
@@ -226,7 +245,12 @@ case "${1:-}" in
       --http "${HTTP_ADDR}" \
       ${AUTH_ARGS} \
       >> "${LOGFILE}" 2>&1 &
-    echo $! > "${PIDFILE}"
+    pid=$!
+    identity="$(process_identity "${pid}")" || {
+      echo "tad-module: 无法记录服务进程身份，启动失败。" >&2
+      exit 1
+    }
+    printf '%s %s\n' "${pid}" "${identity}" > "${PIDFILE}"
     # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
     # 否则 DSM 会把套件标成已启动。
     i=0
@@ -248,11 +272,11 @@ case "${1:-}" in
       kill "${pid}" 2>/dev/null || true
       # 宽限 30 秒：守护进程要在退出前恢复功耗/风扇原始状态（含蜂鸣提示音）
       i=0
-      while [ "${i}" -lt 30 ] && kill -0 "${pid}" 2>/dev/null; do
+      while [ "${i}" -lt 30 ] && [ "$(daemon_pid)" = "${pid}" ]; do
         sleep 1
         i=$((i + 1))
       done
-      if kill -0 "${pid}" 2>/dev/null; then
+      if [ "$(daemon_pid)" = "${pid}" ]; then
         kill -9 "${pid}" 2>/dev/null || true
       fi
     fi

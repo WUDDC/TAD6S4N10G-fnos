@@ -25,6 +25,9 @@ TAD_SPK_VERSION=0.0.1 scripts/build-spk.sh   # 测试包（约定 0.0.1，资源
 scripts/build-spk.sh                          # 正式包（版本取 manifest）
 ```
 
+打包在 GNU/Linux 工具环境下验证，需 GNU `sed`、`md5sum`、`sha256sum`；
+macOS 宿主请先提供这些 GNU 工具，或在 Linux 环境中打包。
+
 本机无 Go 时自动用 docker `golang:1.25` 编译（与 `scripts/build.sh` 同一套参数，
 `CGO_ENABLED=0` 静态二进制）。产物在仓库根：`tad-module-v<版本>.spk` + `.sha256`。
 
@@ -48,7 +51,7 @@ GPIO 按键、SMART 读取都是 root 硬件通路。SPM 提供 setuid 入口 `s
    `http://<NAS>:5000/webman/3rdparty/tad-module/`），**鉴权就是 DSM 登录，无需额外密码**。
    实际路径按安装卷不同而不同：程序与配置在 `<安装卷>/@appstore/tad-module/`，
    运行数据在 `<安装卷>/@appdata/tad-module/`；`/var/packages/tad-module/` 下的
-   `etc/` 是不被使用的空壳目录（DSM 卷安装布局），以 `ps -p $(cat
+   `etc/` 是不被使用的空壳目录（DSM 卷安装布局），以 `ps -p $(awk '{print $1}'
    <安装卷>/@appdata/tad-module/tad-module.pid)` 里的实际参数为准。
 
 **排障**：启动失败且日志（`/var/packages/tad-module/var/tad-module.log` 或
