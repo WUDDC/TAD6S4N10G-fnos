@@ -66,6 +66,14 @@ process_identity() {
   printf '%s %s\n' "${start}" "${boot}"
 }
 
+# port_in_use <host:port> 检测 TCP 端口是否已被监听（busybox/procps netstat
+# 均可用；netstat 缺失时返回 1,退化为主流程自身的 bind 失败报错）。
+# 7.2.1 反馈排查项：RR 引导组件/Docker 容器映射等占用 8123 会让守护进程
+# bind 失败退出,DSM 只报笼统的「无法启动」——启动前主动检测并给出可操作提示。
+port_in_use() {
+  netstat -tln 2>/dev/null | grep -q ":${1##*:}[[:space:]]"
+}
+
 daemon_pid() {
   [ -f "${PIDFILE}" ] || return 0
   read -r pid saved_start saved_boot extra < "${PIDFILE}" || return 0
@@ -216,6 +224,20 @@ case "${1:-}" in
     [ -x "${BIN}" ] || exit 1
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
+    # 端口占用预检:bind 失败是「无法启动」的高频根因(RR 引导/Docker 容器/
+    # 其他套件占用 8123),提前给出可操作提示而不是让守护进程默默退出
+    if port_in_use "${HTTP_ADDR}"; then
+      {
+        echo "$(date '+%Y-%m-%dT%H:%M:%S') 启动失败:${HTTP_ADDR} 已被其他进程占用"
+        echo "占用者(供排查):"
+        netstat -tlnp 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]" || netstat -tln 2>/dev/null | grep ":${HTTP_ADDR##*:}[[:space:]]"
+        echo "处置:编辑 ${CFG_FILE} 把 HTTP_ADDR 改成其他端口(如 127.0.0.1:8231),并同步修改"
+        echo "      ${NGINX_CONF} 里 proxy_pass 的端口后重启套件;或停掉占用该端口的进程/容器"
+      } >> "${STARTUP_LOG}" 2>/dev/null || true
+      echo "启动失败:${HTTP_ADDR} 端口已被其他进程占用(常见于 Docker 容器映射或 RR 组件)。" >&2
+      echo "处置:改 ${CFG_FILE} 的 HTTP_ADDR 端口后重启套件。详细: ${STARTUP_LOG}" >&2
+      exit 1
+    fi
     ensure_power
     ensure_cfg
     ensure_it87
