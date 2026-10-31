@@ -31,6 +31,9 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = serve(os.Args[2:])
+	case "svc":
+		// Windows 服务管理（安装/卸载/启停）；非 Windows 平台是报错桩
+		err = svcCommand(os.Args[2:])
 	case "probe":
 		err = probe(os.Args[2:])
 	case "init":
@@ -163,8 +166,17 @@ func probe(args []string) error {
 	return nil
 }
 
-// serve 启动守护进程: 应用配置、挂载 HTTP(socket/TCP) 服务与各后台循环, 退出时恢复原始功耗/风扇状态
+// serve 控制台/交互式入口：信号转 context 后进 runServe。Windows 服务模式
+// 由 service_windows.go 的 svc run 直接带 context 调 runServe（SCM 的 Stop
+// 请求同样转成 context 取消）。
 func serve(args []string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	return runServe(ctx, args)
+}
+
+// runServe 启动守护进程: 应用配置、挂载 HTTP(socket/TCP) 服务与各后台循环, 退出时恢复原始功耗/风扇状态
+func runServe(ctx context.Context, args []string) error {
 	set := flag.NewFlagSet("serve", flag.ContinueOnError)
 	config := set.String("config", "", "config file")
 	state := set.String("state", "", "state file")
@@ -230,8 +242,6 @@ func serve(args []string) error {
 	}
 	logger.Printf("started version=%s interval=%ds", version, cfg.ReapplySeconds)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 	done := make(chan error, 1)
 	// 历史存储初始化失败只降级历史功能（/api/history 返回空），绝不影响
 	// 风扇控制等主功能——守护进程必须照常运行。
@@ -565,7 +575,7 @@ func gpioLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logg
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|probe|init|apply|restore|version> [options]")
+	fmt.Fprintln(os.Stderr, "usage: tad-module <serve|svc|probe|init|apply|restore|version> [options]")
 }
 
 // initCrps 初始化 CRPS PMBus 监控板块 (可选功能)。配置读独立文件 cfgPath

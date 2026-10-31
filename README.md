@@ -24,6 +24,10 @@ Debian TUI 的 `tad-module` 后端必须以 root 启动，这是官方 `serve()`
 
 安装脚本默认写入 `enabled=false`、风扇和 GPIO 关闭的监控配置，这只表示默认不会主动应用功耗、风扇或 GPIO 设置，不能取消后端的 root 启动要求。`tank` 本身是面向管理员的只读终端工具；root 用户可直接运行，获授权的普通 SSH 用户也可以通过 `www-data` Socket 组读取状态，但后端服务始终以 root 运行。
 
+## Windows 便携版
+
+同一套后端与 Web UI 也可以原生跑在 Windows 上（`windows/amd64` 便携 zip + Windows 服务）。风扇/PWM、RAPL 功耗、GPIO、CRPS 等依赖 Linux 内核接口的硬件功能按平台约定明确降级，监控面板、历史记录、SMART 温度（smartmontools）与 USB 温度传感器可用。部署说明见 [`docs/windows.md`](docs/windows.md)。
+
 ## 默认策略
 
 | CPU | PL1（持续） | PL2（短时） | 可调 PL1 | 可调 PL2 |

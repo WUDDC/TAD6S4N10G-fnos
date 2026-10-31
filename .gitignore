@@ -3,6 +3,8 @@
 /*.fpk
 /*.spk
 /*.spk.sha256
+/tad-module-windows-v*.zip
+/tad-module-windows-v*.zip.sha256
 /app/bin/tad-module
 /ICON.PNG
 /ICON_256.PNG
@@ -13,3 +15,10 @@
 /.tools/
 
 /dist-artifact*/
+
+# SPK 打包残留（payload 曾组装到仓库根，源/产物分别在 synology/ 与 .cache/spk-stage/）
+/bin/
+/ui/
+/app/config
+/app/tadmodule.js
+/app/images/
