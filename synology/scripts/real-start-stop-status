@@ -26,6 +26,9 @@ if [ -z "${PKGDEST}" ]; then
 fi
 PKG_ETC="${SYNOPKG_PKGETC:-${PKGDEST}/etc}"
 PKG_VAR="${SYNOPKG_PKGVAR:-${PKGDEST}/var}"
+# 与薄壳 start-stop-status 写同一个诊断文件。此前本脚本只引用未定义该变量，
+# set -u 下端口占用预检一触发就死于 unbound variable，提示与日志全落空。
+STARTUP_LOG="${PKG_VAR}/startup-debug.log"
 if [ -z "${SYNOPKG_PKGVAR:-}" ]; then
   APPSTORE_PARENT="$(dirname "${PKGDEST}")"
   case "${APPSTORE_PARENT}" in
@@ -147,15 +150,28 @@ ensure_cfg() {
   if [ -f "${CFG_FILE}" ]; then
     return 0
   fi
+  # 安装向导选值寄存(postinst 写不进 etc 时暂存在 var):有则沿用,
+  # cfg 落盘成功即消费删除;写不进则保留,下次启动重试
+  WIZ_ADDR=""
+  WIZ_ENV="${PKG_VAR}/wizard-install.env"
+  if [ -f "${WIZ_ENV}" ]; then
+    # shellcheck disable=SC1090
+    . "${WIZ_ENV}" || true
+    WIZ_ADDR="${HTTP_ADDR:-}"
+  fi
   {
     echo "# tad-module（DSM 版）运行参数；修改后重启套件生效"
-    echo "# 默认桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
-    echo "# 改成 0.0.0.0:8123 可独立端口访问（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
-    echo 'HTTP_ADDR="127.0.0.1:8123"'
+    echo "# 桌面嵌入模式：只监听本机回环，由 DSM nginx 反代 /webman/3rdparty/tad-module/ 提供，鉴权走 DSM 登录"
+    echo "# 独立端口模式：0.0.0.0:端口 对外监听（启动时会自动生成 Basic 凭据，见 etc/initial-password.txt）"
+    echo "HTTP_ADDR=\"${WIZ_ADDR:-127.0.0.1:8123}\""
     echo "# it87 探测参数（仅当系统自带 it87 模块时生效，如 force_id=\"IT8620E\"）"
     echo 'IT87_FORCE_ID=""'
   } > "${CFG_FILE}" 2>/dev/null || true
   chmod 600 "${CFG_FILE}" 2>/dev/null || true
+  if [ -n "${WIZ_ADDR}" ] && [ -f "${CFG_FILE}" ]; then
+    rm -f "${WIZ_ENV}" 2>/dev/null || true
+  fi
+  echo "$(date '+%Y-%m-%dT%H:%M:%S') ensure_cfg 自愈创建 cfg (HTTP_ADDR=${WIZ_ADDR:-127.0.0.1:8123})" >> "${STARTUP_LOG}" 2>/dev/null || true
 }
 
 ensure_nginx() {
@@ -224,6 +240,13 @@ case "${1:-}" in
     [ -x "${BIN}" ] || exit 1
     mkdir -p "${PKG_VAR}"
     rm -f "${PIDFILE}"
+    # 先自愈运行参数再预检端口:ensure_cfg 可能按安装向导刚创建 cfg,
+    # 不重读会让预检与 serve 都用脚本顶部的旧默认端口
+    ensure_cfg
+    if [ -f "${CFG_FILE}" ]; then
+      # shellcheck disable=SC1090
+      . "${CFG_FILE}" || true
+    fi
     # 端口占用预检:bind 失败是「无法启动」的高频根因(RR 引导/Docker 容器/
     # 其他套件占用 8123),提前给出可操作提示而不是让守护进程默默退出
     if port_in_use "${HTTP_ADDR}"; then
@@ -239,7 +262,6 @@ case "${1:-}" in
       exit 1
     fi
     ensure_power
-    ensure_cfg
     ensure_it87
     # 旧版默认值迁移：独立端口时代遗留的 ":8123" 改为回环绑定
     if [ "${HTTP_ADDR}" = ":8123" ]; then

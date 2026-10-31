@@ -38,7 +38,7 @@ log "action=$1 uid=$(id -u) spm-exec=$([ -x "${SPM_EXEC}" ] && echo present || e
 
 if [ ! -x "${SPM_EXEC}" ]; then
   log "失败:spm-exec 不存在——SPM 未安装或未启用提权入口"
-  echo "本套件需要 root 权限（功耗/风扇/GPIO/SMART 硬件通路），而 DSM 7 禁止第三方套件直接以 root 运行。" >&2
+  echo "⚠️本软件需要root授权：功耗/风扇/GPIO/SMART 是硬件 root 通路，而 DSM 7 禁止第三方套件直接以 root 运行。" >&2
   echo "请按顺序操作：" >&2
   echo "  1. 套件中心安装 SimplePermissionManager 并打开其界面点 Active 激活" >&2
   echo "     （https://github.com/XPEnology-Community/SimplePermissionManager）" >&2

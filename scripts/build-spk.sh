@@ -164,15 +164,24 @@ mv "${STAGE}/root/INFO.tmp" "${STAGE}/root/INFO"
 echo "checksum=\"${CHECKSUM_MD5}\"" >> "${STAGE}/root/INFO"
 cp -r "${PROJECT_ROOT}/synology/scripts" "${STAGE}/root/scripts"
 cp -r "${PROJECT_ROOT}/synology/conf" "${STAGE}/root/conf"
+cp -r "${PROJECT_ROOT}/synology/WIZARD_UIFILES" "${STAGE}/root/WIZARD_UIFILES"
 # 归一 LF：Windows 工作区可能带入 CRLF，DSM 的 sh 解析不了 \r
-find "${STAGE}/root/scripts" "${STAGE}/root/conf" -type f -exec sed -i 's/\r$//' {} +
+find "${STAGE}/root/scripts" "${STAGE}/root/conf" "${STAGE}/root/WIZARD_UIFILES" -type f -exec sed -i 's/\r$//' {} +
 chmod 755 "${STAGE}/root/scripts"/*
+# 安装向导 JSON 必须合法（DSM 按 JSON 渲染向导页，畸形会装不出来/空白）；
+# 显式 utf-8：Windows python 默认 cp936 读 ⚠️/中文会直接 UnicodeDecodeError
+for wf in "${STAGE}"/root/WIZARD_UIFILES/*uifile; do
+  python -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "${wf}" || {
+    echo "安装向导 JSON 非法: ${wf}" >&2
+    exit 1
+  }
+done
 cp "${PROJECT_ROOT}/app/ui/images/icon_64.png" "${STAGE}/root/PACKAGE_ICON.PNG"
 cp "${PROJECT_ROOT}/app/ui/images/icon_256.png" "${STAGE}/root/PACKAGE_ICON_256.PNG"
 
 echo "==> 打 SPK"
 tar cf "${PROJECT_ROOT}/${SPK_NAME}" -C "${STAGE}/root" \
-  INFO package.tgz scripts conf PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG
+  INFO package.tgz scripts conf WIZARD_UIFILES PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG
 # 生命周期脚本必须带执行位（同 MSYS 失效问题）
 for s in preinst postinst preuninst postuninst preupgrade postupgrade start-stop-status real-start-stop-status; do
   tar tvf "${PROJECT_ROOT}/${SPK_NAME}" | grep -E "^-r.x" | grep -q " scripts/${s}\$" || {
@@ -180,6 +189,10 @@ for s in preinst postinst preuninst postuninst preupgrade postupgrade start-stop
     exit 1
   }
 done
+tar tf "${PROJECT_ROOT}/${SPK_NAME}" | grep -q "^WIZARD_UIFILES/install_uifile$" || {
+  echo "SPK 内缺 WIZARD_UIFILES/install_uifile（安装向导）" >&2
+  exit 1
+}
 (cd "${PROJECT_ROOT}" && sha256sum "${SPK_NAME}" > "${SPK_NAME}.sha256")
 
 echo "==> 完成: ${PROJECT_ROOT}/${SPK_NAME}"
