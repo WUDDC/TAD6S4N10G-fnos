@@ -252,14 +252,20 @@ case "${1:-}" in
     }
     printf '%s %s\n' "${pid}" "${identity}" > "${PIDFILE}"
     # 就绪探测：进程在启动窗口内退出（如 CPU 不支持）要报失败，
-    # 否则 DSM 会把套件标成已启动。
+    # 否则 DSM 会把套件标成已启动。失败原因同时落盘（DSM 弹窗只有笼统文案）。
     i=0
     while [ "${i}" -lt 8 ]; do
       sleep 1
       if ! kill -0 "$(daemon_pid)" 2>/dev/null; then
         rm -f "${PIDFILE}"
+        {
+          echo "$(date '+%Y-%m-%dT%H:%M:%S') 守护进程在就绪窗口内退出 (exit 探测第 ${i} 秒)"
+          echo "---- 守护进程日志尾部 ----"
+          tail -n 10 "${LOGFILE}" 2>/dev/null || true
+        } >> "${STARTUP_LOG}" 2>/dev/null || true
         echo "tad-module 在启动阶段退出，最近日志："
         tail -n 5 "${LOGFILE}" 2>/dev/null || true
+        echo "详细诊断: ${STARTUP_LOG}" >&2
         exit 1
       fi
       i=$((i + 1))
